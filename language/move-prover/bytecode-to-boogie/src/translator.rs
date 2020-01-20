@@ -13,6 +13,7 @@
 //!    for example, how to construct a TypeValue from a SignatureToken, how to access memory,
 //!    and so on.
 
+use crate::cli::Options;
 use crate::spec_translator::SpecTranslator;
 use bytecode_source_map::source_map::ModuleSourceMap;
 use bytecode_verifier::VerifiedModule;
@@ -65,6 +66,7 @@ pub struct FunctionInfo {
 }
 
 pub struct BoogieTranslator<'a> {
+    pub options: &'a Options,
     pub modules: &'a [VerifiedModule],
     pub module_infos: &'a [ModuleInfo],
     pub source_maps: &'a [ModuleSourceMap<Loc>],
@@ -87,6 +89,7 @@ pub struct ModuleTranslator<'a> {
 
 impl<'a> BoogieTranslator<'a> {
     pub fn new(
+        options: &'a Options,
         modules: &'a [VerifiedModule],
         module_infos: &'a [ModuleInfo],
         source_maps: &'a [ModuleSourceMap<Loc>],
@@ -109,6 +112,7 @@ impl<'a> BoogieTranslator<'a> {
             }
         }
         Self {
+            options,
             modules,
             module_infos,
             source_maps,
@@ -204,10 +208,20 @@ impl<'a> BoogieTranslator<'a> {
                 }
 
                 let type_value = format!("StructType({}, {})", struct_name, field_types);
-                emit_str(&format!(
-                    "function {}_type_value({}): TypeValue {{\n    {}\n}}\n",
-                    struct_name, type_args, type_value
-                ));
+                if struct_name == "LibraAccount_T" {
+                    // Special treatment of well-known resource LibraAccount_T. The type_value
+                    // function is forward-declared in the prelude, here we only add an axiom for
+                    // it.
+                    emit_str(&format!(
+                        "axiom {}_type_value() == {};\n",
+                        struct_name, type_value
+                    ));
+                } else {
+                    emit_str(&format!(
+                        "function {}_type_value({}): TypeValue {{\n    {}\n}}\n",
+                        struct_name, type_args, type_value
+                    ));
+                }
 
                 // Emit other struct specific boilerplate.
                 if !struct_def_view.is_native() {
@@ -301,8 +315,12 @@ impl<'a> ModuleTranslator<'a> {
         // translation of stackless bytecode
         for (idx, function_def) in self.module.function_defs().iter().enumerate() {
             if function_def.is_native() {
-                res.push_str(&self.generate_function_sig(idx, true, &None));
-                res.push_str(";");
+                if self.parent.options.native_stubs {
+                    res.push_str(&self.generate_function_sig(idx, true, &None));
+                    res.push_str(";");
+                    res.push_str(&self.generate_function_spec(idx, &None));
+                    res.push_str("\n");
+                }
                 continue;
             }
             res.push_str(&self.translate_function(idx));
@@ -617,15 +635,33 @@ impl<'a> ModuleTranslator<'a> {
                 "call tmp := LdFalse();".to_string(),
                 format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
-            LdU8(_, _) => unimplemented!(),
-            LdU64(idx, num) => vec![
-                format!("call tmp := LdConst({});", num),
-                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
+            LdU8(idx, num) =>
+                vec![
+                    format!("call tmp := LdConst({});", num),
+                    format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
+                ],
+            LdU64(idx, num) =>
+                vec![
+                    format!("call tmp := LdConst({});", num),
+                    format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
+                ],
+            LdU128(idx, num) =>
+                vec![
+                    format!("call tmp := LdConst({});", num),
+                    format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
+                ],
+            CastU8(dest, src) => vec![
+                // TODO: u8 bounds check
+                format!("m := UpdateLocal(m, old_size + {}, GetLocal(m, old_size + {}));", dest, src),
             ],
-            LdU128(_, _) => unimplemented!(),
-            CastU8(_, _) => unimplemented!(),
-            CastU64(_, _) => unimplemented!(),
-            CastU128(_, _) => unimplemented!(),
+            CastU64(dest, src) =>
+                vec![
+                // TODO: u64 bounds check
+                format!("m := UpdateLocal(m, old_size + {}, GetLocal(m, old_size + {}));", dest, src),
+            ],
+            CastU128(dest, src) => vec![
+                format!("m := UpdateLocal(m, old_size + {}, GetLocal(m, old_size + {}));", dest, src),
+            ],
             LdAddr(idx, addr_idx) => {
                 let addr = self.module.address_pool()[(*addr_idx).into_index()];
                 let addr_int = BigInt::from_str_radix(&addr.to_string(), 16).unwrap();
@@ -886,10 +922,17 @@ impl<'a> ModuleTranslator<'a> {
             }
             rets.push_str(&format!("ret{}", i));
         }
+        let assumptions = "    assume ExistsTxnSenderAccount(m, txn);\n";
         if function_signature.return_types.is_empty() {
-            format!("\n{{\n    call {}({});\n}}\n\n", fun_name, args)
+            format!(
+                "\n{{\n{}    call {}({});\n}}\n\n",
+                assumptions, fun_name, args
+            )
         } else {
-            format!("\n{{\n    call {} := {}({});\n}}\n\n", rets, fun_name, args)
+            format!(
+                "\n{{\n{}    call {} := {}({});\n}}\n\n",
+                assumptions, rets, fun_name, args
+            )
         }
     }
 
@@ -1135,25 +1178,30 @@ pub fn format_type_checking(
     sig: &SignatureToken,
 ) -> String {
     let mut params = name;
+    let mut ret = String::new();
     let check = match sig {
-        SignatureToken::U64 => "is#Integer",
+        SignatureToken::U8 | SignatureToken::U64 | SignatureToken::U128 => "IsValidInteger",
         SignatureToken::Bool => "is#Boolean",
         SignatureToken::Address => "is#Address",
         SignatureToken::ByteArray => "is#ByteArray",
         // Only need to check Struct for top-level; fields will be checked as we extract them.
         SignatureToken::Struct(_, _) => "is#Vector",
-        SignatureToken::Reference(_) | SignatureToken::MutableReference(_) => {
-            params = format!("local_counter, {}", params);
+        SignatureToken::Reference(rtype) | SignatureToken::MutableReference(rtype) => {
+            let n = format!("Dereference(m, {})", params);
+            ret = format_type_checking(_module, n, rtype);
+            ret += "    ";
+            params = format!("m, local_counter, {}", params);
             "IsValidReferenceParameter"
         }
         // Otherwise it is a type parameter which is opaque
-        _ => "",
+        SignatureToken::TypeParameter(_) => "",
     };
-    if check.is_empty() {
+    let ret2 = if check.is_empty() {
         "".to_string()
     } else {
         format!("assume {}({});\n", check, params)
-    }
+    };
+    ret + &ret2
 }
 
 pub fn struct_name_from_handle_index(module: &VerifiedModule, idx: StructHandleIndex) -> String {
@@ -1211,9 +1259,9 @@ pub fn format_type(module: &VerifiedModule, sig: &SignatureToken) -> String {
 pub fn format_type_value(module: &VerifiedModule, sig: &SignatureToken) -> String {
     match sig {
         SignatureToken::Bool => "BooleanType()".to_string(),
-        SignatureToken::U8 => unimplemented!(),
-        SignatureToken::U64 => "IntegerType()".to_string(),
-        SignatureToken::U128 => unimplemented!(),
+        SignatureToken::U8 | SignatureToken::U64 | SignatureToken::U128 => {
+            "IntegerType()".to_string()
+        }
         SignatureToken::ByteArray => "ByteArrayType()".to_string(),
         SignatureToken::Address => "AddressType()".to_string(),
         SignatureToken::Reference(t) | SignatureToken::MutableReference(t) => {

@@ -33,8 +33,8 @@ function GasSchedule_Cost_type_value(): TypeValue {
 
 procedure {:inline 1} Pack_GasSchedule_Cost(v0: Value, v1: Value) returns (v: Value)
 {
-    assume is#Integer(v0);
-    assume is#Integer(v1);
+    assume IsValidInteger(v0);
+    assume IsValidInteger(v1);
     v := Vector(ExtendValueArray(ExtendValueArray(EmptyValueArray, v0), v1));
 
 }
@@ -147,7 +147,7 @@ function LibraCoin_T_type_value(): TypeValue {
 
 procedure {:inline 1} Pack_LibraCoin_T(v0: Value) returns (v: Value)
 {
-    assume is#Integer(v0);
+    assume IsValidInteger(v0);
     v := Vector(ExtendValueArray(EmptyValueArray, v0));
 
 }
@@ -187,7 +187,7 @@ function LibraCoin_MarketCap_type_value(): TypeValue {
 
 procedure {:inline 1} Pack_LibraCoin_MarketCap(v0: Value) returns (v: Value)
 {
-    assume is#Integer(v0);
+    assume IsValidInteger(v0);
     v := Vector(ExtendValueArray(EmptyValueArray, v0));
 
 }
@@ -219,9 +219,7 @@ const LibraAccount_T_sequence_number: FieldName;
 axiom LibraAccount_T_sequence_number == 6;
 const LibraAccount_T_event_generator: FieldName;
 axiom LibraAccount_T_event_generator == 7;
-function LibraAccount_T_type_value(): TypeValue {
-    StructType(LibraAccount_T, ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(EmptyTypeValueArray, ByteArrayType()), LibraCoin_T_type_value()), BooleanType()), BooleanType()), LibraAccount_EventHandle_type_value(LibraAccount_ReceivedPaymentEvent_type_value())), LibraAccount_EventHandle_type_value(LibraAccount_SentPaymentEvent_type_value())), IntegerType()), LibraAccount_EventHandleGenerator_type_value()))
-}
+axiom LibraAccount_T_type_value() == StructType(LibraAccount_T, ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(ExtendTypeValueArray(EmptyTypeValueArray, ByteArrayType()), LibraCoin_T_type_value()), BooleanType()), BooleanType()), LibraAccount_EventHandle_type_value(LibraAccount_ReceivedPaymentEvent_type_value())), LibraAccount_EventHandle_type_value(LibraAccount_SentPaymentEvent_type_value())), IntegerType()), LibraAccount_EventHandleGenerator_type_value()));
 
 procedure {:inline 1} Pack_LibraAccount_T(v0: Value, v1: Value, v2: Value, v3: Value, v4: Value, v5: Value, v6: Value, v7: Value) returns (v: Value)
 {
@@ -231,7 +229,7 @@ procedure {:inline 1} Pack_LibraAccount_T(v0: Value, v1: Value, v2: Value, v3: V
     assume is#Boolean(v3);
     assume is#Vector(v4);
     assume is#Vector(v5);
-    assume is#Integer(v6);
+    assume IsValidInteger(v6);
     assume is#Vector(v7);
     v := Vector(ExtendValueArray(ExtendValueArray(ExtendValueArray(ExtendValueArray(ExtendValueArray(ExtendValueArray(ExtendValueArray(ExtendValueArray(EmptyValueArray, v0), v1), v2), v3), v4), v5), v6), v7));
 
@@ -303,7 +301,7 @@ function LibraAccount_SentPaymentEvent_type_value(): TypeValue {
 
 procedure {:inline 1} Pack_LibraAccount_SentPaymentEvent(v0: Value, v1: Value, v2: Value) returns (v: Value)
 {
-    assume is#Integer(v0);
+    assume IsValidInteger(v0);
     assume is#Address(v1);
     assume is#ByteArray(v2);
     v := Vector(ExtendValueArray(ExtendValueArray(ExtendValueArray(EmptyValueArray, v0), v1), v2));
@@ -331,7 +329,7 @@ function LibraAccount_ReceivedPaymentEvent_type_value(): TypeValue {
 
 procedure {:inline 1} Pack_LibraAccount_ReceivedPaymentEvent(v0: Value, v1: Value, v2: Value) returns (v: Value)
 {
-    assume is#Integer(v0);
+    assume IsValidInteger(v0);
     assume is#Address(v1);
     assume is#ByteArray(v2);
     v := Vector(ExtendValueArray(ExtendValueArray(ExtendValueArray(EmptyValueArray, v0), v1), v2));
@@ -355,7 +353,7 @@ function LibraAccount_EventHandleGenerator_type_value(): TypeValue {
 
 procedure {:inline 1} Pack_LibraAccount_EventHandleGenerator(v0: Value) returns (v: Value)
 {
-    assume is#Integer(v0);
+    assume IsValidInteger(v0);
     v := Vector(ExtendValueArray(EmptyValueArray, v0));
 
 }
@@ -377,7 +375,7 @@ function LibraAccount_EventHandle_type_value(tv0: TypeValue): TypeValue {
 
 procedure {:inline 1} Pack_LibraAccount_EventHandle(tv0: TypeValue, v0: Value, v1: Value) returns (v: Value)
 {
-    assume is#Integer(v0);
+    assume IsValidInteger(v0);
     assume is#ByteArray(v1);
     v := Vector(ExtendValueArray(ExtendValueArray(EmptyValueArray, v0), v1));
 
@@ -399,22 +397,43 @@ procedure {:inline 1} Unpack_LibraAccount_EventHandle(v: Value) returns (v0: Val
 // ** functions of module U64Util
 
 procedure {:inline 1} U64Util_u64_to_bytes (arg0: Value) returns (ret0: Value);
+requires ExistsTxnSenderAccount(m, txn);
+
+
 
 // ** functions of module AddressUtil
 
 procedure {:inline 1} AddressUtil_address_to_bytes (arg0: Value) returns (ret0: Value);
+requires ExistsTxnSenderAccount(m, txn);
+
+
 
 // ** functions of module BytearrayUtil
 
 procedure {:inline 1} BytearrayUtil_bytearray_concat (arg0: Value, arg1: Value) returns (ret0: Value);
+requires ExistsTxnSenderAccount(m, txn);
+
+
 
 // ** functions of module Hash
 
-procedure {:inline 1} Hash_sha2_256 (arg0: Value) returns (ret0: Value);procedure {:inline 1} Hash_sha3_256 (arg0: Value) returns (ret0: Value);
+procedure {:inline 1} Hash_sha2_256 (arg0: Value) returns (ret0: Value);
+requires ExistsTxnSenderAccount(m, txn);
+
+procedure {:inline 1} Hash_sha3_256 (arg0: Value) returns (ret0: Value);
+requires ExistsTxnSenderAccount(m, txn);
+
+
 
 // ** functions of module Signature
 
-procedure {:inline 1} Signature_ed25519_verify (arg0: Value, arg1: Value, arg2: Value) returns (ret0: Value);procedure {:inline 1} Signature_ed25519_threshold_verify (arg0: Value, arg1: Value, arg2: Value, arg3: Value) returns (ret0: Value);
+procedure {:inline 1} Signature_ed25519_verify (arg0: Value, arg1: Value, arg2: Value) returns (ret0: Value);
+requires ExistsTxnSenderAccount(m, txn);
+
+procedure {:inline 1} Signature_ed25519_threshold_verify (arg0: Value, arg1: Value, arg2: Value, arg3: Value) returns (ret0: Value);
+requires ExistsTxnSenderAccount(m, txn);
+
+
 
 // ** functions of module GasSchedule
 
@@ -481,6 +500,7 @@ Label_Abort:
 
 procedure GasSchedule_initialize_verify (arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call GasSchedule_initialize(arg0);
 }
 
@@ -524,7 +544,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     call t6 := Vector_length(GasSchedule_Cost_type_value(), t5);
     if (abort_flag) { goto Label_Abort; }
-    assume is#Integer(t6);
+    assume IsValidInteger(t6);
 
     m := UpdateLocal(m, old_size + 6, t6);
 
@@ -545,6 +565,7 @@ Label_Abort:
 
 procedure GasSchedule_instruction_table_size_verify () returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := GasSchedule_instruction_table_size();
 }
 
@@ -588,7 +609,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     call t6 := Vector_length(GasSchedule_Cost_type_value(), t5);
     if (abort_flag) { goto Label_Abort; }
-    assume is#Integer(t6);
+    assume IsValidInteger(t6);
 
     m := UpdateLocal(m, old_size + 6, t6);
 
@@ -609,6 +630,7 @@ Label_Abort:
 
 procedure GasSchedule_native_table_size_verify () returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := GasSchedule_native_table_size();
 }
 
@@ -656,6 +678,7 @@ Label_Abort:
 
 procedure ValidatorConfig_has_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := ValidatorConfig_has(arg0);
 }
 
@@ -714,6 +737,7 @@ Label_Abort:
 
 procedure ValidatorConfig_config_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := ValidatorConfig_config(arg0);
 }
 
@@ -734,7 +758,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 4;
@@ -761,6 +786,7 @@ Label_Abort:
 
 procedure ValidatorConfig_consensus_pubkey_verify (arg0: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := ValidatorConfig_consensus_pubkey(arg0);
 }
 
@@ -781,7 +807,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 4;
@@ -808,6 +835,7 @@ Label_Abort:
 
 procedure ValidatorConfig_validator_network_signing_pubkey_verify (arg0: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := ValidatorConfig_validator_network_signing_pubkey(arg0);
 }
 
@@ -828,7 +856,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 4;
@@ -855,6 +884,7 @@ Label_Abort:
 
 procedure ValidatorConfig_validator_network_identity_pubkey_verify (arg0: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := ValidatorConfig_validator_network_identity_pubkey(arg0);
 }
 
@@ -875,7 +905,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 4;
@@ -902,6 +933,7 @@ Label_Abort:
 
 procedure ValidatorConfig_validator_network_address_verify (arg0: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := ValidatorConfig_validator_network_address(arg0);
 }
 
@@ -922,7 +954,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 4;
@@ -949,6 +982,7 @@ Label_Abort:
 
 procedure ValidatorConfig_fullnodes_network_identity_pubkey_verify (arg0: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := ValidatorConfig_fullnodes_network_identity_pubkey(arg0);
 }
 
@@ -969,7 +1003,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 4;
@@ -996,6 +1031,7 @@ Label_Abort:
 
 procedure ValidatorConfig_fullnodes_network_address_verify (arg0: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := ValidatorConfig_fullnodes_network_address(arg0);
 }
 
@@ -1093,6 +1129,7 @@ Label_Abort:
 
 procedure ValidatorConfig_register_candidate_validator_verify (arg0: Value, arg1: Value, arg2: Value, arg3: Value, arg4: Value, arg5: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ValidatorConfig_register_candidate_validator(arg0, arg1, arg2, arg3, arg4, arg5);
 }
 
@@ -1164,6 +1201,7 @@ Label_Abort:
 
 procedure ValidatorConfig_rotate_consensus_pubkey_verify (arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ValidatorConfig_rotate_consensus_pubkey(arg0);
 }
 
@@ -1235,6 +1273,7 @@ Label_Abort:
 
 procedure ValidatorConfig_rotate_validator_network_identity_pubkey_verify (arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ValidatorConfig_rotate_validator_network_identity_pubkey(arg0);
 }
 
@@ -1306,6 +1345,7 @@ Label_Abort:
 
 procedure ValidatorConfig_rotate_validator_network_address_verify (arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ValidatorConfig_rotate_validator_network_address(arg0);
 }
 
@@ -1331,7 +1371,7 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume is#Integer(arg0);
+    assume IsValidInteger(arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 5;
@@ -1364,6 +1404,7 @@ Label_Abort:
 
 procedure LibraCoin_mint_with_default_capability_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraCoin_mint_with_default_capability(arg0);
 }
 
@@ -1391,10 +1432,11 @@ requires ExistsTxnSenderAccount(m, txn);
     var t17: Value; // IntegerType()
     var t18: Value; // IntegerType()
     var t19: Value; // IntegerType()
-    var t20: Reference; // ReferenceType(LibraCoin_MarketCap_type_value())
-    var t21: Reference; // ReferenceType(IntegerType())
-    var t22: Value; // IntegerType()
-    var t23: Value; // LibraCoin_T_type_value()
+    var t20: Value; // IntegerType()
+    var t21: Reference; // ReferenceType(LibraCoin_MarketCap_type_value())
+    var t22: Reference; // ReferenceType(IntegerType())
+    var t23: Value; // IntegerType()
+    var t24: Value; // LibraCoin_T_type_value()
 
     var tmp: Value;
     var old_size: int;
@@ -1404,11 +1446,12 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume is#Integer(arg0);
-    assume IsValidReferenceParameter(local_counter, arg1);
+    assume IsValidInteger(arg0);
+    assume is#Vector(Dereference(m, arg1));
+    assume IsValidReferenceParameter(m, local_counter, arg1);
 
     old_size := local_counter;
-    local_counter := local_counter + 24;
+    local_counter := local_counter + 25;
     m := UpdateLocal(m, old_size + 0, arg0);
     t1 := arg1;
 
@@ -1458,7 +1501,7 @@ Label_11:
     call t15 := BorrowField(t14, LibraCoin_MarketCap_total_value);
 
     call tmp := ReadRef(t15);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 16, tmp);
 
@@ -1471,25 +1514,27 @@ Label_11:
     call tmp := CopyOrMoveValue(GetLocal(m, old_size + 0));
     m := UpdateLocal(m, old_size + 18, tmp);
 
-    call tmp := Add(GetLocal(m, old_size + 17), GetLocal(m, old_size + 18));
+    m := UpdateLocal(m, old_size + 19, GetLocal(m, old_size + 18));
+
+    call tmp := Add(GetLocal(m, old_size + 17), GetLocal(m, old_size + 19));
     if (abort_flag) { goto Label_Abort; }
-    m := UpdateLocal(m, old_size + 19, tmp);
+    m := UpdateLocal(m, old_size + 20, tmp);
 
-    call t20 := CopyOrMoveRef(t2);
+    call t21 := CopyOrMoveRef(t2);
 
-    call t21 := BorrowField(t20, LibraCoin_MarketCap_total_value);
+    call t22 := BorrowField(t21, LibraCoin_MarketCap_total_value);
 
-    call WriteRef(t21, GetLocal(m, old_size + 19));
+    call WriteRef(t22, GetLocal(m, old_size + 20));
 
     call tmp := CopyOrMoveValue(GetLocal(m, old_size + 0));
-    m := UpdateLocal(m, old_size + 22, tmp);
-
-    assume is#Integer(GetLocal(m, old_size + 22));
-
-    call tmp := Pack_LibraCoin_T(GetLocal(m, old_size + 22));
     m := UpdateLocal(m, old_size + 23, tmp);
 
-    ret0 := GetLocal(m, old_size + 23);
+    assume IsValidInteger(GetLocal(m, old_size + 23));
+
+    call tmp := Pack_LibraCoin_T(GetLocal(m, old_size + 23));
+    m := UpdateLocal(m, old_size + 24, tmp);
+
+    ret0 := GetLocal(m, old_size + 24);
     return;
 
 Label_Abort:
@@ -1500,6 +1545,7 @@ Label_Abort:
 
 procedure LibraCoin_mint_verify (arg0: Value, arg1: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraCoin_mint(arg0, arg1);
 }
 
@@ -1565,7 +1611,7 @@ Label_7:
     call tmp := LdConst(0);
     m := UpdateLocal(m, old_size + 7, tmp);
 
-    assume is#Integer(GetLocal(m, old_size + 7));
+    assume IsValidInteger(GetLocal(m, old_size + 7));
 
     call tmp := Pack_LibraCoin_MarketCap(GetLocal(m, old_size + 7));
     m := UpdateLocal(m, old_size + 8, tmp);
@@ -1582,6 +1628,7 @@ Label_Abort:
 
 procedure LibraCoin_initialize_verify () returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraCoin_initialize();
 }
 
@@ -1616,7 +1663,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call t2 := BorrowField(t1, LibraCoin_MarketCap_total_value);
 
     call tmp := ReadRef(t2);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 3, tmp);
 
@@ -1631,6 +1678,7 @@ Label_Abort:
 
 procedure LibraCoin_market_cap_verify () returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraCoin_market_cap();
 }
 
@@ -1657,7 +1705,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call tmp := LdConst(0);
     m := UpdateLocal(m, old_size + 0, tmp);
 
-    assume is#Integer(GetLocal(m, old_size + 0));
+    assume IsValidInteger(GetLocal(m, old_size + 0));
 
     call tmp := Pack_LibraCoin_T(GetLocal(m, old_size + 0));
     m := UpdateLocal(m, old_size + 1, tmp);
@@ -1673,6 +1721,7 @@ Label_Abort:
 
 procedure LibraCoin_zero_verify () returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraCoin_zero();
 }
 
@@ -1693,7 +1742,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 4;
@@ -1705,7 +1755,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call t2 := BorrowField(t1, LibraCoin_T_value);
 
     call tmp := ReadRef(t2);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 3, tmp);
 
@@ -1720,6 +1770,7 @@ Label_Abort:
 
 procedure LibraCoin_value_verify (arg0: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraCoin_value(arg0);
 }
 
@@ -1745,7 +1796,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     // assume arguments are of correct types
     assume is#Vector(arg0);
-    assume is#Integer(arg1);
+    assume IsValidInteger(arg1);
 
     old_size := local_counter;
     local_counter := local_counter + 8;
@@ -1786,6 +1837,7 @@ Label_Abort:
 
 procedure LibraCoin_split_verify (arg0: Value, arg1: Value) returns (ret0: Value, ret1: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0, ret1 := LibraCoin_split(arg0, arg1);
 }
 
@@ -1820,8 +1872,9 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
-    assume is#Integer(arg1);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
+    assume IsValidInteger(arg1);
 
     old_size := local_counter;
     local_counter := local_counter + 18;
@@ -1834,7 +1887,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call t4 := BorrowField(t3, LibraCoin_T_value);
 
     call tmp := ReadRef(t4);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 5, tmp);
 
@@ -1881,7 +1934,7 @@ Label_11:
     call tmp := CopyOrMoveValue(GetLocal(m, old_size + 1));
     m := UpdateLocal(m, old_size + 16, tmp);
 
-    assume is#Integer(GetLocal(m, old_size + 16));
+    assume IsValidInteger(GetLocal(m, old_size + 16));
 
     call tmp := Pack_LibraCoin_T(GetLocal(m, old_size + 16));
     m := UpdateLocal(m, old_size + 17, tmp);
@@ -1897,6 +1950,7 @@ Label_Abort:
 
 procedure LibraCoin_withdraw_verify (arg0: Reference, arg1: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraCoin_withdraw(arg0, arg1);
 }
 
@@ -1949,6 +2003,7 @@ Label_Abort:
 
 procedure LibraCoin_join_verify (arg0: Value, arg1: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraCoin_join(arg0, arg1);
 }
 
@@ -1979,7 +2034,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
     assume is#Vector(arg1);
 
     old_size := local_counter;
@@ -1993,7 +2049,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call t5 := BorrowField(t4, LibraCoin_T_value);
 
     call tmp := ReadRef(t5);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 6, tmp);
 
@@ -2004,7 +2060,7 @@ requires ExistsTxnSenderAccount(m, txn);
     m := UpdateLocal(m, old_size + 7, tmp);
 
     call t8 := Unpack_LibraCoin_T(GetLocal(m, old_size + 7));
-    assume is#Integer(t8);
+    assume IsValidInteger(t8);
 
     m := UpdateLocal(m, old_size + 8, t8);
 
@@ -2036,6 +2092,7 @@ Label_Abort:
 
 procedure LibraCoin_deposit_verify (arg0: Reference, arg1: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraCoin_deposit(arg0, arg1);
 }
 
@@ -2072,7 +2129,7 @@ requires ExistsTxnSenderAccount(m, txn);
     m := UpdateLocal(m, old_size + 2, tmp);
 
     call t3 := Unpack_LibraCoin_T(GetLocal(m, old_size + 2));
-    assume is#Integer(t3);
+    assume IsValidInteger(t3);
 
     m := UpdateLocal(m, old_size + 3, t3);
 
@@ -2109,175 +2166,13 @@ Label_Abort:
 
 procedure LibraCoin_destroy_zero_verify (arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraCoin_destroy_zero(arg0);
 }
 
 
 
 // ** functions of module LibraAccount
-
-procedure {:inline 1} LibraAccount_make (arg0: Value) returns (ret0: Value)
-requires ExistsTxnSenderAccount(m, txn);
-{
-    // declare local variables
-    var t0: Value; // AddressType()
-    var t1: Value; // LibraCoin_T_type_value()
-    var t2: Value; // LibraAccount_EventHandleGenerator_type_value()
-    var t3: Value; // LibraAccount_EventHandle_type_value(LibraAccount_SentPaymentEvent_type_value())
-    var t4: Value; // LibraAccount_EventHandle_type_value(LibraAccount_ReceivedPaymentEvent_type_value())
-    var t5: Value; // ByteArrayType()
-    var t6: Value; // AddressType()
-    var t7: Value; // ByteArrayType()
-    var t8: Value; // IntegerType()
-    var t9: Value; // LibraAccount_EventHandleGenerator_type_value()
-    var t10: Reference; // ReferenceType(LibraAccount_EventHandleGenerator_type_value())
-    var t11: Value; // AddressType()
-    var t12: Value; // LibraAccount_EventHandle_type_value(LibraAccount_SentPaymentEvent_type_value())
-    var t13: Reference; // ReferenceType(LibraAccount_EventHandleGenerator_type_value())
-    var t14: Value; // AddressType()
-    var t15: Value; // LibraAccount_EventHandle_type_value(LibraAccount_ReceivedPaymentEvent_type_value())
-    var t16: Value; // LibraCoin_T_type_value()
-    var t17: Value; // ByteArrayType()
-    var t18: Value; // LibraCoin_T_type_value()
-    var t19: Value; // BooleanType()
-    var t20: Value; // BooleanType()
-    var t21: Value; // LibraAccount_EventHandle_type_value(LibraAccount_ReceivedPaymentEvent_type_value())
-    var t22: Value; // LibraAccount_EventHandle_type_value(LibraAccount_SentPaymentEvent_type_value())
-    var t23: Value; // IntegerType()
-    var t24: Value; // LibraAccount_EventHandleGenerator_type_value()
-    var t25: Value; // LibraAccount_T_type_value()
-
-    var tmp: Value;
-    var old_size: int;
-
-    var saved_m: Memory;
-    assume !abort_flag;
-    saved_m := m;
-
-    // assume arguments are of correct types
-    assume is#Address(arg0);
-
-    old_size := local_counter;
-    local_counter := local_counter + 26;
-    m := UpdateLocal(m, old_size + 0, arg0);
-
-    // bytecode translation starts here
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 0));
-    m := UpdateLocal(m, old_size + 6, tmp);
-
-    call t7 := AddressUtil_address_to_bytes(GetLocal(m, old_size + 6));
-    if (abort_flag) { goto Label_Abort; }
-    assume is#ByteArray(t7);
-
-    m := UpdateLocal(m, old_size + 7, t7);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 7));
-    m := UpdateLocal(m, old_size + 5, tmp);
-
-    call tmp := LdConst(0);
-    m := UpdateLocal(m, old_size + 8, tmp);
-
-    assume is#Integer(GetLocal(m, old_size + 8));
-
-    call tmp := Pack_LibraAccount_EventHandleGenerator(GetLocal(m, old_size + 8));
-    m := UpdateLocal(m, old_size + 9, tmp);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 9));
-    m := UpdateLocal(m, old_size + 2, tmp);
-
-    call t10 := BorrowLoc(old_size+2);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 0));
-    m := UpdateLocal(m, old_size + 11, tmp);
-
-    call t12 := LibraAccount_new_event_handle_impl(LibraAccount_SentPaymentEvent_type_value(), t10, GetLocal(m, old_size + 11));
-    if (abort_flag) { goto Label_Abort; }
-    assume is#Vector(t12);
-
-    m := UpdateLocal(m, old_size + 12, t12);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 12));
-    m := UpdateLocal(m, old_size + 3, tmp);
-
-    call t13 := BorrowLoc(old_size+2);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 0));
-    m := UpdateLocal(m, old_size + 14, tmp);
-
-    call t15 := LibraAccount_new_event_handle_impl(LibraAccount_ReceivedPaymentEvent_type_value(), t13, GetLocal(m, old_size + 14));
-    if (abort_flag) { goto Label_Abort; }
-    assume is#Vector(t15);
-
-    m := UpdateLocal(m, old_size + 15, t15);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 15));
-    m := UpdateLocal(m, old_size + 4, tmp);
-
-    call t16 := LibraCoin_zero();
-    if (abort_flag) { goto Label_Abort; }
-    assume is#Vector(t16);
-
-    m := UpdateLocal(m, old_size + 16, t16);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 16));
-    m := UpdateLocal(m, old_size + 1, tmp);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 5));
-    m := UpdateLocal(m, old_size + 17, tmp);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 1));
-    m := UpdateLocal(m, old_size + 18, tmp);
-
-    call tmp := LdFalse();
-    m := UpdateLocal(m, old_size + 19, tmp);
-
-    call tmp := LdFalse();
-    m := UpdateLocal(m, old_size + 20, tmp);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 4));
-    m := UpdateLocal(m, old_size + 21, tmp);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 3));
-    m := UpdateLocal(m, old_size + 22, tmp);
-
-    call tmp := LdConst(0);
-    m := UpdateLocal(m, old_size + 23, tmp);
-
-    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 2));
-    m := UpdateLocal(m, old_size + 24, tmp);
-
-    assume is#ByteArray(GetLocal(m, old_size + 17));
-
-    assume is#Vector(GetLocal(m, old_size + 18));
-
-    assume is#Boolean(GetLocal(m, old_size + 19));
-
-    assume is#Boolean(GetLocal(m, old_size + 20));
-
-    assume is#Vector(GetLocal(m, old_size + 21));
-
-    assume is#Vector(GetLocal(m, old_size + 22));
-
-    assume is#Integer(GetLocal(m, old_size + 23));
-
-    assume is#Vector(GetLocal(m, old_size + 24));
-
-    call tmp := Pack_LibraAccount_T(GetLocal(m, old_size + 17), GetLocal(m, old_size + 18), GetLocal(m, old_size + 19), GetLocal(m, old_size + 20), GetLocal(m, old_size + 21), GetLocal(m, old_size + 22), GetLocal(m, old_size + 23), GetLocal(m, old_size + 24));
-    m := UpdateLocal(m, old_size + 25, tmp);
-
-    ret0 := GetLocal(m, old_size + 25);
-    return;
-
-Label_Abort:
-    abort_flag := true;
-    m := saved_m;
-    ret0 := DefaultValue;
-}
-
-procedure LibraAccount_make_verify (arg0: Value) returns (ret0: Value)
-{
-    call ret0 := LibraAccount_make(arg0);
-}
 
 procedure {:inline 1} LibraAccount_deposit (arg0: Value, arg1: Value) returns ()
 requires ExistsTxnSenderAccount(m, txn);
@@ -2326,6 +2221,7 @@ Label_Abort:
 
 procedure LibraAccount_deposit_verify (arg0: Value, arg1: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_deposit(arg0, arg1);
 }
 
@@ -2384,6 +2280,7 @@ Label_Abort:
 
 procedure LibraAccount_deposit_with_metadata_verify (arg0: Value, arg1: Value, arg2: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_deposit_with_metadata(arg0, arg1, arg2);
 }
 
@@ -2450,7 +2347,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     call t8 := LibraCoin_value(t7);
     if (abort_flag) { goto Label_Abort; }
-    assume is#Integer(t8);
+    assume IsValidInteger(t8);
 
     m := UpdateLocal(m, old_size + 8, t8);
 
@@ -2499,7 +2396,7 @@ Label_10:
     call tmp := CopyOrMoveValue(GetLocal(m, old_size + 3));
     m := UpdateLocal(m, old_size + 20, tmp);
 
-    assume is#Integer(GetLocal(m, old_size + 18));
+    assume IsValidInteger(GetLocal(m, old_size + 18));
 
     assume is#Address(GetLocal(m, old_size + 19));
 
@@ -2542,7 +2439,7 @@ Label_10:
     call tmp := CopyOrMoveValue(GetLocal(m, old_size + 3));
     m := UpdateLocal(m, old_size + 31, tmp);
 
-    assume is#Integer(GetLocal(m, old_size + 29));
+    assume IsValidInteger(GetLocal(m, old_size + 29));
 
     assume is#Address(GetLocal(m, old_size + 30));
 
@@ -2563,6 +2460,7 @@ Label_Abort:
 
 procedure LibraAccount_deposit_with_sender_and_metadata_verify (arg0: Value, arg1: Value, arg2: Value, arg3: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_deposit_with_sender_and_metadata(arg0, arg1, arg2, arg3);
 }
 
@@ -2589,7 +2487,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     // assume arguments are of correct types
     assume is#Address(arg0);
-    assume is#Integer(arg1);
+    assume IsValidInteger(arg1);
 
     old_size := local_counter;
     local_counter := local_counter + 9;
@@ -2640,6 +2538,7 @@ Label_Abort:
 
 procedure LibraAccount_mint_to_address_verify (arg0: Value, arg1: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_mint_to_address(arg0, arg1);
 }
 
@@ -2664,8 +2563,9 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
-    assume is#Integer(arg1);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
+    assume IsValidInteger(arg1);
 
     old_size := local_counter;
     local_counter := local_counter + 8;
@@ -2703,6 +2603,7 @@ Label_Abort:
 
 procedure LibraAccount_withdraw_from_account_verify (arg0: Reference, arg1: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_withdraw_from_account(arg0, arg1);
 }
 
@@ -2730,7 +2631,7 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume is#Integer(arg0);
+    assume IsValidInteger(arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 11;
@@ -2785,6 +2686,7 @@ Label_Abort:
 
 procedure LibraAccount_withdraw_from_sender_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_withdraw_from_sender(arg0);
 }
 
@@ -2811,8 +2713,9 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
-    assume is#Integer(arg1);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
+    assume IsValidInteger(arg1);
 
     old_size := local_counter;
     local_counter := local_counter + 10;
@@ -2856,6 +2759,7 @@ Label_Abort:
 
 procedure LibraAccount_withdraw_with_capability_verify (arg0: Reference, arg1: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_withdraw_with_capability(arg0, arg1);
 }
 
@@ -2954,6 +2858,7 @@ Label_Abort:
 
 procedure LibraAccount_extract_sender_withdrawal_capability_verify () returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_extract_sender_withdrawal_capability();
 }
 
@@ -3024,6 +2929,7 @@ Label_Abort:
 
 procedure LibraAccount_restore_withdrawal_capability_verify (arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_restore_withdrawal_capability(arg0);
 }
 
@@ -3057,8 +2963,9 @@ requires ExistsTxnSenderAccount(m, txn);
 
     // assume arguments are of correct types
     assume is#Address(arg0);
-    assume IsValidReferenceParameter(local_counter, arg1);
-    assume is#Integer(arg2);
+    assume is#Vector(Dereference(m, arg1));
+    assume IsValidReferenceParameter(m, local_counter, arg1);
+    assume IsValidInteger(arg2);
     assume is#ByteArray(arg3);
 
     old_size := local_counter;
@@ -3111,7 +3018,8 @@ Label_6:
 
     m := UpdateLocal(m, old_size + 14, t14);
 
-    // unimplemented instruction
+    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 3));
+    m := UpdateLocal(m, old_size + 15, tmp);
 
     call LibraAccount_deposit_with_sender_and_metadata(GetLocal(m, old_size + 8), GetLocal(m, old_size + 11), GetLocal(m, old_size + 14), GetLocal(m, old_size + 15));
     if (abort_flag) { goto Label_Abort; }
@@ -3125,6 +3033,7 @@ Label_Abort:
 
 procedure LibraAccount_pay_from_capability_verify (arg0: Value, arg1: Reference, arg2: Value, arg3: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_pay_from_capability(arg0, arg1, arg2, arg3);
 }
 
@@ -3153,7 +3062,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     // assume arguments are of correct types
     assume is#Address(arg0);
-    assume is#Integer(arg1);
+    assume IsValidInteger(arg1);
     assume is#ByteArray(arg2);
 
     old_size := local_counter;
@@ -3209,6 +3118,7 @@ Label_Abort:
 
 procedure LibraAccount_pay_from_sender_with_metadata_verify (arg0: Value, arg1: Value, arg2: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_pay_from_sender_with_metadata(arg0, arg1, arg2);
 }
 
@@ -3231,7 +3141,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     // assume arguments are of correct types
     assume is#Address(arg0);
-    assume is#Integer(arg1);
+    assume IsValidInteger(arg1);
 
     old_size := local_counter;
     local_counter := local_counter + 5;
@@ -3259,6 +3169,7 @@ Label_Abort:
 
 procedure LibraAccount_pay_from_sender_verify (arg0: Value, arg1: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_pay_from_sender(arg0, arg1);
 }
 
@@ -3280,7 +3191,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
     assume is#ByteArray(arg1);
 
     old_size := local_counter;
@@ -3307,6 +3219,7 @@ Label_Abort:
 
 procedure LibraAccount_rotate_authentication_key_for_account_verify (arg0: Reference, arg1: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_rotate_authentication_key_for_account(arg0, arg1);
 }
 
@@ -3383,6 +3296,7 @@ Label_Abort:
 
 procedure LibraAccount_rotate_authentication_key_verify (arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_rotate_authentication_key(arg0);
 }
 
@@ -3406,7 +3320,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
     assume is#ByteArray(arg1);
 
     old_size := local_counter;
@@ -3442,6 +3357,7 @@ Label_Abort:
 
 procedure LibraAccount_rotate_authentication_key_with_capability_verify (arg0: Reference, arg1: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_rotate_authentication_key_with_capability(arg0, arg1);
 }
 
@@ -3534,6 +3450,7 @@ Label_Abort:
 
 procedure LibraAccount_extract_sender_key_rotation_capability_verify () returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_extract_sender_key_rotation_capability();
 }
 
@@ -3604,6 +3521,7 @@ Label_Abort:
 
 procedure LibraAccount_restore_key_rotation_capability_verify (arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_restore_key_rotation_capability(arg0);
 }
 
@@ -3649,7 +3567,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call tmp := LdConst(0);
     m := UpdateLocal(m, old_size + 2, tmp);
 
-    assume is#Integer(GetLocal(m, old_size + 2));
+    assume IsValidInteger(GetLocal(m, old_size + 2));
 
     call tmp := Pack_LibraAccount_EventHandleGenerator(GetLocal(m, old_size + 2));
     m := UpdateLocal(m, old_size + 3, tmp);
@@ -3721,7 +3639,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     assume is#Vector(GetLocal(m, old_size + 15));
 
-    assume is#Integer(GetLocal(m, old_size + 16));
+    assume IsValidInteger(GetLocal(m, old_size + 16));
 
     assume is#Vector(GetLocal(m, old_size + 17));
 
@@ -3740,6 +3658,7 @@ Label_Abort:
 
 procedure LibraAccount_create_account_verify (arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_create_account(arg0);
 }
 
@@ -3765,7 +3684,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     // assume arguments are of correct types
     assume is#Address(arg0);
-    assume is#Integer(arg1);
+    assume IsValidInteger(arg1);
 
     old_size := local_counter;
     local_counter := local_counter + 8;
@@ -3810,10 +3729,14 @@ Label_Abort:
 
 procedure LibraAccount_create_new_account_verify (arg0: Value, arg1: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_create_new_account(arg0, arg1);
 }
 
-procedure {:inline 1} LibraAccount_save_account (arg0: Value, arg1: Value) returns ();procedure {:inline 1} LibraAccount_balance_for_account (arg0: Reference) returns (ret0: Value)
+procedure {:inline 1} LibraAccount_save_account (arg0: Value, arg1: Value) returns ();
+requires ExistsTxnSenderAccount(m, txn);
+
+procedure {:inline 1} LibraAccount_balance_for_account (arg0: Reference) returns (ret0: Value)
 requires ExistsTxnSenderAccount(m, txn);
 {
     // declare local variables
@@ -3832,7 +3755,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 6;
@@ -3845,7 +3769,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     call t4 := LibraCoin_value(t3);
     if (abort_flag) { goto Label_Abort; }
-    assume is#Integer(t4);
+    assume IsValidInteger(t4);
 
     m := UpdateLocal(m, old_size + 4, t4);
 
@@ -3866,6 +3790,7 @@ Label_Abort:
 
 procedure LibraAccount_balance_for_account_verify (arg0: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_balance_for_account(arg0);
 }
 
@@ -3901,7 +3826,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     call t3 := LibraAccount_balance_for_account(t2);
     if (abort_flag) { goto Label_Abort; }
-    assume is#Integer(t3);
+    assume IsValidInteger(t3);
 
     m := UpdateLocal(m, old_size + 3, t3);
 
@@ -3916,6 +3841,7 @@ Label_Abort:
 
 procedure LibraAccount_balance_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_balance(arg0);
 }
 
@@ -3936,7 +3862,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 4;
@@ -3948,7 +3875,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call t2 := BorrowField(t1, LibraAccount_T_sequence_number);
 
     call tmp := ReadRef(t2);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 3, tmp);
 
@@ -3963,6 +3890,7 @@ Label_Abort:
 
 procedure LibraAccount_sequence_number_for_account_verify (arg0: Reference) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_sequence_number_for_account(arg0);
 }
 
@@ -3998,7 +3926,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     call t3 := LibraAccount_sequence_number_for_account(t2);
     if (abort_flag) { goto Label_Abort; }
-    assume is#Integer(t3);
+    assume IsValidInteger(t3);
 
     m := UpdateLocal(m, old_size + 3, t3);
 
@@ -4013,6 +3941,7 @@ Label_Abort:
 
 procedure LibraAccount_sequence_number_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_sequence_number(arg0);
 }
 
@@ -4065,6 +3994,7 @@ Label_Abort:
 
 procedure LibraAccount_delegated_key_rotation_capability_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_delegated_key_rotation_capability(arg0);
 }
 
@@ -4117,6 +4047,7 @@ Label_Abort:
 
 procedure LibraAccount_delegated_withdrawal_capability_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_delegated_withdrawal_capability(arg0);
 }
 
@@ -4136,7 +4067,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 3;
@@ -4158,6 +4090,7 @@ Label_Abort:
 
 procedure LibraAccount_withdrawal_capability_address_verify (arg0: Reference) returns (ret0: Reference)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_withdrawal_capability_address(arg0);
 }
 
@@ -4177,7 +4110,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 3;
@@ -4199,6 +4133,7 @@ Label_Abort:
 
 procedure LibraAccount_key_rotation_capability_address_verify (arg0: Reference) returns (ret0: Reference)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_key_rotation_capability_address(arg0);
 }
 
@@ -4242,6 +4177,7 @@ Label_Abort:
 
 procedure LibraAccount_exists_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_exists(arg0);
 }
 
@@ -4308,10 +4244,10 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume is#Integer(arg0);
+    assume IsValidInteger(arg0);
     assume is#ByteArray(arg1);
-    assume is#Integer(arg2);
-    assume is#Integer(arg3);
+    assume IsValidInteger(arg2);
+    assume IsValidInteger(arg3);
 
     old_size := local_counter;
     local_counter := local_counter + 50;
@@ -4409,7 +4345,7 @@ Label_21:
 
     call t31 := LibraAccount_balance_for_account(t30);
     if (abort_flag) { goto Label_Abort; }
-    assume is#Integer(t31);
+    assume IsValidInteger(t31);
 
     m := UpdateLocal(m, old_size + 31, t31);
 
@@ -4442,7 +4378,7 @@ Label_38:
     call t38 := BorrowField(t37, LibraAccount_T_sequence_number);
 
     call tmp := ReadRef(t38);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 39, tmp);
 
@@ -4500,6 +4436,7 @@ Label_Abort:
 
 procedure LibraAccount_prologue_verify (arg0: Value, arg1: Value, arg2: Value, arg3: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_prologue(arg0, arg1, arg2, arg3);
 }
 
@@ -4553,10 +4490,10 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume is#Integer(arg0);
-    assume is#Integer(arg1);
-    assume is#Integer(arg2);
-    assume is#Integer(arg3);
+    assume IsValidInteger(arg0);
+    assume IsValidInteger(arg1);
+    assume IsValidInteger(arg2);
+    assume IsValidInteger(arg3);
 
     old_size := local_counter;
     local_counter := local_counter + 37;
@@ -4604,7 +4541,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     call t19 := LibraAccount_balance_for_account(t18);
     if (abort_flag) { goto Label_Abort; }
-    assume is#Integer(t19);
+    assume IsValidInteger(t19);
 
     m := UpdateLocal(m, old_size + 19, t19);
 
@@ -4683,6 +4620,7 @@ Label_Abort:
 
 procedure LibraAccount_epilogue_verify (arg0: Value, arg1: Value, arg2: Value, arg3: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_epilogue(arg0, arg1, arg2, arg3);
 }
 
@@ -4721,7 +4659,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
     assume is#Address(arg1);
 
     old_size := local_counter;
@@ -4751,7 +4690,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call t10 := CopyOrMoveRef(t2);
 
     call tmp := ReadRef(t10);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 11, tmp);
 
@@ -4767,7 +4706,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call t13 := CopyOrMoveRef(t2);
 
     call tmp := ReadRef(t13);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 14, tmp);
 
@@ -4811,6 +4750,7 @@ Label_Abort:
 
 procedure LibraAccount_fresh_guid_verify (arg0: Reference, arg1: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_fresh_guid(arg0, arg1);
 }
 
@@ -4834,7 +4774,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
     assume is#Address(arg1);
 
     old_size := local_counter;
@@ -4857,7 +4798,7 @@ requires ExistsTxnSenderAccount(m, txn);
 
     m := UpdateLocal(m, old_size + 5, t5);
 
-    assume is#Integer(GetLocal(m, old_size + 2));
+    assume IsValidInteger(GetLocal(m, old_size + 2));
 
     assume is#ByteArray(GetLocal(m, old_size + 5));
 
@@ -4875,6 +4816,7 @@ Label_Abort:
 
 procedure LibraAccount_new_event_handle_impl_verify (tv0: TypeValue, arg0: Reference, arg1: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_new_event_handle_impl(tv0: TypeValue, arg0, arg1);
 }
 
@@ -4936,6 +4878,7 @@ Label_Abort:
 
 procedure LibraAccount_new_event_handle_verify (tv0: TypeValue) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := LibraAccount_new_event_handle(tv0: TypeValue);
 }
 
@@ -4970,7 +4913,8 @@ requires ExistsTxnSenderAccount(m, txn);
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 18;
@@ -5002,7 +4946,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call t10 := CopyOrMoveRef(t2);
 
     call tmp := ReadRef(t10);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 11, tmp);
 
@@ -5015,7 +4959,7 @@ requires ExistsTxnSenderAccount(m, txn);
     call t13 := CopyOrMoveRef(t2);
 
     call tmp := ReadRef(t13);
-    assume is#Integer(tmp);
+    assume IsValidInteger(tmp);
 
     m := UpdateLocal(m, old_size + 14, tmp);
 
@@ -5039,10 +4983,14 @@ Label_Abort:
 
 procedure LibraAccount_emit_event_verify (tv0: TypeValue, arg0: Reference, arg1: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_emit_event(tv0: TypeValue, arg0, arg1);
 }
 
-procedure {:inline 1} LibraAccount_write_to_event_store (tv0: TypeValue, arg0: Value, arg1: Value, arg2: Value) returns ();procedure {:inline 1} LibraAccount_destroy_handle (tv0: TypeValue, arg0: Value) returns ()
+procedure {:inline 1} LibraAccount_write_to_event_store (tv0: TypeValue, arg0: Value, arg1: Value, arg2: Value) returns ();
+requires ExistsTxnSenderAccount(m, txn);
+
+procedure {:inline 1} LibraAccount_destroy_handle (tv0: TypeValue, arg0: Value) returns ()
 requires ExistsTxnSenderAccount(m, txn);
 {
     // declare local variables
@@ -5072,7 +5020,7 @@ requires ExistsTxnSenderAccount(m, txn);
     m := UpdateLocal(m, old_size + 3, tmp);
 
     call t4, t5 := Unpack_LibraAccount_EventHandle(GetLocal(m, old_size + 3));
-    assume is#Integer(t4);
+    assume IsValidInteger(t4);
 
     assume is#ByteArray(t5);
 
@@ -5094,6 +5042,7 @@ Label_Abort:
 
 procedure LibraAccount_destroy_handle_verify (tv0: TypeValue, arg0: Value) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call LibraAccount_destroy_handle(tv0: TypeValue, arg0);
 }
 

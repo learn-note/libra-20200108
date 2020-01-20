@@ -1,4 +1,14 @@
 
+// ** helpers from test_mvir/test-specs-translate.prover.bpl// Boogie helper functions for test-specs-translate.mvir
+
+function {:inline} number_in_range(x: Value): Value {
+  Boolean(i#Integer(x) >= 0 && i#Integer(x) < 128)
+}
+
+function {:inline} max_u64(): Value {
+  Integer(MAX_U64)
+}
+
 
 // ** structs of module TestSpecs
 
@@ -33,7 +43,7 @@ function TestSpecs_R_type_value(): TypeValue {
 
 procedure {:inline 1} Pack_TestSpecs_R(v0: Value, v1: Value) returns (v: Value)
 {
-    assume is#Integer(v0);
+    assume IsValidInteger(v0);
     assume is#Vector(v1);
     v := Vector(ExtendValueArray(ExtendValueArray(EmptyValueArray, v0), v1));
 
@@ -74,8 +84,8 @@ ensures old(b#Boolean(Boolean(i#Integer(arg0) <= i#Integer(Integer(0))))) ==> ab
     saved_m := m;
 
     // assume arguments are of correct types
-    assume is#Integer(arg0);
-    assume is#Integer(arg1);
+    assume IsValidInteger(arg0);
+    assume IsValidInteger(arg1);
 
     old_size := local_counter;
     local_counter := local_counter + 7;
@@ -110,6 +120,7 @@ Label_Abort:
 
 procedure TestSpecs_div_verify (arg0: Value, arg1: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := TestSpecs_div(arg0, arg1);
 }
 
@@ -143,6 +154,7 @@ Label_Abort:
 
 procedure TestSpecs_create_resource_verify () returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call TestSpecs_create_resource();
 }
 
@@ -174,6 +186,7 @@ Label_Abort:
 
 procedure TestSpecs_select_from_global_resource_verify () returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call TestSpecs_select_from_global_resource();
 }
 
@@ -214,6 +227,7 @@ Label_Abort:
 
 procedure TestSpecs_select_from_resource_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := TestSpecs_select_from_resource(arg0);
 }
 
@@ -254,6 +268,7 @@ Label_Abort:
 
 procedure TestSpecs_select_from_resource_nested_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := TestSpecs_select_from_resource_nested(arg0);
 }
 
@@ -294,6 +309,7 @@ Label_Abort:
 
 procedure TestSpecs_select_from_global_resource_dynamic_address_verify (arg0: Value) returns (ret0: Value)
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call ret0 := TestSpecs_select_from_global_resource_dynamic_address(arg0);
 }
 
@@ -313,7 +329,8 @@ ensures b#Boolean(Boolean((SelectField(SelectField(Dereference(m, arg0), TestSpe
     saved_m := m;
 
     // assume arguments are of correct types
-    assume IsValidReferenceParameter(local_counter, arg0);
+    assume is#Vector(Dereference(m, arg0));
+    assume IsValidReferenceParameter(m, local_counter, arg0);
 
     old_size := local_counter;
     local_counter := local_counter + 1;
@@ -329,5 +346,99 @@ Label_Abort:
 
 procedure TestSpecs_select_from_reference_verify (arg0: Reference) returns ()
 {
+    assume ExistsTxnSenderAccount(m, txn);
     call TestSpecs_select_from_reference(arg0);
+}
+
+procedure {:inline 1} TestSpecs_ret_values () returns (ret0: Value, ret1: Value, ret2: Value)
+requires ExistsTxnSenderAccount(m, txn);
+ensures b#Boolean(Boolean((ret0) == (Integer(7))));
+ensures b#Boolean(Boolean((ret1) == (Boolean(false))));
+ensures b#Boolean(Boolean((ret2) == (Integer(10))));
+{
+    // declare local variables
+    var t0: Value; // IntegerType()
+    var t1: Value; // BooleanType()
+    var t2: Value; // IntegerType()
+
+    var tmp: Value;
+    var old_size: int;
+
+    var saved_m: Memory;
+    assume !abort_flag;
+    saved_m := m;
+
+    // assume arguments are of correct types
+
+    old_size := local_counter;
+    local_counter := local_counter + 3;
+
+    // bytecode translation starts here
+    call tmp := LdConst(7);
+    m := UpdateLocal(m, old_size + 0, tmp);
+
+    call tmp := LdFalse();
+    m := UpdateLocal(m, old_size + 1, tmp);
+
+    call tmp := LdConst(10);
+    m := UpdateLocal(m, old_size + 2, tmp);
+
+    ret0 := GetLocal(m, old_size + 0);
+    ret1 := GetLocal(m, old_size + 1);
+    ret2 := GetLocal(m, old_size + 2);
+    return;
+
+Label_Abort:
+    abort_flag := true;
+    m := saved_m;
+    ret0 := DefaultValue;
+    ret1 := DefaultValue;
+    ret2 := DefaultValue;
+}
+
+procedure TestSpecs_ret_values_verify () returns (ret0: Value, ret1: Value, ret2: Value)
+{
+    assume ExistsTxnSenderAccount(m, txn);
+    call ret0, ret1, ret2 := TestSpecs_ret_values();
+}
+
+procedure {:inline 1} TestSpecs_helper_function (arg0: Value) returns (ret0: Value)
+requires ExistsTxnSenderAccount(m, txn);
+ensures b#Boolean(Boolean(b#Boolean(number_in_range(arg0)) && b#Boolean(Boolean(i#Integer(arg0) < i#Integer(max_u64())))));
+{
+    // declare local variables
+    var t0: Value; // IntegerType()
+    var t1: Value; // IntegerType()
+
+    var tmp: Value;
+    var old_size: int;
+
+    var saved_m: Memory;
+    assume !abort_flag;
+    saved_m := m;
+
+    // assume arguments are of correct types
+    assume IsValidInteger(arg0);
+
+    old_size := local_counter;
+    local_counter := local_counter + 2;
+    m := UpdateLocal(m, old_size + 0, arg0);
+
+    // bytecode translation starts here
+    call tmp := CopyOrMoveValue(GetLocal(m, old_size + 0));
+    m := UpdateLocal(m, old_size + 1, tmp);
+
+    ret0 := GetLocal(m, old_size + 1);
+    return;
+
+Label_Abort:
+    abort_flag := true;
+    m := saved_m;
+    ret0 := DefaultValue;
+}
+
+procedure TestSpecs_helper_function_verify (arg0: Value) returns (ret0: Value)
+{
+    assume ExistsTxnSenderAccount(m, txn);
+    call ret0 := TestSpecs_helper_function(arg0);
 }

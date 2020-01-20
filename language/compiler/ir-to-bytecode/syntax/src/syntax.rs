@@ -274,6 +274,7 @@ fn parse_copyable_val_<'input>(
 fn get_precedence(token: &Tok) -> u32 {
     match token {
         // Reserved minimum precedence value is 1 (specified in parse_exp_)
+        Tok::EqualEqualGreater => 1,
         Tok::PipePipe => 2,
         Tok::AmpAmp => 3,
         Tok::EqualEqual => 4,
@@ -1333,17 +1334,48 @@ fn parse_acquire_list<'input>(
     Ok(al)
 }
 
-//// Spec langauge parsing ////
+//// Spec language parsing ////
+
+// parses Name '.' Name and returns pair of strings.
+fn spec_parse_dot_name<'input>(
+    tokens: &mut Lexer<'input>,
+) -> Result<(String, String), ParseError<usize, anyhow::Error>> {
+    let name1 = parse_name(tokens)?;
+    consume_token(tokens, Tok::Period)?;
+    let name2 = parse_name(tokens)?;
+    Ok((name1, name2))
+}
+
+fn spec_parse_qualified_struct_ident<'input>(
+    tokens: &mut Lexer<'input>,
+) -> Result<QualifiedStructIdent, ParseError<usize, anyhow::Error>> {
+    let (m_string, n_string) = spec_parse_dot_name(tokens)?;
+    let m: ModuleName = ModuleName::parse(m_string)?;
+    let n: StructName = StructName::parse(n_string)?;
+    Ok(QualifiedStructIdent::new(m, n))
+}
 
 fn parse_storage_location<'input>(
     tokens: &mut Lexer<'input>,
 ) -> Result<StorageLocation, ParseError<usize, anyhow::Error>> {
     let base = match tokens.peek() {
-        // TODO: probably shouldn't reuse the Move return operator, but reserving "ret" as a
-        // keyword caused too many parse errors in existing code
-        Tok::Return => {
+        Tok::SpecReturn => {
+            // RET(i)
             tokens.advance()?;
-            StorageLocation::Ret
+            let i = {
+                if tokens.peek() == Tok::LParen {
+                    consume_token(tokens, Tok::LParen)?;
+                    let i = u8::from_str(tokens.content()).unwrap();
+                    consume_token(tokens, Tok::U64Value)?;
+                    consume_token(tokens, Tok::RParen)?;
+                    i
+                } else {
+                    // RET without brackets; use RET(0)
+                    0
+                }
+            };
+
+            StorageLocation::Ret(i)
         }
         Tok::TxnSender => {
             tokens.advance()?;
@@ -1351,8 +1383,9 @@ fn parse_storage_location<'input>(
         }
         Tok::AccountAddressValue => StorageLocation::Address(parse_account_address(tokens)?),
         Tok::Global => {
-            tokens.advance()?; // this consumes 'global<' due to parser funkiness
-            let type_ = parse_qualified_struct_ident(tokens)?;
+            consume_token(tokens, Tok::Global)?;
+            consume_token(tokens, Tok::Less)?;
+            let type_ = spec_parse_qualified_struct_ident(tokens)?;
             let type_actuals = parse_type_actuals(tokens)?;
             consume_token(tokens, Tok::Greater)?;
             consume_token(tokens, Tok::LParen)?;
@@ -1364,22 +1397,12 @@ fn parse_storage_location<'input>(
                 address,
             }
         }
-        Tok::Old => {
-            tokens.advance()?;
-            consume_token(tokens, Tok::LParen)?;
-            let stloc = parse_storage_location(tokens)?;
-            consume_token(tokens, Tok::RParen)?;
-            StorageLocation::Old(Box::new(stloc))
-        }
         _ => StorageLocation::Formal(parse_name(tokens)?),
     };
 
     // parsed the storage location base. now parse its fields (if any)
     let mut fields = vec![];
-    // TODO: in the long term, using slash is a bad choice because of the conflict with division
-    // (e.g., x/f / y == 7 is ambiguous), but the current parser has a hangup with our desired
-    // syntax '.' (see DotNameValue)
-    while tokens.peek() == Tok::Slash {
+    while tokens.peek() == Tok::Period {
         tokens.advance()?;
         fields.push(parse_field_(tokens)?.value);
     }
@@ -1405,8 +1428,9 @@ fn parse_unary_spec_exp<'input>(
         | Tok::U128Value
         | Tok::ByteArrayValue => SpecExp::Constant(parse_copyable_val_(tokens)?.value),
         Tok::GlobalExists => {
-            tokens.advance()?; // this consumes 'global_exists<' due to parser funkiness
-            let type_ = parse_qualified_struct_ident(tokens)?;
+            consume_token(tokens, Tok::GlobalExists)?;
+            consume_token(tokens, Tok::Less)?;
+            let type_ = spec_parse_qualified_struct_ident(tokens)?;
             let type_actuals = parse_type_actuals(tokens)?;
             consume_token(tokens, Tok::Greater)?;
             consume_token(tokens, Tok::LParen)?;
@@ -1432,6 +1456,33 @@ fn parse_unary_spec_exp<'input>(
             tokens.advance()?;
             let exp = parse_spec_exp(tokens)?;
             SpecExp::Not(Box::new(exp))
+        }
+        Tok::Old => {
+            tokens.advance()?;
+            consume_token(tokens, Tok::LParen)?;
+            let exp = parse_spec_exp(tokens)?;
+            consume_token(tokens, Tok::RParen)?;
+            SpecExp::Old(Box::new(exp))
+        }
+        Tok::NameValue => {
+            let next = tokens.lookahead();
+            if next.is_err() || next.unwrap() != Tok::LParen {
+                SpecExp::StorageLocation(parse_storage_location(tokens)?)
+            } else {
+                let name = parse_name(tokens)?;
+                let mut args = vec![];
+                consume_token(tokens, Tok::LParen)?;
+                while tokens.peek() != Tok::RParen {
+                    let exp = parse_spec_exp(tokens)?;
+                    args.push(exp);
+                    if tokens.peek() != Tok::Comma {
+                        break;
+                    }
+                    consume_token(tokens, Tok::Comma)?;
+                }
+                consume_token(tokens, Tok::RParen)?;
+                SpecExp::Call(name, args)
+            }
         }
         _ => SpecExp::StorageLocation(parse_storage_location(tokens)?),
     })
@@ -1461,27 +1512,35 @@ fn parse_rhs_of_spec_exp<'input>(
             rhs = parse_rhs_of_spec_exp(tokens, rhs, this_prec + 1)?;
             next_tok_prec = get_precedence(&tokens.peek());
         }
-
-        let op = match op_token {
-            Tok::EqualEqual => BinOp::Eq,
-            Tok::ExclaimEqual => BinOp::Neq,
-            Tok::Less => BinOp::Lt,
-            Tok::Greater => BinOp::Gt,
-            Tok::LessEqual => BinOp::Le,
-            Tok::GreaterEqual => BinOp::Ge,
-            Tok::PipePipe => BinOp::Or,
-            Tok::AmpAmp => BinOp::And,
-            Tok::Caret => BinOp::Xor,
-            Tok::Pipe => BinOp::BitOr,
-            Tok::Amp => BinOp::BitAnd,
-            Tok::Plus => BinOp::Add,
-            Tok::Minus => BinOp::Sub,
-            Tok::Star => BinOp::Mul,
-            Tok::Slash => BinOp::Div,
-            Tok::Percent => BinOp::Mod,
-            _ => panic!("Unexpected token that is not a binary operator"),
-        };
-        result = SpecExp::Binop(Box::new(result), op, Box::new(rhs))
+        if op_token == Tok::EqualEqualGreater {
+            // Syntactic sugar: p ==> c ~~~> !p || c
+            result = SpecExp::Binop(
+                Box::new(SpecExp::Not(Box::new(result))),
+                BinOp::Or,
+                Box::new(rhs),
+            );
+        } else {
+            let op = match op_token {
+                Tok::EqualEqual => BinOp::Eq,
+                Tok::ExclaimEqual => BinOp::Neq,
+                Tok::Less => BinOp::Lt,
+                Tok::Greater => BinOp::Gt,
+                Tok::LessEqual => BinOp::Le,
+                Tok::GreaterEqual => BinOp::Ge,
+                Tok::PipePipe => BinOp::Or,
+                Tok::AmpAmp => BinOp::And,
+                Tok::Caret => BinOp::Xor,
+                Tok::Pipe => BinOp::BitOr,
+                Tok::Amp => BinOp::BitAnd,
+                Tok::Plus => BinOp::Add,
+                Tok::Minus => BinOp::Sub,
+                Tok::Star => BinOp::Mul,
+                Tok::Slash => BinOp::Div,
+                Tok::Percent => BinOp::Mod,
+                _ => panic!("Unexpected token that is not a binary operator"),
+            };
+            result = SpecExp::Binop(Box::new(result), op, Box::new(rhs))
+        }
     }
     Ok(result)
 }
@@ -1493,10 +1552,16 @@ fn parse_spec_exp<'input>(
     parse_rhs_of_spec_exp(tokens, lhs, /* min_prec */ 1)
 }
 
+// Parse a top-level requires, ensures, aborts_if, or succeeds_if spec
+// in a function decl.  This has to set the lexer into "spec_mode" to
+// return names without eating trailing punctuation such as '<' or '.'.
+// That is needed to parse paths with dots separating field names.
 fn parse_spec_condition<'input>(
     tokens: &mut Lexer<'input>,
 ) -> Result<Condition, ParseError<usize, anyhow::Error>> {
-    Ok(match tokens.peek() {
+    // Set lexer to read names without trailing punctuation
+    tokens.spec_mode = true;
+    let retval = Ok(match tokens.peek() {
         Tok::AbortsIf => {
             tokens.advance()?;
             Condition::AbortsIf(parse_spec_exp(tokens)?)
@@ -1514,11 +1579,14 @@ fn parse_spec_condition<'input>(
             Condition::SucceedsIf(parse_spec_exp(tokens)?)
         }
         _ => {
+            tokens.spec_mode = false;
             return Err(ParseError::InvalidToken {
                 location: tokens.start_loc(),
-            })
+            });
         }
-    })
+    });
+    tokens.spec_mode = false;
+    retval
 }
 
 // FunctionDecl : (FunctionName, Function_) = {
