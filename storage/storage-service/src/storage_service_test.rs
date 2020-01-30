@@ -3,7 +3,6 @@
 
 use super::*;
 use futures::stream::StreamExt;
-use grpcio::EnvBuilder;
 use itertools::zip_eq;
 use libra_config::config::NodeConfig;
 use libra_crypto::hash::CryptoHash;
@@ -19,36 +18,19 @@ use tokio::runtime::Runtime;
 
 fn start_test_storage_with_read_write_client() -> (
     Runtime,
-    libra_tools::tempdir::TempPath,
-    ServerHandle,
+    libra_temppath::TempPath,
     StorageReadServiceClient,
     StorageWriteServiceClient,
 ) {
-    let rt = Runtime::new().unwrap();
     let mut config = NodeConfig::random();
-    let tmp_dir = libra_tools::tempdir::TempPath::new();
+    let tmp_dir = libra_temppath::TempPath::new();
     config.storage.dir = tmp_dir.path().to_path_buf();
 
     let storage_server_handle = start_storage_service(&config);
 
-    let read_client = StorageReadServiceClient::new(
-        Arc::new(EnvBuilder::new().build()),
-        &config.storage.address,
-        config.storage.port,
-    );
-    let write_client = StorageWriteServiceClient::new(
-        Arc::new(EnvBuilder::new().build()),
-        &config.storage.address,
-        config.storage.port,
-        None,
-    );
-    (
-        rt,
-        tmp_dir,
-        storage_server_handle,
-        read_client,
-        write_client,
-    )
+    let read_client = StorageReadServiceClient::new(&config.storage.address, config.storage.port);
+    let write_client = StorageWriteServiceClient::new(&config.storage.address, config.storage.port);
+    (storage_server_handle, tmp_dir, read_client, write_client)
 }
 
 proptest! {
@@ -56,7 +38,7 @@ proptest! {
 
     #[test]
     fn test_storage_service_basic(blocks in arb_blocks_to_commit().no_shrink()) {
-        let(mut rt, _tmp_dir, _server_handler, read_client, write_client) =
+        let(mut rt, _tmp_dir, read_client, write_client) =
             start_test_storage_with_read_write_client();
 
         let mut version = 0;
@@ -64,7 +46,7 @@ proptest! {
 
         for (txns_to_commit, ledger_info_with_sigs) in &blocks {
             rt.block_on(write_client
-                .save_transactions_async(txns_to_commit.clone(),
+                .save_transactions(txns_to_commit.clone(),
                                    version, /* first_version */
                                    Some(ledger_info_with_sigs.clone()),
                 )).unwrap();
@@ -95,7 +77,7 @@ proptest! {
                 _validator_change_proof,
                 _ledger_consistency_proof,
             ) = rt.block_on(read_client
-                .update_to_latest_ledger_async(0, account_state_request_items)).unwrap();
+                .update_to_latest_ledger(0, account_state_request_items)).unwrap();
             for ((address, blob), response_item) in zip_eq(account_states, response_items) {
                     match response_item {
                         ResponseItem::GetAccountState {
@@ -117,7 +99,7 @@ proptest! {
         }
 
         // Check state backup for all account states.
-        let stream = read_client.backup_account_state(version - 1).unwrap();
+        let stream = rt.block_on(read_client.backup_account_state(version - 1)).unwrap();
         let backup_responses = rt.block_on(stream.collect::<Vec<_>>());
         for ((hash, blob), response) in zip_eq(all_accounts, backup_responses) {
             let resp = response.unwrap();

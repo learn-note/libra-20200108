@@ -12,14 +12,13 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0"
 bytes = "0.5"
-prost = "0.5.0"
-futures = { version = "0.3.0", features = ["compat"] }
-grpcio = { version = "=0.5.0-alpha.4", default-features = false, features = ["protobuf-codec"] }
+prost = "0.6"
+futures = "0.3"
 num_cpus = "1.10.1"
 once_cell = "1.2.0"
 rand = "0.6.5"
 tokio = { version = "0.2.8", features = ["full"] }
-tonic = { git = "https://github.com/hyperium/tonic.git" }
+tonic = "0.1"
 prometheus = { version = "0.7.0", default-features = false }
 
 admission-control-proto = { path = "../admission-control-proto", version = "0.1.0" }
@@ -47,4 +46,4 @@ assert_matches = "1.3.0"
 
 [features]
 default = []
-fuzzing = ["proptest", "libra-proptest-helpers", "libra-types/fuzzing", "storage-service/fuzzing"]
+fuzzing = ["proptest", "libra-mempool/fuzzing", "libra-proptest-helpers", "libra-types/fuzzing", "storage-service/fuzzing"]

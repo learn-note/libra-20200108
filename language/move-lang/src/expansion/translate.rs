@@ -181,7 +181,7 @@ fn address_directive(
         (None, Some(addr)) => addr,
         (None, None) => {
             context.error(vec![
-                    (loc, format!("Invalid module declration. No sender address was given as a command line argument. Add one using --{}. Or set the address at the top of the file using 'address _:'", crate::command_line::SENDER)),
+                    (loc, format!("Invalid module declaration. No sender address was given as a command line argument. Add one using --{}. Or set the address at the top of the file using 'address _:'", crate::command_line::SENDER)),
                 ]);
             Address::LIBRA_CORE
         }
@@ -445,7 +445,10 @@ fn function_def(context: &mut Context, pfunction: P::Function) -> (FunctionName,
         acquires,
     } = pfunction;
     let signature = function_signature(context, psignature);
-    let acquires = single_types(context, acquires);
+    let acquires = acquires
+        .into_iter()
+        .flat_map(|a| module_access(context, a))
+        .collect();
     let body = function_body(context, pbody);
     let fdef = E::Function {
         visibility,

@@ -88,8 +88,6 @@ fn function(context: &mut Context, _name: FunctionName, f: N::Function) -> T::Fu
     function_signature(context, &signature);
     expand::function_signature(context, &mut signature);
 
-    let mut acquires = function_acquires(context, acquires);
-    expand::function_acquires(context, &mut acquires);
     let body = function_body(context, &acquires, n_body);
 
     T::Function {
@@ -121,22 +119,9 @@ fn function_signature(context: &mut Context, sig: &N::FunctionSignature) {
     core::solve_constraints(context);
 }
 
-fn function_acquires(context: &mut Context, acquires: BTreeSet<BaseType>) -> BTreeSet<BaseType> {
-    for ty in &acquires {
-        core::instantiate_base(context, ty.clone());
-    }
-    core::solve_constraints(context);
-
-    let msg = || "Invalid 'acquires' annotation".into();
-    let check_annot = |bt: &BaseType| -> bool {
-        globals::check_global_access(context, &bt.loc, msg, bt) // true if no error
-    };
-    acquires.into_iter().filter(check_annot).collect()
-}
-
 fn function_body(
     context: &mut Context,
-    acquires: &BTreeSet<BaseType>,
+    acquires: &BTreeSet<StructName>,
     sp!(loc, nb_): N::FunctionBody,
 ) -> T::FunctionBody {
     assert!(context.constraints.is_empty());
@@ -704,23 +689,23 @@ fn exp_(context: &mut Context, sp!(eloc, ne_): N::Exp) -> T::Exp {
             let msg = || format!("Invalid argument to '{}'", &bop);
             let el = exp(context, *nl);
             let er = exp(context, *nr);
-            let ty = match &bop.value {
+            let (ty, operand_ty) = match &bop.value {
                 Sub | Add | Mul | Mod | Div => {
                     let ty = expect_builtin_ty(context, BT::numeric(), el.exp.loc, msg, &el.ty);
-                    subtype(context, er.exp.loc, msg, &er.ty, &ty);
-                    ty
+                    let operand_ty = subtype(context, er.exp.loc, msg, &er.ty, &ty);
+                    (ty, operand_ty)
                 }
 
                 BitOr | BitAnd | Xor => {
                     let ty = expect_builtin_ty(context, BT::bits(), el.exp.loc, msg, &el.ty);
-                    subtype(context, er.exp.loc, msg, &er.ty, &ty);
-                    ty
+                    let operand_ty = subtype(context, er.exp.loc, msg, &er.ty, &ty);
+                    (ty, operand_ty)
                 }
 
                 Lt | Gt | Le | Ge => {
                     let ty = expect_builtin_ty(context, BT::ordered(), el.exp.loc, msg, &el.ty);
-                    join(context, er.exp.loc, msg, &er.ty, &ty);
-                    Type_::bool(eloc)
+                    let operand_ty = join(context, er.exp.loc, msg, &er.ty, &ty);
+                    (Type_::bool(eloc), operand_ty)
                 }
 
                 Eq | Neq => {
@@ -739,10 +724,10 @@ fn exp_(context: &mut Context, sp!(eloc, ne_): N::Exp) -> T::Exp {
                     context.add_copyable_constraint(
                         eloc,
                         format!("Cannot use '{}' on resource values. This would destroy the resource. Try borrowing the values with '&' first.'", &bop),
-                        st
+                        st.clone(),
                     );
 
-                    Type_::bool(eloc)
+                    (Type_::bool(eloc), Type_::single(st))
                 }
 
                 And | Or => {
@@ -750,10 +735,10 @@ fn exp_(context: &mut Context, sp!(eloc, ne_): N::Exp) -> T::Exp {
                     subtype(context, lloc, msg, &el.ty, &Type_::bool(lloc));
                     let rloc = er.exp.loc;
                     subtype(context, rloc, msg, &er.ty, &Type_::bool(lloc));
-                    Type_::bool(eloc)
+                    (Type_::bool(eloc), Type_::bool(eloc))
                 }
             };
-            (ty, TE::BinopExp(el, bop, er))
+            (ty, TE::BinopExp(el, bop, Box::new(operand_ty), er))
         }
 
         NE::ExpList(nes) => {
@@ -876,7 +861,7 @@ fn exp_(context: &mut Context, sp!(eloc, ne_): N::Exp) -> T::Exp {
                 &el.ty,
                 &rhs,
             );
-            (rhs, el.exp.value)
+            (rhs.clone(), TE::Annotate(el, Box::new(rhs)))
         }
         NE::UnresolvedError => {
             assert!(context.has_errors());

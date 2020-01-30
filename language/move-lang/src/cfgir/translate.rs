@@ -125,7 +125,7 @@ fn module(
 fn function(context: &mut Context, _name: FunctionName, f: H::Function) -> G::Function {
     let visibility = f.visibility;
     let signature = function_signature(context, f.signature);
-    let acquires = base_types(context, f.acquires);
+    let acquires = f.acquires;
     let body = function_body(context, &signature, f.body);
     G::Function {
         visibility,
@@ -175,8 +175,14 @@ fn function_body(
                 context.error(e);
             }
 
-            cfgir::refine(signature, &locals, &mut cfg, infinite_loop_starts);
-            cfgir::verify(&mut context.errors, signature, &locals, &mut cfg);
+            cfgir::refine_and_verify(
+                &mut context.errors,
+                signature,
+                &locals,
+                &mut cfg,
+                &infinite_loop_starts,
+            );
+            cfgir::verify(&mut context.errors, signature, &locals, &cfg);
 
             GB::Defined {
                 locals,
@@ -451,7 +457,7 @@ fn exp_(context: &Context, he: H::Exp) -> G::Exp {
             let name = hcall.name;
             let type_arguments = base_types(context, hcall.type_arguments);
             let arguments = exp(context, hcall.arguments);
-            let acquires = base_types(context, hcall.acquires);
+            let acquires = hcall.acquires;
             let mcall = G::ModuleCall {
                 module,
                 name,

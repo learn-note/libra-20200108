@@ -14,6 +14,7 @@ use compiler::Compiler;
 use libra_config::config::{NodeConfig, VMPublishingOption};
 use libra_crypto::ed25519::*;
 use libra_types::{
+    account_config::core_code_address,
     test_helpers::transaction_test_helpers,
     transaction::{
         Script, TransactionArgument, TransactionPayload, TransactionStatus,
@@ -35,7 +36,7 @@ fn verify_signature() {
         let signed_txn = transaction_test_helpers::get_test_unchecked_txn(
             *sender.address(),
             0,
-            private_key,
+            &private_key,
             sender.account().pubkey.clone(),
             Some(program),
         );
@@ -49,6 +50,30 @@ fn verify_signature() {
 }
 
 #[test]
+fn verify_reserved_sender() {
+    test_all_genesis(|mut executor| {
+        let sender = AccountData::new(900_000, 10);
+        executor.add_account_data(&sender);
+        // Generate a new key pair to try and sign things with.
+        let (private_key, public_key) = compat::generate_keypair(None);
+        let program = encode_transfer_script(sender.address(), 100);
+        let signed_txn = transaction_test_helpers::get_test_signed_txn(
+            core_code_address(),
+            0,
+            &private_key,
+            public_key,
+            Some(program),
+        );
+
+        assert_prologue_parity!(
+            executor.verify_transaction(signed_txn.clone()),
+            executor.execute_transaction(signed_txn).status(),
+            VMStatus::new(StatusCode::SENDING_ACCOUNT_DOES_NOT_EXIST)
+        );
+    });
+}
+
+#[test]
 fn verify_rejected_write_set() {
     test_all_genesis(|mut executor| {
         let sender = AccountData::new(900_000, 10);
@@ -56,7 +81,7 @@ fn verify_rejected_write_set() {
         let signed_txn = transaction_test_helpers::get_write_set_txn(
             *sender.address(),
             0,
-            sender.account().privkey.clone(),
+            &sender.account().privkey,
             sender.account().pubkey.clone(),
             None,
         )
@@ -298,7 +323,7 @@ fn verify_simple_payment() {
         );
         assert_eq!(
             executor.execute_transaction(txn).status(),
-            &TransactionStatus::Discard(
+            &TransactionStatus::Keep(
                 VMStatus::new(StatusCode::TYPE_MISMATCH)
                     .with_message("Actual Type Mismatch".to_string())
             )
@@ -314,7 +339,7 @@ fn verify_simple_payment() {
         );
         assert_eq!(
             executor.execute_transaction(txn).status(),
-            &TransactionStatus::Discard(
+            &TransactionStatus::Keep(
                 VMStatus::new(StatusCode::TYPE_MISMATCH)
                     .with_message("Actual Type Mismatch".to_string())
             )
@@ -450,7 +475,7 @@ pub fn test_open_publishing_invalid_address() {
 
     // execute and fail for the same reason
     let output = executor.execute_transaction(txn);
-    if let TransactionStatus::Discard(status) = output.status() {
+    if let TransactionStatus::Keep(status) = output.status() {
         assert!(status.major_status == StatusCode::MODULE_ADDRESS_DOES_NOT_MATCH_SENDER)
     } else {
         panic!("Unexpected execution status: {:?}", output)
@@ -557,7 +582,7 @@ fn test_dependency_fails_verification() {
     // As of now, we don't verify dependencies in verify_transaction.
     assert_eq!(executor.verify_transaction(txn.clone()), None);
     match executor.execute_transaction(txn).status() {
-        TransactionStatus::Discard(status) => {
+        TransactionStatus::Keep(status) => {
             assert!(status.is(StatusType::Verification));
             assert!(status.major_status == StatusCode::INVALID_RESOURCE_FIELD);
         }

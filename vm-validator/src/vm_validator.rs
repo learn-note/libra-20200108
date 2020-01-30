@@ -51,19 +51,31 @@ impl TransactionValidation for VMValidator {
     type ValidationInstance = LibraVM;
 
     async fn validate_transaction(&self, txn: SignedTransaction) -> Result<Option<VMStatus>> {
-        let (version, state_root) = self
-            .storage_read_client
-            .get_latest_state_root_async()
-            .await?;
-        let smt = SparseMerkleTree::new(state_root);
-        let state_view = VerifiedStateView::new(
-            Arc::clone(&self.storage_read_client),
-            self.rt_handle.clone(),
-            Some(version),
-            state_root,
-            &smt,
-        );
-        Ok(self.vm.validate_transaction(txn, &state_view))
+        let (version, state_root) = self.storage_read_client.get_latest_state_root().await?;
+        let client = self.storage_read_client.clone();
+        let rt_handle = self.rt_handle.clone();
+        let vm = self.vm.clone();
+        // We have to be careful here. The storage read client only exposes async functions but the
+        // whole VM is synchronous and async/await isn't currently using in the VM. Due to this
+        // there is a trick in the StateView impl which spawns a task on a runtime to actually do
+        // the async read while using "block_on" to synchronously wait for the read to complete.
+        // This is where things get tricky. If that task is spawned onto the same thread in the
+        // pool as the task that is using "block_on" then there is a chance that the read will
+        // never complete since it will be resource starved resulting in the "block_on" task
+        // hanging forever.
+        //
+        // In order to work around this issue we can use "spawn_blocking" to move the task that is
+        // using "block_on" to its own thread, where it won't interfere with have a chance to
+        // starve other async tasks.
+        tokio::task::spawn_blocking(move || {
+            let smt = SparseMerkleTree::new(state_root);
+            let state_view =
+                VerifiedStateView::new(client, rt_handle, Some(version), state_root, &smt);
+
+            vm.validate_transaction(txn, &state_view)
+        })
+        .await
+        .map_err(Into::into)
     }
 }
 
@@ -74,7 +86,7 @@ pub async fn get_account_state(
     address: AccountAddress,
 ) -> Result<(u64, u64)> {
     let account_state = storage_read_client
-        .get_latest_account_state_async(address)
+        .get_latest_account_state(address)
         .await?;
     Ok(if let Some(blob) = account_state {
         let account_resource = AccountResource::try_from(&blob)?;

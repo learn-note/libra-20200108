@@ -1,7 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{config::RootPath, utils};
+use crate::config::RootPath;
 use anyhow::Result;
 use libra_types::transaction::Transaction;
 use serde::{Deserialize, Serialize};
@@ -16,8 +16,6 @@ const GENESIS_DEFAULT: &str = "genesis.blob";
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExecutionConfig {
-    pub address: String,
-    pub port: u16,
     #[serde(skip)]
     pub genesis: Option<Transaction>,
     pub genesis_file_location: PathBuf,
@@ -26,8 +24,6 @@ pub struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> ExecutionConfig {
         ExecutionConfig {
-            address: "localhost".to_string(),
-            port: 6183,
             genesis: None,
             genesis_file_location: PathBuf::new(),
         }
@@ -59,17 +55,16 @@ impl ExecutionConfig {
         }
         Ok(())
     }
-
-    pub fn randomize_ports(&mut self) {
-        self.port = utils::get_available_port();
-    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use libra_tools::tempdir::TempPath;
-    use libra_types::{transaction::Transaction, write_set::WriteSetMut};
+    use libra_temppath::TempPath;
+    use libra_types::{
+        transaction::{ChangeSet, Transaction},
+        write_set::WriteSetMut,
+    };
 
     #[test]
     fn test_no_genesis() {
@@ -83,7 +78,10 @@ mod test {
 
     #[test]
     fn test_some_and_load_genesis() {
-        let fake_genesis = Transaction::WriteSet(WriteSetMut::new(vec![]).freeze().unwrap());
+        let fake_genesis = Transaction::WriteSet(ChangeSet::new(
+            WriteSetMut::new(vec![]).freeze().unwrap(),
+            vec![],
+        ));
         let (mut config, path) = generate_config();
         config.genesis = Some(fake_genesis.clone());
         let root_dir = RootPath::new_path(path.path());

@@ -1,0 +1,20 @@
+main() {
+    let x: u64;
+    let y: u64;
+    let b: bool;
+    x = 0;
+    b = true;
+    while (true) {
+        if (copy(b)) {
+            y = move(x);
+        } else {
+            x = move(y);
+        }
+        b = false;
+    }
+    return;
+}
+
+// TODO: fix verifier remove identical errors
+// check: MOVELOC_UNAVAILABLE_ERROR
+// check: MOVELOC_UNAVAILABLE_ERROR

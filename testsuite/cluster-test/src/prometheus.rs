@@ -11,7 +11,8 @@ use std::{collections::HashMap, time::Duration};
 #[derive(Clone)]
 pub struct Prometheus {
     url: Url,
-    client: reqwest::Client,
+    client: reqwest::blocking::Client,
+    public_url: Url,
 }
 
 pub struct MatrixResponse {
@@ -23,12 +24,28 @@ pub struct TimeSeries {
 }
 
 impl Prometheus {
-    pub fn new(ip: &str) -> Self {
+    pub fn new(ip: &str, workspace: &str) -> Self {
         let url = format!("http://{}:9091", ip)
             .parse()
             .expect("Failed to parse prometheus url");
-        let client = reqwest::Client::new();
-        Self { url, client }
+        let public_url = format!("http://prometheus.{}.aws.hlw3truzy4ls.com:9091", workspace)
+            .parse()
+            .expect("Failed to parse prometheus public url");
+        let client = reqwest::blocking::Client::new();
+        Self {
+            url,
+            client,
+            public_url,
+        }
+    }
+
+    pub fn link_to_dashboard(&self, start: Duration, end: Duration) -> String {
+        format!(
+            "{}d/overview10/overview?orgId=1&from={}&to={}",
+            self.public_url,
+            start.as_millis(),
+            end.as_millis()
+        )
     }
 
     fn query_range(
@@ -49,7 +66,7 @@ impl Prometheus {
             ))
             .expect("Failed to make query_range url");
 
-        let mut response = self
+        let response = self
             .client
             .get(url.clone())
             .send()

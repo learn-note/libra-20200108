@@ -3,7 +3,7 @@
 
 use crate::keys::KeyPair;
 use libra_crypto::{ed25519::Ed25519PrivateKey, Uniform};
-use libra_tools::tempdir::TempPath;
+use libra_temppath::TempPath;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -21,11 +21,12 @@ pub struct TestConfig {
     temp_dir: Option<TempPath>,
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
 impl Clone for TestConfig {
     fn clone(&self) -> Self {
         Self {
-            account_keypair: None,
-            consensus_keypair: None,
+            account_keypair: self.account_keypair.clone(),
+            consensus_keypair: self.consensus_keypair.clone(),
             temp_dir: None,
         }
     }

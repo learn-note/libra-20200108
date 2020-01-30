@@ -1,19 +1,16 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use admission_control_service::runtime::AdmissionControlRuntime;
+use admission_control_service::admission_control_service::AdmissionControlService;
 use consensus::consensus_provider::{make_consensus_provider, ConsensusProvider};
 use debug_interface::{
     node_debug_service::NodeDebugService,
     proto::node_debug_interface_server::NodeDebugInterfaceServer,
 };
 use executor::Executor;
-use futures::executor::block_on;
-use grpc_helpers::ServerHandle;
-use grpcio::EnvBuilder;
+use futures::{channel::mpsc::channel, executor::block_on};
 use libra_config::config::{NetworkConfig, NodeConfig, RoleType};
 use libra_logger::prelude::*;
-use libra_mempool::MempoolRuntime;
 use libra_metrics::metric_server;
 use network::{
     validator_network::{
@@ -21,7 +18,6 @@ use network::{
         LibraNetworkProvider,
         // when you add a new protocol const, you must add this in either
         // .direct_send_protocols or .rpc_protocols vector of network_builder in setup_network()
-        ADMISSION_CONTROL_RPC_PROTOCOL,
         CONSENSUS_DIRECT_SEND_PROTOCOL,
         CONSENSUS_RPC_PROTOCOL,
         MEMPOOL_DIRECT_SEND_PROTOCOL,
@@ -33,18 +29,20 @@ use state_synchronizer::StateSynchronizer;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::{sync::Arc, thread, time::Instant};
-use storage_client::{StorageRead, StorageReadServiceClient, StorageWriteServiceClient};
+use storage_client::{StorageReadServiceClient, StorageWriteServiceClient};
 use storage_service::start_storage_service;
 use tokio::runtime::{Builder, Runtime};
 use vm_runtime::LibraVM;
 
+const AC_SMP_CHANNEL_BUFFER_SIZE: usize = 1_024;
+
 pub struct LibraHandle {
-    _ac: AdmissionControlRuntime,
-    _mempool: Option<MempoolRuntime>,
+    _ac: Runtime,
+    _mempool: Runtime,
     _state_synchronizer: StateSynchronizer,
     _network_runtimes: Vec<Runtime>,
     consensus: Option<Box<dyn ConsensusProvider>>,
-    _storage: ServerHandle,
+    _storage: Runtime,
     _debug: Runtime,
 }
 
@@ -57,21 +55,17 @@ impl Drop for LibraHandle {
 }
 
 fn setup_executor(config: &NodeConfig) -> Arc<Executor<LibraVM>> {
-    let client_env = Arc::new(EnvBuilder::new().name_prefix("grpc-exe-sto-").build());
     let storage_read_client = Arc::new(StorageReadServiceClient::new(
-        Arc::clone(&client_env),
         &config.storage.address,
         config.storage.port,
     ));
     let storage_write_client = Arc::new(StorageWriteServiceClient::new(
-        Arc::clone(&client_env),
         &config.storage.address,
         config.storage.port,
-        config.storage.grpc_max_receive_len,
     ));
 
     Arc::new(Executor::new(
-        Arc::clone(&storage_read_client) as Arc<dyn StorageRead>,
+        storage_read_client,
         storage_write_client,
         config,
     ))
@@ -113,37 +107,37 @@ pub fn setup_network(
         role,
     );
     network_builder
-        .permissioned(config.is_permissioned)
+        .enable_remote_authentication(config.enable_remote_authentication)
         .advertised_address(config.advertised_address.clone())
         .direct_send_protocols(vec![
             ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL),
             ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL),
             ProtocolId::from_static(STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL),
         ])
-        .rpc_protocols(vec![
-            ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL),
-            ProtocolId::from_static(ADMISSION_CONTROL_RPC_PROTOCOL),
-        ]);
-    if config.is_permissioned {
-        // If the node wants to run in permissioned mode, it should also have authentication and
-        // encryption.
+        .rpc_protocols(vec![ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL)]);
+    if config.enable_remote_authentication {
+        // If the node wants to run in enable_remote_authentication mode, it should also use noise for
+        // authentication and encryption.
         assert!(
-            config.enable_encryption_and_authentication,
+            config.enable_noise,
             "Permissioned network end-points should use authentication"
         );
         let seed_peers = config.seed_peers.seed_peers.clone();
-        let signing_private = config
+        let network_keypairs = config
             .network_keypairs
-            .signing_keys
+            .as_mut()
+            .expect("Network keypairs are not defined");
+        let signing_keys = &mut network_keypairs.signing_keys;
+        let identity_keys = &mut network_keypairs.identity_keys;
+
+        let signing_private = signing_keys
             .take_private()
             .expect("Failed to take Network signing private key, key absent or already read");
-        let signing_public = config.network_keypairs.signing_keys.public().clone();
-        let identity_private = config
-            .network_keypairs
-            .identity_keys
+        let signing_public = signing_keys.public().clone();
+        let identity_private = identity_keys
             .take_private()
             .expect("Failed to take Network identity private key, key absent or already read");
-        let identity_public = config.network_keypairs.identity_keys.public().clone();
+        let identity_public = identity_keys.public().clone();
         let trusted_peers = if role == RoleType::Validator {
             // for validators, trusted_peers is empty will be populated from consensus
             HashMap::new()
@@ -160,15 +154,19 @@ pub fn setup_network(
             .trusted_peers(trusted_peers)
             .signing_keys((signing_private, signing_public))
             .discovery_interval_ms(config.discovery_interval_ms);
-    } else if config.enable_encryption_and_authentication {
-        let identity_private = config
+    } else if config.enable_noise {
+        let identity_keys = &mut config
             .network_keypairs
-            .identity_keys
+            .as_mut()
+            .expect("Network keypairs are not defined")
+            .identity_keys;
+        let identity_private = identity_keys
             .take_private()
             .expect("Failed to take Network identity private key, key absent or already read");
-        let identity_public = config.network_keypairs.identity_keys.public().clone();
-        // Even if a network end-point is permissionless, it might want to prove its identity to
-        // another peer it connects to. For this, we use TCP + Noise but in a permission-less way.
+        let identity_public = identity_keys.public().clone();
+        // Even if a network end-point operates without remote authentication, it might want to prove
+        // its identity to another peer it connects to. For this, we use TCP + Noise but without
+        // enforcing a trusted peers set.
         network_builder.transport(TransportType::TcpNoise(Some((
             identity_private,
             identity_public,
@@ -202,8 +200,7 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     debug!("Executor setup in {} ms", instant.elapsed().as_millis());
     let mut network_runtimes = vec![];
     let mut state_sync_network_handles = vec![];
-    let mut ac_network_sender = None;
-    let mut ac_network_events = vec![];
+    let mut mempool_network_handles = vec![];
     let mut validator_network_provider = None;
 
     if let Some(network) = node_config.validator_network.as_mut() {
@@ -212,14 +209,11 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
             ProtocolId::from_static(STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL),
         ]));
 
-        let (ac_sender, ac_events) =
-            network_provider.add_admission_control(vec![ProtocolId::from_static(
-                ADMISSION_CONTROL_RPC_PROTOCOL,
-            )]);
-        ac_network_events.push(ac_events);
+        let (mempool_sender, mempool_events) = network_provider
+            .add_mempool(vec![ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL)]);
+        mempool_network_handles.push((network.peer_id, mempool_sender, mempool_events));
 
         validator_network_provider = Some((network.peer_id, runtime, network_provider));
-        ac_network_sender = Some(ac_sender);
     }
 
     for i in 0..node_config.full_node_networks.len() {
@@ -229,16 +223,15 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
             ProtocolId::from_static(STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL),
         ]));
 
-        let (ac_sender, ac_events) =
-            network_provider.add_admission_control(vec![ProtocolId::from_static(
-                ADMISSION_CONTROL_RPC_PROTOCOL,
-            )]);
-        ac_network_events.push(ac_events);
+        let (mempool_sender, mempool_events) = network_provider
+            .add_mempool(vec![ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL)]);
+        mempool_network_handles.push((
+            node_config.full_node_networks[i].peer_id,
+            mempool_sender,
+            mempool_events,
+        ));
 
         let network = &node_config.full_node_networks[i];
-        if node_config.is_upstream_network(network) {
-            ac_network_sender = Some(ac_sender);
-        }
         // Start the network provider.
         runtime.handle().spawn(network_provider.start());
         network_runtimes.push(runtime);
@@ -261,15 +254,16 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         Arc::clone(&executor),
         &node_config,
     );
-    let admission_control = AdmissionControlRuntime::bootstrap(
-        &node_config,
-        ac_network_sender.unwrap(),
-        ac_network_events,
-    );
+    let (ac_sender, client_events) = channel(AC_SMP_CHANNEL_BUFFER_SIZE);
+    let admission_control_runtime = AdmissionControlService::bootstrap(&node_config, ac_sender);
 
-    let mut mempool = None;
     let mut consensus = None;
+    let (_, rcv) = channel(1_024); // TODO replace this placeholder with connection with state sync for full nodes
+    let mut consensus_events = rcv;
     if let Some((peer_id, runtime, mut network_provider)) = validator_network_provider {
+        let (mempool_channel, consensus_mp_receiver) = channel(1_024);
+        consensus_events = consensus_mp_receiver;
+
         // Note: We need to start network provider before consensus, because the consensus
         // initialization is blocked on state synchronizer to sync to the initial root ledger
         // info, which in turn cannot make progress before network initialization
@@ -279,8 +273,6 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         // network provider -> consensus -> state synchronizer -> network provider. This deadlock
         // was observed in GitHub Issue #749. A long term fix might be make
         // consensus initialization async instead of blocking on state synchronizer.
-        let (mempool_network_sender, mempool_network_events) = network_provider
-            .add_mempool(vec![ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL)]);
         let (consensus_network_sender, consensus_network_events) =
             network_provider.add_consensus(vec![
                 ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL),
@@ -299,15 +291,6 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
             .expect("State synchronizer initialization failure");
         debug!("State synchronizer initialization complete.");
 
-        // Initialize and start mempool.
-        instant = Instant::now();
-        mempool = Some(MempoolRuntime::bootstrap(
-            &node_config,
-            mempool_network_sender,
-            mempool_network_events,
-        ));
-        debug!("Mempool started in {} ms", instant.elapsed().as_millis());
-
         // Initialize and start consensus.
         instant = Instant::now();
         let mut consensus_provider = make_consensus_provider(
@@ -316,6 +299,7 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
             consensus_network_events,
             executor,
             state_synchronizer.create_client(),
+            mempool_channel,
         );
         consensus_provider
             .start()
@@ -324,9 +308,18 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         debug!("Consensus started in {} ms", instant.elapsed().as_millis());
     }
 
+    instant = Instant::now();
+    let mempool = libra_mempool::bootstrap(
+        node_config,
+        mempool_network_handles,
+        client_events,
+        consensus_events,
+    );
+    debug!("Mempool started in {} ms", instant.elapsed().as_millis());
+
     LibraHandle {
         _network_runtimes: network_runtimes,
-        _ac: admission_control,
+        _ac: admission_control_runtime,
         _mempool: mempool,
         _state_synchronizer: state_synchronizer,
         consensus,
