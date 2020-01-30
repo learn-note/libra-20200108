@@ -38,7 +38,7 @@ pub struct Mempool {
 }
 
 impl Mempool {
-    pub(crate) fn new(config: &NodeConfig) -> Self {
+    pub fn new(config: &NodeConfig) -> Self {
         Mempool {
             transactions: TransactionStore::new(&config.mempool),
             sequence_number_cache: LruCache::new(config.mempool.capacity),
@@ -64,19 +64,22 @@ impl Mempool {
         self.metrics_cache.remove(&(*sender, sequence_number));
         OP_COUNTERS.inc(&format!("remove_transaction.{}", is_rejected));
 
+        let current_seq_number = self
+            .sequence_number_cache
+            .remove(&sender)
+            .unwrap_or_default();
+
         if is_rejected {
             debug!(
                 "[Mempool] transaction is rejected: {}:{}",
                 sender, sequence_number
             );
-            self.transactions
-                .reject_transaction(&sender, sequence_number);
+            if sequence_number >= current_seq_number {
+                self.transactions
+                    .reject_transaction(&sender, sequence_number);
+            }
         } else {
             // update current cached sequence number for account
-            let current_seq_number = self
-                .sequence_number_cache
-                .remove(&sender)
-                .unwrap_or_default();
             let new_seq_number = max(current_seq_number, sequence_number + 1);
             self.sequence_number_cache
                 .insert(sender.clone(), new_seq_number);
@@ -94,8 +97,9 @@ impl Mempool {
         }
     }
 
-    fn get_required_balance(&mut self, txn: &SignedTransaction, gas_amount: u64) -> u64 {
-        txn.gas_unit_price() * gas_amount + self.transactions.get_required_balance(&txn.sender())
+    fn get_required_balance(&mut self, txn: &SignedTransaction, gas_amount: u64) -> u128 {
+        txn.gas_unit_price() as u128 * gas_amount as u128
+            + self.transactions.get_required_balance(&txn.sender()) as u128
     }
 
     /// Used to add a transaction to the Mempool
@@ -116,7 +120,7 @@ impl Mempool {
         );
 
         let required_balance = self.get_required_balance(&txn, gas_amount);
-        if balance < required_balance {
+        if (balance as u128) < required_balance {
             return MempoolAddTransactionStatus::new(
                 MempoolAddTransactionStatusCode::InsufficientBalance,
                 format!(
@@ -247,10 +251,5 @@ impl Mempool {
         count: usize,
     ) -> (Vec<SignedTransaction>, u64) {
         self.transactions.read_timeline(timeline_id, count)
-    }
-
-    /// Check the health of core mempool.
-    pub(crate) fn health_check(&self) -> bool {
-        self.transactions.health_check()
     }
 }

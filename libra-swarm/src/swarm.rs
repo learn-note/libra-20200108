@@ -1,14 +1,13 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::utils;
 use anyhow::{Context, Result};
-use client_lib::AccountAddress;
 use config_builder::{FullNodeConfig, SwarmConfig, ValidatorConfig};
 use debug_interface::NodeDebugClient;
-use libra_config::config::{NodeConfig, RoleType, VMPublishingOption};
+use libra_config::config::{NodeConfig, RoleType};
 use libra_logger::prelude::*;
-use libra_tools::tempdir::TempPath;
+use libra_temppath::TempPath;
+use libra_types::account_address::AccountAddress;
 use std::{
     collections::HashMap,
     env,
@@ -19,6 +18,7 @@ use std::{
     str::FromStr,
 };
 use thiserror::Error;
+use workspace_builder;
 
 const LIBRA_NODE_BIN: &str = "libra-node";
 
@@ -65,9 +65,9 @@ impl LibraNode {
             RoleType::Validator => Some(config.validator_network.unwrap().peer_id),
             RoleType::FullNode => None,
         };
-        let mut node_command = Command::new(utils::get_bin(LIBRA_NODE_BIN));
+        let mut node_command = Command::new(workspace_builder::get_bin(LIBRA_NODE_BIN));
         node_command
-            .current_dir(utils::workspace_root())
+            .current_dir(workspace_builder::workspace_root())
             .arg("-f")
             .arg(config_path);
         if env::var("RUST_LOG").is_err() {
@@ -235,18 +235,24 @@ impl LibraSwarm {
         role: RoleType,
         disable_logging: bool,
         config_dir: Option<String>,
-        template_path: Option<String>,
+        template: Option<NodeConfig>,
         upstream_config_dir: Option<String>,
     ) -> Self {
         let num_launch_attempts = 5;
         for i in 0..num_launch_attempts {
             info!("Launch swarm attempt: {} of {}", i, num_launch_attempts);
 
+            let node_config = if let Some(template) = template.clone() {
+                template
+            } else {
+                NodeConfig::default()
+            };
+
             if let Ok(mut swarm) = Self::configure_swarm(
                 num_nodes,
                 role,
                 config_dir.clone(),
-                template_path.clone(),
+                Some(node_config),
                 upstream_config_dir.clone(),
             ) {
                 match swarm.launch_attempt(role, disable_logging) {
@@ -290,24 +296,23 @@ impl LibraSwarm {
         num_nodes: usize,
         role: RoleType,
         config_dir: Option<String>,
-        template_path: Option<String>,
+        template: Option<NodeConfig>,
         upstream_config_dir: Option<String>,
     ) -> Result<LibraSwarm> {
         let swarm_config_dir = Self::setup_config_dir(&config_dir);
         info!("logs at {:?}", swarm_config_dir);
-        let mut template = if let Some(template_path) = template_path {
-            NodeConfig::load(utils::workspace_root().join(template_path)).unwrap_or_default()
-        } else {
-            let mut template = NodeConfig::default();
-            template.vm_config.publishing_options = VMPublishingOption::Open;
+
+        let mut node_config = if let Some(template) = template {
             template
+        } else {
+            NodeConfig::default()
         };
-        template.base.role = role;
+        node_config.base.role = role;
 
         let config_path = &swarm_config_dir.as_ref().to_path_buf();
         let config = if role.is_validator() {
             let mut validator_builder = ValidatorConfig::new();
-            validator_builder.template(template).nodes(num_nodes);
+            validator_builder.template(node_config).nodes(num_nodes);
             SwarmConfig::build(&validator_builder, config_path)?
         } else {
             let upstream_config_dir = upstream_config_dir.expect("No upstream node for full nodes");
@@ -318,7 +323,7 @@ impl LibraSwarm {
             full_node_builder
                 .full_nodes(num_nodes)
                 .genesis(genesis.expect("Missing genesis from validator").clone())
-                .template(template);
+                .template(node_config);
             full_node_builder.extend_validator(&mut validator_config)?;
             validator_config.save(&upstream_config_file)?;
             full_node_builder.bootstrap(

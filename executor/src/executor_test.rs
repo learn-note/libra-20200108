@@ -9,7 +9,6 @@ use crate::{
     Executor, OP_COUNTERS,
 };
 use config_builder;
-use grpcio::{EnvBuilder, ServerBuilder};
 use libra_config::config::NodeConfig;
 use libra_crypto::{hash::PRE_GENESIS_BLOCK_ID, HashValue};
 use libra_types::block_info::BlockInfo;
@@ -21,53 +20,32 @@ use libra_types::{
 };
 use proptest::prelude::*;
 use rusty_fork::{rusty_fork_id, rusty_fork_test, rusty_fork_test_name};
-use std::{
-    collections::BTreeMap,
-    sync::{mpsc, Arc},
-};
+use std::{collections::BTreeMap, sync::Arc};
 use storage_client::{StorageRead, StorageReadServiceClient, StorageWriteServiceClient};
-use storage_proto::proto::storage::create_storage;
-use storage_service::StorageService;
+use storage_service::start_storage_service;
 use tokio::runtime::Runtime;
 
-fn create_storage_server(config: &mut NodeConfig) -> (grpcio::Server, mpsc::Receiver<()>) {
-    let (service, shutdown_receiver) = StorageService::new(&config.storage.dir());
-    let mut server = ServerBuilder::new(Arc::new(EnvBuilder::new().build()))
-        .register_service(create_storage(service))
-        .bind("localhost", 0)
-        .build()
-        .expect("Failed to create storage server.");
-    server.start();
-
-    assert_eq!(server.bind_addrs().len(), 1);
-    let (_, port) = server.bind_addrs()[0];
-
-    // This is a little messy -- technically the config should also be used to set up the storage
-    // server, but the code currently creates the storage server, binds it to a port, then sets up
-    // the config.
-    // XXX Clean this up a little.
-    config.storage.port = port;
-
-    (server, shutdown_receiver)
+fn create_storage_server(config: &mut NodeConfig) -> Runtime {
+    start_storage_service(&config)
 }
 
 fn create_executor(config: &NodeConfig) -> (Executor<MockVM>, ExecutedTrees) {
     let mut rt = Runtime::new().unwrap();
-    let client_env = Arc::new(EnvBuilder::new().build());
     let read_client = Arc::new(StorageReadServiceClient::new(
-        Arc::clone(&client_env),
         "localhost",
         config.storage.port,
     ));
     let write_client = Arc::new(StorageWriteServiceClient::new(
-        Arc::clone(&client_env),
         "localhost",
         config.storage.port,
-        None,
     ));
-    let executor = Executor::new(read_client.clone(), write_client, config);
+    let executor = Executor::new(read_client, write_client, config);
+    let read_client = Arc::new(StorageReadServiceClient::new(
+        "localhost",
+        config.storage.port,
+    ));
     let startup_info = rt
-        .block_on(read_client.get_startup_info_async())
+        .block_on(read_client.get_startup_info())
         .expect("unable to read ledger info from storage")
         .expect("startup info is None");
     let root_executed_trees = ExecutedTrees::from(startup_info.committed_tree_state);
@@ -80,20 +58,10 @@ fn execute_and_commit_block(
     txn_index: u64,
 ) {
     let txn = encode_mint_transaction(gen_address(txn_index), 100);
-    let parent_block_id = match txn_index {
-        0 => *PRE_GENESIS_BLOCK_ID,
-        x => gen_block_id(x),
-    };
     let id = gen_block_id(txn_index + 1);
 
     let output = executor
-        .execute_block(
-            vec![txn.clone()],
-            &committed_trees,
-            &committed_trees,
-            parent_block_id,
-            id,
-        )
+        .execute_block(vec![txn.clone()], &committed_trees, &committed_trees)
         .unwrap();
     assert_eq!(output.version().unwrap(), txn_index + 1);
 
@@ -112,22 +80,20 @@ fn execute_and_commit_block(
 struct TestExecutor {
     // The config is kept around because it owns the temp dir used in the test.
     _config: NodeConfig,
-    storage_server: Option<grpcio::Server>,
-    shutdown_receiver: mpsc::Receiver<()>,
+    storage_server: Option<Runtime>,
     executor: Executor<MockVM>,
 }
 
 impl TestExecutor {
     fn new() -> (TestExecutor, ExecutedTrees) {
         let (mut config, _) = config_builder::test_config();
-        let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
+        let storage_server = create_storage_server(&mut config);
         let (executor, committed_trees) = create_executor(&config);
 
         (
             TestExecutor {
                 _config: config,
                 storage_server: Some(storage_server),
-                shutdown_receiver,
                 executor,
             },
             committed_trees,
@@ -148,7 +114,6 @@ impl Drop for TestExecutor {
         self.storage_server
             .take()
             .expect("Storage server should exist.");
-        self.shutdown_receiver.recv().unwrap();
     }
 }
 
@@ -195,17 +160,8 @@ fn test_executor_status() {
     let txn1 = encode_mint_transaction(gen_address(1), 100);
     let txn2 = encode_transfer_transaction(gen_address(0), gen_address(1), 500);
 
-    let parent_block_id = *PRE_GENESIS_BLOCK_ID;
-    let block_id = gen_block_id(1);
-
     let output = executor
-        .execute_block(
-            vec![txn0, txn1, txn2],
-            &committed_trees,
-            &committed_trees,
-            parent_block_id,
-            block_id,
-        )
+        .execute_block(vec![txn0, txn1, txn2], &committed_trees, &committed_trees)
         .unwrap();
 
     assert_eq!(
@@ -222,7 +178,6 @@ fn test_executor_status() {
 fn test_executor_one_block() {
     let (executor, committed_trees) = TestExecutor::new();
 
-    let parent_block_id = *PRE_GENESIS_BLOCK_ID;
     let block_id = gen_block_id(1);
     let version = 100;
 
@@ -230,13 +185,7 @@ fn test_executor_one_block() {
         .map(|i| encode_mint_transaction(gen_address(i), 100))
         .collect::<Vec<_>>();
     let output = executor
-        .execute_block(
-            txns.clone(),
-            &committed_trees,
-            &committed_trees,
-            parent_block_id,
-            block_id,
-        )
+        .execute_block(txns.clone(), &committed_trees, &committed_trees)
         .unwrap();
     assert_eq!(output.version().unwrap(), 100);
 
@@ -263,7 +212,6 @@ fn test_executor_multiple_blocks() {
 fn test_executor_two_blocks_with_failed_txns() {
     let (executor, committed_trees) = TestExecutor::new();
 
-    let block1_id = gen_block_id(1);
     let block2_id = gen_block_id(2);
     let block1_txns = (0..50)
         .map(|i| encode_mint_transaction(gen_address(i), 100))
@@ -278,21 +226,13 @@ fn test_executor_two_blocks_with_failed_txns() {
         })
         .collect::<Vec<_>>();
     let output1 = executor
-        .execute_block(
-            block1_txns.clone(),
-            &committed_trees,
-            &committed_trees,
-            *PRE_GENESIS_BLOCK_ID,
-            block1_id,
-        )
+        .execute_block(block1_txns.clone(), &committed_trees, &committed_trees)
         .unwrap();
     let output2 = executor
         .execute_block(
             block2_txns.clone(),
             output1.executed_trees(),
             &committed_trees,
-            block1_id,
-            block2_id,
         )
         .unwrap();
     let ledger_info = gen_ledger_info(75, output2.accu_root(), block2_id, 1);
@@ -310,8 +250,6 @@ fn test_executor_two_blocks_with_failed_txns() {
 
 #[test]
 fn test_executor_execute_same_block_multiple_times() {
-    let parent_block_id = *PRE_GENESIS_BLOCK_ID;
-    let block_id = gen_block_id(1);
     let version = 100;
 
     let txns: Vec<_> = (0..version)
@@ -322,13 +260,7 @@ fn test_executor_execute_same_block_multiple_times() {
     let mut responses = vec![];
     for _i in 0..100 {
         let output = executor
-            .execute_block(
-                txns.clone(),
-                &committed_trees,
-                &committed_trees,
-                parent_block_id,
-                block_id,
-            )
+            .execute_block(txns.clone(), &committed_trees, &committed_trees)
             .unwrap();
         responses.push(output.state_compute_result());
     }
@@ -365,7 +297,7 @@ fn create_transaction_chunks(
     // To obtain the batches of transactions, we first execute and save all these transactions in a
     // separate DB. Then we call get_transactions to retrieve them.
     let (mut config, _) = config_builder::test_config();
-    let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
+    let storage_server = create_storage_server(&mut config);
     let (executor, root_trees) = create_executor(&config);
 
     let mut txns = vec![];
@@ -376,13 +308,7 @@ fn create_transaction_chunks(
     let id = gen_block_id(1);
 
     let output = executor
-        .execute_block(
-            txns.clone(),
-            &root_trees,
-            &root_trees,
-            *GENESIS_BLOCK_ID,
-            id,
-        )
+        .execute_block(txns.clone(), &root_trees, &root_trees)
         .unwrap();
     let ledger_version = txns.len() as u64;
     let ledger_info = gen_ledger_info(ledger_version, output.accu_root(), id, 1);
@@ -394,16 +320,12 @@ fn create_transaction_chunks(
         )
         .unwrap();
 
-    let storage_client = StorageReadServiceClient::new(
-        Arc::new(EnvBuilder::new().build()),
-        "localhost",
-        config.storage.port,
-    );
+    let storage_client = StorageReadServiceClient::new("localhost", config.storage.port);
 
     let batches: Vec<_> = chunk_ranges
         .into_iter()
         .map(|range| {
-            rt.block_on(storage_client.get_transactions_async(
+            rt.block_on(storage_client.get_transactions(
                 range.start,
                 range.end - range.start,
                 ledger_version,
@@ -414,7 +336,6 @@ fn create_transaction_chunks(
         .collect();
 
     drop(storage_server);
-    shutdown_receiver.recv().unwrap();
 
     (batches, ledger_info)
 }
@@ -440,13 +361,9 @@ fn test_executor_execute_and_commit_chunk() {
 
     // Now we execute these two chunks of transactions.
     let (mut config, _) = config_builder::test_config();
-    let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
+    let storage_server = create_storage_server(&mut config);
     let (executor, mut committed_trees) = create_executor(&config);
-    let storage_client = StorageReadServiceClient::new(
-        Arc::new(EnvBuilder::new().build()),
-        "localhost",
-        config.storage.port,
-    );
+    let storage_client = StorageReadServiceClient::new("localhost", config.storage.port);
 
     // Execute the first chunk. After that we should still get the genesis ledger info from DB.
     executor
@@ -458,7 +375,7 @@ fn test_executor_execute_and_commit_chunk() {
         )
         .unwrap();
     let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
         .unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
@@ -473,7 +390,7 @@ fn test_executor_execute_and_commit_chunk() {
         )
         .unwrap();
     let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
         .unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
@@ -488,7 +405,7 @@ fn test_executor_execute_and_commit_chunk() {
         )
         .unwrap();
     let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
         .unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
@@ -503,7 +420,7 @@ fn test_executor_execute_and_commit_chunk() {
         )
         .unwrap();
     let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
         .unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
@@ -518,12 +435,11 @@ fn test_executor_execute_and_commit_chunk() {
         )
         .unwrap();
     let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
         .unwrap();
     assert_eq!(li, ledger_info);
 
     drop(storage_server);
-    shutdown_receiver.recv().unwrap();
 }
 
 #[test]
@@ -542,17 +458,13 @@ fn test_executor_execute_and_commit_chunk_restart() {
     };
 
     let (mut config, _) = config_builder::test_config();
-    let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
+    let storage_server = create_storage_server(&mut config);
     let mut synced_trees;
 
     // First we simulate syncing the first chunk of transactions.
     {
         let (executor, mut committed_trees) = create_executor(&config);
-        let storage_client = StorageReadServiceClient::new(
-            Arc::new(EnvBuilder::new().build()),
-            "localhost",
-            config.storage.port,
-        );
+        let storage_client = StorageReadServiceClient::new("localhost", config.storage.port);
 
         executor
             .execute_and_commit_chunk(
@@ -564,7 +476,7 @@ fn test_executor_execute_and_commit_chunk_restart() {
             .unwrap();
         synced_trees = committed_trees;
         let (_, li, _, _) = rt
-            .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+            .block_on(storage_client.update_to_latest_ledger(0, vec![]))
             .unwrap();
         assert_eq!(li.ledger_info().version(), 0);
         assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
@@ -573,11 +485,7 @@ fn test_executor_execute_and_commit_chunk_restart() {
     // Then we restart executor and resume to the next chunk.
     {
         let (executor, _) = create_executor(&config);
-        let storage_client = StorageReadServiceClient::new(
-            Arc::new(EnvBuilder::new().build()),
-            "localhost",
-            config.storage.port,
-        );
+        let storage_client = StorageReadServiceClient::new("localhost", config.storage.port);
 
         executor
             .execute_and_commit_chunk(
@@ -588,13 +496,12 @@ fn test_executor_execute_and_commit_chunk_restart() {
             )
             .unwrap();
         let (_, li, _, _) = rt
-            .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+            .block_on(storage_client.update_to_latest_ledger(0, vec![]))
             .unwrap();
         assert_eq!(li, ledger_info);
     }
 
     drop(storage_server);
-    shutdown_receiver.recv().unwrap();
 }
 
 struct TestBlock {
@@ -628,13 +535,7 @@ fn run_transactions_naive(transactions: Vec<Transaction>) -> HashValue {
     let first_txn = iter.next().map_or(vec![], |txn| vec![txn]);
     let first_id = gen_block_id(1);
     let mut output = executor
-        .execute_block(
-            first_txn.clone(),
-            &committed_trees,
-            &committed_trees,
-            *GENESIS_BLOCK_ID,
-            gen_block_id(1),
-        )
+        .execute_block(first_txn.clone(), &committed_trees, &committed_trees)
         .unwrap();
     let mut root_hash = output.accu_root();
     let ledger_info = gen_ledger_info(first_txn.len() as u64, root_hash, first_id, 0);
@@ -649,17 +550,10 @@ fn run_transactions_naive(transactions: Vec<Transaction>) -> HashValue {
     committed_trees = new_trees;
 
     for (i, txn) in iter.enumerate() {
-        let parent_block_id = gen_block_id(i as u64 + 1);
         // when i = 0, id should be 2.
         let id = gen_block_id(i as u64 + 2);
         output = executor
-            .execute_block(
-                vec![txn.clone()],
-                &committed_trees,
-                &committed_trees,
-                parent_block_id,
-                id,
-            )
+            .execute_block(vec![txn.clone()], &committed_trees, &committed_trees)
             .unwrap();
 
         root_hash = output.accu_root();
@@ -697,15 +591,15 @@ proptest! {
         let (executor, committed_trees) = TestExecutor::new();
 
         let output_a = executor.execute_block(
-            block_a.txns.clone(), &committed_trees, &committed_trees,block_a.parent_id, block_a.id,
+            block_a.txns.clone(), &committed_trees, &committed_trees,
         ).unwrap();
         prop_assert_eq!(output_a.version().unwrap(), a_size);
         let output_b = executor.execute_block(
-            block_b.txns.clone(), output_a.executed_trees(), &committed_trees, block_b.parent_id, block_b.id,
+            block_b.txns.clone(), output_a.executed_trees(), &committed_trees,
         ).unwrap();
         prop_assert_eq!(output_b.version().unwrap(), a_size + b_size);
         let output_c = executor.execute_block(
-            block_c.txns.clone(), output_a.executed_trees(), &committed_trees, block_c.parent_id, block_c.id,
+            block_c.txns.clone(), output_a.executed_trees(), &committed_trees,
         ).unwrap();
         prop_assert_eq!(output_c.version().unwrap(), a_size + c_size);
 
@@ -740,13 +634,13 @@ proptest! {
         let block_b = TestBlock::new(0..b_size, amount, gen_block_id(1), gen_block_id(2));
 
         let (mut config, _) = config_builder::test_config();
-        let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
+        let storage_server = create_storage_server(&mut config);
 
         // First execute and commit one block, then destroy executor.
         {
             let (executor, committed_trees) = create_executor(&config);
             let output_a = executor.execute_block(
-                block_a.txns.clone(), &committed_trees, &committed_trees, block_a.parent_id, block_a.id,
+                block_a.txns.clone(), &committed_trees, &committed_trees,
             ).unwrap();
             let root_hash = output_a.accu_root();
             let ledger_info = gen_ledger_info(block_a.txns.len() as u64, root_hash, block_a.id, 1);
@@ -760,7 +654,7 @@ proptest! {
         let root_hash = {
             let (executor, committed_trees) = create_executor(&config);
             let output_b = executor.execute_block(
-                block_b.txns.clone(), &committed_trees, &committed_trees, block_b.parent_id, block_b.id,
+                block_b.txns.clone(), &committed_trees, &committed_trees,
             ).unwrap();
             let root_hash = output_b.accu_root();
             let ledger_info = gen_ledger_info(
@@ -785,7 +679,6 @@ proptest! {
         prop_assert_eq!(root_hash, expected_root_hash);
 
         drop(storage_server);
-        shutdown_receiver.recv().unwrap();
     }
 
     #[test]
@@ -799,7 +692,7 @@ proptest! {
             ]);
 
         let (mut config, _) = config_builder::test_config();
-        let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
+        let storage_server = create_storage_server(&mut config);
         let (executor, committed_trees) = create_executor(&config);
 
         let overlap_txn_list_with_proof = chunks.pop().unwrap();
@@ -811,8 +704,6 @@ proptest! {
         executor.execute_and_commit_chunk(txn_list_with_proof_to_commit, ledger_info, None, &mut synced_trees)
             .unwrap();
 
-        let parent_block_id = HashValue::zero();
-        let first_block_id = gen_block_id(1);
         first_block_txns.extend(overlap_txn_list_with_proof.transactions);
         let second_block_txns = ((chunk_size + overlap_size + 1..=chunk_size + overlap_size + num_new_txns)
                              .map(|i| encode_mint_transaction(gen_address(i), 100))).collect::<Vec<_>>();
@@ -821,8 +712,6 @@ proptest! {
             first_block_txns.clone(),
             &committed_trees,
             &committed_trees,
-            parent_block_id,
-            first_block_id,
         ).unwrap();
 
         let second_block_id = gen_block_id(2);
@@ -830,8 +719,6 @@ proptest! {
             second_block_txns.clone(),
             output1.executed_trees(),
             &committed_trees,
-            first_block_id,
-            second_block_id,
         ).unwrap();
 
         let version = chunk_size + overlap_size + num_new_txns;
@@ -846,6 +733,5 @@ proptest! {
         ).unwrap();
 
         drop(storage_server);
-        shutdown_receiver.recv().unwrap();
     }
 }

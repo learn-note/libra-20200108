@@ -19,9 +19,10 @@
             {"sourceVolume": "libra-data", "containerPath": "/opt/libra/data"}
         ],
         "environment": [
-            %{ if cfg_upstream_node_index != "" }
-	    {"name": "CFG_UPSTREAM_NODE_INDEX", "value": ${cfg_upstream_node_index}},
-	    %{ endif }
+        %{ if cfg_fullnode_seed != "" }
+	    {"name": "CFG_FULLNODE_SEED", "value": "${cfg_fullnode_seed}"},
+	    {"name": "CFG_NUM_FULLNODES", "value": "${cfg_num_fullnodes}"},
+	%{ endif }
 	    {"name": "CFG_LISTEN_ADDR", "value": "${cfg_listen_addr}"},
             {"name": "CFG_NODE_INDEX", "value": "${cfg_node_index}"},
             {"name": "CFG_NUM_VALIDATORS", "value": "${cfg_num_validators}"},

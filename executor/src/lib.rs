@@ -16,8 +16,7 @@ use libra_config::config::VMConfig;
 use libra_crypto::{
     hash::{
         CryptoHash, EventAccumulatorHasher, TransactionAccumulatorHasher,
-        ACCUMULATOR_PLACEHOLDER_HASH, GENESIS_BLOCK_ID, PRE_GENESIS_BLOCK_ID,
-        SPARSE_MERKLE_PLACEHOLDER_HASH,
+        ACCUMULATOR_PLACEHOLDER_HASH, PRE_GENESIS_BLOCK_ID, SPARSE_MERKLE_PLACEHOLDER_HASH,
     },
     HashValue,
 };
@@ -323,7 +322,7 @@ where
 
         let startup_info = block_on(executor.rt.spawn(async move {
             storage_read_client
-                .get_startup_info_async()
+                .get_startup_info()
                 .await
                 .expect("Shouldn't fail")
         }))
@@ -351,13 +350,7 @@ where
         // We create `PRE_GENESIS_BLOCK_ID` as the parent of the genesis block.
         let pre_genesis_trees = ExecutedTrees::new_empty();
         let output = self
-            .execute_block(
-                genesis_txns.clone(),
-                &pre_genesis_trees,
-                &pre_genesis_trees,
-                *PRE_GENESIS_BLOCK_ID,
-                *GENESIS_BLOCK_ID,
-            )
+            .execute_block(genesis_txns.clone(), &pre_genesis_trees, &pre_genesis_trees)
             .expect("Failed to execute genesis block.");
 
         let root_hash = output.accu_root();
@@ -390,14 +383,7 @@ where
         transactions: Vec<Transaction>,
         parent_trees: &ExecutedTrees,
         committed_trees: &ExecutedTrees,
-        parent_id: HashValue,
-        id: HashValue,
     ) -> Result<ProcessedVMOutput> {
-        debug!(
-            "Received request to execute block. Parent id: {:x}. Id: {:x}.",
-            parent_id, id
-        );
-
         let _timer = OP_COUNTERS.timer("block_execute_time_s");
         // Construct a StateView and pass the transactions to VM.
         let state_view = VerifiedStateView::new(
@@ -536,7 +522,7 @@ where
             let write_client = self.storage_write_client.clone();
             block_on(self.rt.spawn(async move {
                 write_client
-                    .save_transactions_async(
+                    .save_transactions(
                         txns_to_commit,
                         first_version_to_commit,
                         Some(ledger_info_with_sigs),
@@ -643,7 +629,7 @@ where
         let ledger_info = ledger_info_to_commit.clone();
         block_on(self.rt.spawn(async move {
             write_client
-                .save_transactions_async(txns_to_commit, first_version, ledger_info)
+                .save_transactions(txns_to_commit, first_version, ledger_info)
                 .await
         }))
         .unwrap()?;
@@ -799,15 +785,15 @@ where
                     txn_info_hashes.push(real_txn_info_hash);
                     txn_info_hash = Some(real_txn_info_hash);
                 }
-                TransactionStatus::Discard(_) => {
-                    ensure!(
-                        vm_output.write_set().is_empty(),
-                        "Discarded transaction has non-empty write set.",
-                    );
-                    ensure!(
-                        vm_output.events().is_empty(),
-                        "Discarded transaction has non-empty events.",
-                    );
+                TransactionStatus::Discard(status) => {
+                    if !vm_output.write_set().is_empty() || !vm_output.events().is_empty() {
+                        crit!(
+                            "Discarded transaction has non-empty write set or events. \
+                             Transaction: {:?}. Status: {}.",
+                            txn,
+                            status,
+                        );
+                    }
                 }
             }
 

@@ -17,7 +17,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub const INLINE_PRELUDE: &str = "<inline-prelude>";
 
 /// Default flags passed to boogie. Additional flags will be added to this via the -B option.
-const DEFAULT_BOOGIE_FLAGS: &[&str] = &["-doModSetAnalysis", "-noinfer"];
+
+const DEFAULT_BOOGIE_FLAGS: &[&str] = &[
+    "-doModSetAnalysis",
+    "-noinfer",
+    "-printVerifiedProceduresCount:0",
+];
 
 /// Atomic used to prevent re-initialization of logging.
 static LOGGER_CONFIGURED: AtomicBool = AtomicBool::new(false);
@@ -49,6 +54,10 @@ pub struct Options {
     pub boogie_flags: Vec<String>,
     /// Whether to only generate boogie
     pub generate_only: bool,
+    /// Whether to generate stubs for native functions.
+    pub native_stubs: bool,
+    /// Whether to minimize execution traces in errors.
+    pub minimize_execution_trace: bool,
 }
 
 impl Default for Options {
@@ -64,6 +73,8 @@ impl Default for Options {
             cvc4_exe: "".to_string(),
             boogie_flags: vec![],
             generate_only: false,
+            native_stubs: false,
+            minimize_execution_trace: true,
         }
     }
 }
@@ -107,6 +118,11 @@ impl Options {
                     .short("g")
                     .long("generate-only")
                     .help("only generate boogie file but do not call boogie"),
+            )
+            .arg(
+                Arg::with_name("native-stubs")
+                    .long("native-stubs")
+                    .help("whether to generate stubs for native functions"),
             )
             .arg(
                 Arg::with_name("boogie-exe")
@@ -181,6 +197,7 @@ impl Options {
             _ => unreachable!("should not happen"),
         };
         self.generate_only = matches.is_present("generate-only");
+        self.native_stubs = matches.is_present("native-stubs");
         self.use_cvc4 = matches.is_present("use-cvc4");
         self.boogie_exe = get_with_default("boogie-exe");
         self.z3_exe = get_with_default("z3-exe");
@@ -232,6 +249,11 @@ impl Options {
         }
         add(&[boogie_file]);
         result
+    }
+
+    /// Returns name of file where to log boogie output.
+    pub fn get_boogie_log_file(&self, boogie_file: &str) -> String {
+        format!("{}.log", boogie_file)
     }
 }
 

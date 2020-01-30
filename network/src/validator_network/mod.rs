@@ -12,7 +12,7 @@ use crate::{
     utils::MessageExt,
     ProtocolId,
 };
-use bytes05::Bytes;
+use bytes::Bytes;
 use futures::{
     channel::oneshot,
     ready,
@@ -27,7 +27,6 @@ use std::{collections::HashMap, default::Default, marker::PhantomData, pin::Pin,
 
 pub mod network_builder;
 
-mod admission_control;
 mod consensus;
 mod discovery;
 mod health_checker;
@@ -39,9 +38,6 @@ mod test;
 
 // Public re-exports
 pub use crate::interface::LibraNetworkProvider;
-pub use admission_control::{
-    AdmissionControlNetworkEvents, AdmissionControlNetworkSender, ADMISSION_CONTROL_RPC_PROTOCOL,
-};
 pub use consensus::{
     ConsensusNetworkEvents, ConsensusNetworkSender, CONSENSUS_DIRECT_SEND_PROTOCOL,
     CONSENSUS_RPC_PROTOCOL,

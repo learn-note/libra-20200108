@@ -4,7 +4,6 @@
 use crate::SynchronizerState;
 use anyhow::{ensure, format_err, Result};
 use executor::{ExecutedTrees, Executor};
-use grpcio::EnvBuilder;
 use libra_config::config::NodeConfig;
 use libra_types::{
     crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof},
@@ -55,9 +54,7 @@ pub(crate) struct ExecutorProxy {
 
 impl ExecutorProxy {
     pub(crate) fn new(executor: Arc<Executor<LibraVM>>, config: &NodeConfig) -> Self {
-        let client_env = Arc::new(EnvBuilder::new().name_prefix("grpc-coord-").build());
         let storage_read_client = Arc::new(StorageReadServiceClient::new(
-            client_env,
             &config.storage.address,
             config.storage.port,
         ));
@@ -73,7 +70,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
     async fn get_local_storage_state(&self) -> Result<SynchronizerState> {
         let storage_info = self
             .storage_read_client
-            .get_startup_info_async()
+            .get_startup_info()
             .await?
             .ok_or_else(|| format_err!("[state sync] Failed to access storage info"))?;
 
@@ -114,7 +111,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
         target_version: u64,
     ) -> Result<TransactionListWithProof> {
         self.storage_read_client
-            .get_transactions_async(known_version + 1, limit, target_version, false)
+            .get_transactions(known_version + 1, limit, target_version, false)
             .await
     }
 
@@ -125,7 +122,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
     ) -> Result<ValidatorChangeProof> {
         let validator_change_proof = self
             .storage_read_client
-            .get_epoch_change_ledger_infos_async(start_epoch, end_epoch)
+            .get_epoch_change_ledger_infos(start_epoch, end_epoch)
             .await?;
         Ok(validator_change_proof)
     }
@@ -133,7 +130,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
     async fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
         let (_, _, li_chain, _) = self
             .storage_read_client
-            .update_to_latest_ledger_async(version, vec![])
+            .update_to_latest_ledger(version, vec![])
             .await?;
         let waypoint_li = li_chain
             .ledger_info_with_sigs
