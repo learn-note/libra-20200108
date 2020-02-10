@@ -1,7 +1,9 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::chained_bft::persistent_storage::{PersistentStorage, RecoveryData};
+use crate::chained_bft::persistent_liveness_storage::{
+    LedgerRecoveryData, PersistentLivenessStorage, RecoveryData,
+};
 
 use anyhow::Result;
 use consensus_types::{
@@ -52,7 +54,15 @@ impl<T: Payload> MockStorage<T> {
         }
     }
 
+    pub fn get_ledger_recovery_data(&self) -> LedgerRecoveryData<T> {
+        LedgerRecoveryData::new(
+            self.storage_ledger.lock().unwrap().clone(),
+            self.shared_storage.validator_set.clone(),
+        )
+    }
+
     pub fn try_start(&self) -> Result<RecoveryData<T>> {
+        let ledger_recovery_data = self.get_ledger_recovery_data();
         let mut blocks: Vec<_> = self
             .shared_storage
             .block
@@ -74,6 +84,7 @@ impl<T: Payload> MockStorage<T> {
         blocks.sort_by_key(Block::round);
         RecoveryData::new(
             self.shared_storage.last_vote.lock().unwrap().clone(),
+            ledger_recovery_data,
             blocks,
             quorum_certs,
             &self.storage_ledger.lock().unwrap(),
@@ -83,7 +94,6 @@ impl<T: Payload> MockStorage<T> {
                 .lock()
                 .unwrap()
                 .clone(),
-            self.shared_storage.validator_set.clone(),
         )
     }
 
@@ -107,7 +117,7 @@ impl<T: Payload> MockStorage<T> {
 
 // A impl that always start from genesis.
 #[async_trait::async_trait]
-impl<T: Payload> PersistentStorage<T> for MockStorage<T> {
+impl<T: Payload> PersistentLivenessStorage<T> for MockStorage<T> {
     fn save_tree(&self, blocks: Vec<Block<T>>, quorum_certs: Vec<QuorumCert>) -> Result<()> {
         for block in blocks {
             self.shared_storage
@@ -149,6 +159,10 @@ impl<T: Payload> PersistentStorage<T> for MockStorage<T> {
         Ok(())
     }
 
+    async fn recover_from_ledger(&self) -> LedgerRecoveryData<T> {
+        self.get_ledger_recovery_data()
+    }
+
     async fn start(&self) -> RecoveryData<T> {
         self.try_start().unwrap()
     }
@@ -177,7 +191,7 @@ impl EmptyStorage {
 }
 
 #[async_trait::async_trait]
-impl<T: Payload> PersistentStorage<T> for EmptyStorage {
+impl<T: Payload> PersistentLivenessStorage<T> for EmptyStorage {
     fn save_tree(&self, _: Vec<Block<T>>, _: Vec<QuorumCert>) -> Result<()> {
         Ok(())
     }
@@ -190,15 +204,19 @@ impl<T: Payload> PersistentStorage<T> for EmptyStorage {
         Ok(())
     }
 
+    async fn recover_from_ledger(&self) -> LedgerRecoveryData<T> {
+        LedgerRecoveryData::new(LedgerInfo::genesis(), ValidatorSet::new(vec![]))
+    }
+
     async fn start(&self) -> RecoveryData<T> {
         RecoveryData::new(
             None,
+            self.recover_from_ledger().await,
             vec![],
             vec![],
             &LedgerInfo::genesis(),
             ExecutedTrees::new_empty(),
             None,
-            ValidatorSet::new(vec![]),
         )
         .unwrap()
     }

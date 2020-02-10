@@ -6,9 +6,9 @@
 use itertools::Itertools;
 use num::{BigInt, Num};
 
-use ir_to_bytecode_syntax::ast::{BinOp, CopyableVal, Field, Loc, QualifiedStructIdent, Type};
-use ir_to_bytecode_syntax::spec_language_ast::{Condition, SpecExp, StorageLocation};
 use libra_types::account_address::AccountAddress;
+use move_ir_types::ast::{BinOp, CopyableVal_, Field_, Loc, QualifiedStructIdent, Type};
+use move_ir_types::spec_language_ast::{Condition_, SpecExp, StorageLocation};
 
 use crate::boogie_helpers::{boogie_field_name, boogie_type_value};
 use crate::code_writer::CodeWriter;
@@ -79,7 +79,7 @@ impl<'env> SpecTranslator<'env> {
         // must have existed! So we can assume txn_sender account
         // exists in pre-condition.
         for cond in self.func_env.get_specification() {
-            if let Condition::Requires(expr) = &cond.value {
+            if let Condition_::Requires(expr) = &cond.value {
                 self.update_location(cond.span);
                 emitln!(
                     self.writer,
@@ -98,7 +98,7 @@ impl<'env> SpecTranslator<'env> {
             .get_specification()
             .iter()
             .filter_map(|c| match &c.value {
-                Condition::SucceedsIf(expr) => {
+                Condition_::SucceedsIf(expr) => {
                     self.update_location(c.span);
                     Some(format!("b#Boolean({})", self.translate_expr(expr).result()))
                 }
@@ -113,7 +113,7 @@ impl<'env> SpecTranslator<'env> {
             .get_specification()
             .iter()
             .filter_map(|c| match &c.value {
-                Condition::AbortsIf(expr) => {
+                Condition_::AbortsIf(expr) => {
                     self.update_location(c.span);
                     Some(format!("b#Boolean({})", self.translate_expr(expr).result()))
                 }
@@ -140,7 +140,7 @@ impl<'env> SpecTranslator<'env> {
 
         // Generate explicit ensures conditions
         for cond in self.func_env.get_specification() {
-            if let Condition::Ensures(expr) = &cond.value {
+            if let Condition_::Ensures(expr) = &cond.value {
                 // FIXME: Do we really need to check whether succeeds_if & aborts_if are
                 // empty, below?
                 self.update_location(cond.span);
@@ -290,11 +290,19 @@ impl<'env> SpecTranslator<'env> {
 
             // generic equality
             BinOp::Eq => BoogieExpr(
-                format!("Boolean(({}) == ({}))", left.0, right.0),
+                if left.1.is_reference() || right.1.is_reference() {
+                    format!("Boolean(({}) == ({}))", left.0, right.0)
+                } else {
+                    format!("Boolean(IsEqual({}, {}))", left.0, right.0)
+                },
                 GlobalType::Bool,
             ),
             BinOp::Neq => BoogieExpr(
-                format!("Boolean(({}) != ({}))", left.0, right.0),
+                if left.1.is_reference() || right.1.is_reference() {
+                    format!("Boolean(({}) != ({}))", left.0, right.0)
+                } else {
+                    format!("Boolean(!IsEqual({}, {}))", left.0, right.0)
+                },
                 GlobalType::Bool,
             ),
 
@@ -344,18 +352,18 @@ impl<'env> SpecTranslator<'env> {
     }
 
     /// Translates a constant.
-    fn translate_constant(&mut self, val: &CopyableVal) -> BoogieExpr {
+    fn translate_constant(&mut self, val: &CopyableVal_) -> BoogieExpr {
         match val {
-            CopyableVal::Address(addr) => BoogieExpr(
+            CopyableVal_::Address(addr) => BoogieExpr(
                 format!("Address({})", self.translate_account_address(addr)),
                 GlobalType::Address,
             ),
-            CopyableVal::U8(val) => BoogieExpr(format!("Integer({})", val), GlobalType::U8),
-            CopyableVal::U64(val) => BoogieExpr(format!("Integer({})", val), GlobalType::U64),
-            CopyableVal::U128(val) => BoogieExpr(format!("Integer({})", val), GlobalType::U128),
-            CopyableVal::Bool(val) => BoogieExpr(format!("Boolean({})", val), GlobalType::Bool),
+            CopyableVal_::U8(val) => BoogieExpr(format!("Integer({})", val), GlobalType::U8),
+            CopyableVal_::U64(val) => BoogieExpr(format!("Integer({})", val), GlobalType::U64),
+            CopyableVal_::U128(val) => BoogieExpr(format!("Integer({})", val), GlobalType::U128),
+            CopyableVal_::Bool(val) => BoogieExpr(format!("Boolean({})", val), GlobalType::Bool),
             // TODO: byte arrays
-            CopyableVal::ByteArray(_arr) => BoogieExpr(
+            CopyableVal_::ByteArray(_arr) => BoogieExpr(
                 self.error("ByteArray not implemented", "<bytearray>".to_string()),
                 GlobalType::ByteArray,
             ),
@@ -537,13 +545,13 @@ impl<'env> SpecTranslator<'env> {
                 BoogieExpr("<ret>".to_string(), GlobalType::U64),
             )
         } else {
-            BoogieExpr(format!("ret{}", index), return_types[index].clone())
+            BoogieExpr(format!("__ret{}", index), return_types[index].clone())
         }
     }
 
     /// Translates a field name, where `sig` is the type from which the field is selected.
     /// Returns boogie field name and type.
-    fn translate_field(&mut self, mut sig: &GlobalType, field: &Field) -> (String, GlobalType) {
+    fn translate_field(&mut self, mut sig: &GlobalType, field: &Field_) -> (String, GlobalType) {
         // If this is a reference, use the underlying type. This function works with both
         // references and non-references.
         let is_ref = if let GlobalType::Reference(s) = sig {

@@ -13,11 +13,11 @@ ensures old(b#Boolean(Boolean(i#Integer(x) <= i#Integer(y)))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t2: Value; // IntegerType()
-    var t3: Value; // IntegerType()
-    var t4: Value; // BooleanType()
-    var t5: Value; // BooleanType()
-    var t6: Value; // IntegerType()
+    var __t2: Value; // IntegerType()
+    var __t3: Value; // IntegerType()
+    var __t4: Value; // BooleanType()
+    var __t5: Value; // BooleanType()
+    var __t6: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -31,8 +31,10 @@ ensures old(b#Boolean(Boolean(i#Integer(x) <= i#Integer(y)))) ==> __abort_flag;
     // process and type check arguments
     assume IsValidU64(x);
     __m := UpdateLocal(__m, __frame + 0, x);
+    assume $DebugTrackLocal(0, 0, 0, 66, x);
     assume IsValidU64(y);
     __m := UpdateLocal(__m, __frame + 1, y);
+    assume $DebugTrackLocal(0, 0, 1, 66, y);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -65,7 +67,7 @@ Label_Abort:
 
 procedure TestAbortIf_abort1_verify (x: Value, y: Value) returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestAbortIf_abort1(x, y);
 }
 
@@ -89,8 +91,10 @@ ensures old(b#Boolean(Boolean(i#Integer(x) <= i#Integer(y)))) ==> __abort_flag;
     // process and type check arguments
     assume IsValidU64(x);
     __m := UpdateLocal(__m, __frame + 0, x);
+    assume $DebugTrackLocal(0, 1, 0, 283, x);
     assume IsValidU64(y);
     __m := UpdateLocal(__m, __frame + 1, y);
+    assume $DebugTrackLocal(0, 1, 1, 283, y);
 
     // bytecode translation starts here
     return;
@@ -102,7 +106,7 @@ Label_Abort:
 
 procedure TestAbortIf_abort2_verify (x: Value, y: Value) returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestAbortIf_abort2(x, y);
 }
 
@@ -113,9 +117,9 @@ ensures old(b#Boolean(Boolean(i#Integer(x) <= i#Integer(y)))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t2: Value; // BooleanType()
-    var t3: Value; // BooleanType()
-    var t4: Value; // IntegerType()
+    var __t2: Value; // BooleanType()
+    var __t3: Value; // BooleanType()
+    var __t4: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -129,8 +133,10 @@ ensures old(b#Boolean(Boolean(i#Integer(x) <= i#Integer(y)))) ==> __abort_flag;
     // process and type check arguments
     assume IsValidU64(x);
     __m := UpdateLocal(__m, __frame + 0, x);
+    assume $DebugTrackLocal(0, 2, 0, 476, x);
     assume IsValidU64(y);
     __m := UpdateLocal(__m, __frame + 1, y);
+    assume $DebugTrackLocal(0, 2, 1, 476, y);
 
     // bytecode translation starts here
     call __tmp := LdFalse();
@@ -157,7 +163,7 @@ Label_Abort:
 
 procedure TestAbortIf_abort3_verify (x: Value, y: Value) returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestAbortIf_abort3(x, y);
 }
 
@@ -168,11 +174,11 @@ ensures old(b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t2: Value; // IntegerType()
-    var t3: Value; // IntegerType()
-    var t4: Value; // BooleanType()
-    var t5: Value; // BooleanType()
-    var t6: Value; // IntegerType()
+    var __t2: Value; // IntegerType()
+    var __t3: Value; // IntegerType()
+    var __t4: Value; // BooleanType()
+    var __t5: Value; // BooleanType()
+    var __t6: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -186,8 +192,10 @@ ensures old(b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) ==> __abort_flag;
     // process and type check arguments
     assume IsValidU64(x);
     __m := UpdateLocal(__m, __frame + 0, x);
+    assume $DebugTrackLocal(0, 3, 0, 717, x);
     assume IsValidU64(y);
     __m := UpdateLocal(__m, __frame + 1, y);
+    assume $DebugTrackLocal(0, 3, 1, 717, y);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -220,7 +228,7 @@ Label_Abort:
 
 procedure TestAbortIf_abort4_verify (x: Value, y: Value) returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestAbortIf_abort4(x, y);
 }
 
@@ -231,11 +239,11 @@ ensures old(b#Boolean(Boolean(i#Integer(x) <= i#Integer(y)))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t2: Value; // IntegerType()
-    var t3: Value; // IntegerType()
-    var t4: Value; // BooleanType()
-    var t5: Value; // BooleanType()
-    var t6: Value; // IntegerType()
+    var __t2: Value; // IntegerType()
+    var __t3: Value; // IntegerType()
+    var __t4: Value; // BooleanType()
+    var __t5: Value; // BooleanType()
+    var __t6: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -249,8 +257,10 @@ ensures old(b#Boolean(Boolean(i#Integer(x) <= i#Integer(y)))) ==> __abort_flag;
     // process and type check arguments
     assume IsValidU64(x);
     __m := UpdateLocal(__m, __frame + 0, x);
+    assume $DebugTrackLocal(0, 4, 0, 954, x);
     assume IsValidU64(y);
     __m := UpdateLocal(__m, __frame + 1, y);
+    assume $DebugTrackLocal(0, 4, 1, 954, y);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -283,7 +293,7 @@ Label_Abort:
 
 procedure TestAbortIf_abort5_verify (x: Value, y: Value) returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestAbortIf_abort5(x, y);
 }
 
@@ -294,11 +304,11 @@ ensures old(b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t2: Value; // IntegerType()
-    var t3: Value; // IntegerType()
-    var t4: Value; // BooleanType()
-    var t5: Value; // BooleanType()
-    var t6: Value; // IntegerType()
+    var __t2: Value; // IntegerType()
+    var __t3: Value; // IntegerType()
+    var __t4: Value; // BooleanType()
+    var __t5: Value; // BooleanType()
+    var __t6: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -312,8 +322,10 @@ ensures old(b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) ==> __abort_flag;
     // process and type check arguments
     assume IsValidU64(x);
     __m := UpdateLocal(__m, __frame + 0, x);
+    assume $DebugTrackLocal(0, 5, 0, 1199, x);
     assume IsValidU64(y);
     __m := UpdateLocal(__m, __frame + 1, y);
+    assume $DebugTrackLocal(0, 5, 1, 1199, y);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -346,7 +358,7 @@ Label_Abort:
 
 procedure TestAbortIf_abort6_verify (x: Value, y: Value) returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestAbortIf_abort6(x, y);
 }
 
@@ -357,11 +369,11 @@ ensures old(b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t2: Value; // IntegerType()
-    var t3: Value; // IntegerType()
-    var t4: Value; // BooleanType()
-    var t5: Value; // BooleanType()
-    var t6: Value; // IntegerType()
+    var __t2: Value; // IntegerType()
+    var __t3: Value; // IntegerType()
+    var __t4: Value; // BooleanType()
+    var __t5: Value; // BooleanType()
+    var __t6: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -375,8 +387,10 @@ ensures old(b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) ==> __abort_flag;
     // process and type check arguments
     assume IsValidU64(x);
     __m := UpdateLocal(__m, __frame + 0, x);
+    assume $DebugTrackLocal(0, 6, 0, 1423, x);
     assume IsValidU64(y);
     __m := UpdateLocal(__m, __frame + 1, y);
+    assume $DebugTrackLocal(0, 6, 1, 1423, y);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -409,27 +423,27 @@ Label_Abort:
 
 procedure TestAbortIf_abort7_verify (x: Value, y: Value) returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestAbortIf_abort7(x, y);
 }
 
-procedure {:inline 1} TestAbortIf_abort8 (x: Value, y: Value) returns (ret0: Value)
+procedure {:inline 1} TestAbortIf_abort8 (x: Value, y: Value) returns (__ret0: Value)
 requires ExistsTxnSenderAccount(__m, __txn);
-ensures !__abort_flag ==> b#Boolean(Boolean((ret0) == (Boolean(true))));
+ensures !__abort_flag ==> b#Boolean(Boolean(IsEqual(__ret0, Boolean(true))));
 ensures old(!(b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) && (b#Boolean(Boolean(i#Integer(x) > i#Integer(y))))) ==> !__abort_flag;
 ensures old(b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t2: Value; // IntegerType()
-    var t3: Value; // IntegerType()
-    var t4: Value; // BooleanType()
-    var t5: Value; // BooleanType()
-    var t6: Value; // IntegerType()
-    var t7: Value; // IntegerType()
-    var t8: Value; // IntegerType()
-    var t9: Value; // IntegerType()
-    var t10: Value; // BooleanType()
+    var __t2: Value; // IntegerType()
+    var __t3: Value; // IntegerType()
+    var __t4: Value; // BooleanType()
+    var __t5: Value; // BooleanType()
+    var __t6: Value; // IntegerType()
+    var __t7: Value; // IntegerType()
+    var __t8: Value; // IntegerType()
+    var __t9: Value; // IntegerType()
+    var __t10: Value; // BooleanType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -443,8 +457,10 @@ ensures old(b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) ==> __abort_flag;
     // process and type check arguments
     assume IsValidU64(x);
     __m := UpdateLocal(__m, __frame + 0, x);
+    assume $DebugTrackLocal(0, 7, 0, 1706, x);
     assume IsValidU64(y);
     __m := UpdateLocal(__m, __frame + 1, y);
+    assume $DebugTrackLocal(0, 7, 1, 1706, y);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -473,6 +489,7 @@ Label_7:
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 7));
     __m := UpdateLocal(__m, __frame + 1, __tmp);
+    assume $DebugTrackLocal(0, 7, 1, 1900, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
     __m := UpdateLocal(__m, __frame + 8, __tmp);
@@ -483,34 +500,35 @@ Label_7:
     __tmp := Boolean(IsEqual(GetLocal(__m, __frame + 8), GetLocal(__m, __frame + 9)));
     __m := UpdateLocal(__m, __frame + 10, __tmp);
 
-    ret0 := GetLocal(__m, __frame + 10);
+    __ret0 := GetLocal(__m, __frame + 10);
+    assume $DebugTrackLocal(0, 7, 2, 1935, __ret0);
     return;
 
 Label_Abort:
     __abort_flag := true;
     __m := __saved_m;
-    ret0 := DefaultValue;
+    __ret0 := DefaultValue;
 }
 
-procedure TestAbortIf_abort8_verify (x: Value, y: Value) returns (ret0: Value)
+procedure TestAbortIf_abort8_verify (x: Value, y: Value) returns (__ret0: Value)
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
-    call ret0 := TestAbortIf_abort8(x, y);
+    call InitVerification();
+    call __ret0 := TestAbortIf_abort8(x, y);
 }
 
 procedure {:inline 1} TestAbortIf_abort9 (x: Value, y: Value) returns ()
 requires ExistsTxnSenderAccount(__m, __txn);
-ensures !__abort_flag ==> b#Boolean(Boolean((x) == (y)));
+ensures !__abort_flag ==> b#Boolean(Boolean(IsEqual(x, y)));
 ensures old(!(b#Boolean(Boolean(i#Integer(x) > i#Integer(y))) || b#Boolean(Boolean(i#Integer(x) < i#Integer(y))))) ==> !__abort_flag;
 ensures old(b#Boolean(Boolean(i#Integer(x) > i#Integer(y))) || b#Boolean(Boolean(i#Integer(x) < i#Integer(y)))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t2: Value; // IntegerType()
-    var t3: Value; // IntegerType()
-    var t4: Value; // BooleanType()
-    var t5: Value; // BooleanType()
-    var t6: Value; // IntegerType()
+    var __t2: Value; // IntegerType()
+    var __t3: Value; // IntegerType()
+    var __t4: Value; // BooleanType()
+    var __t5: Value; // BooleanType()
+    var __t6: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -524,8 +542,10 @@ ensures old(b#Boolean(Boolean(i#Integer(x) > i#Integer(y))) || b#Boolean(Boolean
     // process and type check arguments
     assume IsValidU64(x);
     __m := UpdateLocal(__m, __frame + 0, x);
+    assume $DebugTrackLocal(0, 8, 0, 2218, x);
     assume IsValidU64(y);
     __m := UpdateLocal(__m, __frame + 1, y);
+    assume $DebugTrackLocal(0, 8, 1, 2218, y);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -558,6 +578,6 @@ Label_Abort:
 
 procedure TestAbortIf_abort9_verify (x: Value, y: Value) returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestAbortIf_abort9(x, y);
 }

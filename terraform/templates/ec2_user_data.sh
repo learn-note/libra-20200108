@@ -34,4 +34,20 @@ cat > /etc/profile.d/libra_prompt.sh <<EOF
 export PS1="[\u:validator@\h \w]$ "
 EOF
 
-yum -y install ngrep tcpdump perf gdb nmap-ncat strace htop sysstat tc
+{% if enable_logrotate %}
+cat > /etc/logrotate.d/libra <<EOF
+${log_path} {
+	daily
+	size 100M
+	rotate 100
+	compress
+	delaycompress
+}
+EOF
+{% end %}
+
+yum -y install ngrep tcpdump perf gdb nmap-ncat strace htop sysstat tc git
+
+if [ ! -d /usr/local/etc/FlameGraph ] ; then
+    git clone --depth 1 https://github.com/brendangregg/FlameGraph /usr/local/etc/FlameGraph
+fi

@@ -12,12 +12,13 @@ use crate::{
     },
     consensus_provider::ConsensusProvider,
 };
-use channel;
+use channel::{self, libra_channel, message_queues::QueueStyle};
 use consensus_types::{
     proposal_msg::{ProposalMsg, ProposalUncheckedSignatures},
     vote_msg::VoteMsg,
 };
 use futures::{channel::mpsc, executor::block_on, prelude::*};
+use libra_config::config::ConsensusConfig;
 use libra_config::{
     config::{
         ConsensusProposerType::{self, FixedProposer, MultipleOrderedProposers, RotatingProposer},
@@ -29,11 +30,12 @@ use libra_crypto::hash::CryptoHash;
 use libra_types::crypto_proxies::{
     LedgerInfoWithSignatures, ValidatorChangeProof, ValidatorSet, ValidatorVerifier,
 };
+use network::peer_manager::conn_status_channel;
 use network::{
     proto::ConsensusMsg_oneof,
     validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender},
 };
-use std::{convert::TryFrom, sync::Arc};
+use std::{convert::TryFrom, num::NonZeroUsize, sync::Arc};
 
 /// Auxiliary struct that is preparing SMR for the test
 struct SMRNode {
@@ -56,12 +58,16 @@ impl SMRNode {
     ) -> Self {
         let author = config.validator_network.as_ref().unwrap().peer_id;
 
-        let (network_reqs_tx, network_reqs_rx) = channel::new_test(8);
-        let (consensus_tx, consensus_rx) = channel::new_test(8);
-        let network_sender = ConsensusNetworkSender::new(network_reqs_tx);
-        let network_events = ConsensusNetworkEvents::new(consensus_rx);
+        let (network_reqs_tx, network_reqs_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (consensus_tx, consensus_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(8);
+        let (_, conn_status_rx) = conn_status_channel::new();
+        let network_sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
+        let network_events = ConsensusNetworkEvents::new(consensus_rx, conn_status_rx);
 
-        playground.add_node(author, consensus_tx, network_reqs_rx);
+        playground.add_node(author, consensus_tx, network_reqs_rx, conn_mgr_reqs_rx);
         let (commit_cb_sender, commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
         let (mempool, commit_receiver) = MockTransactionManager::new();
 
@@ -538,7 +544,8 @@ fn basic_state_sync() {
             .next()
             .await
             .expect("Fail to be notified by a mempool committed txns");
-        assert_eq!(nodes[3].mempool.get_committed_txns().len(), 100);
+        let max_block_size = ConsensusConfig::default().max_block_size as usize;
+        assert_eq!(nodes[3].mempool.get_committed_txns().len(), max_block_size);
     });
 }
 

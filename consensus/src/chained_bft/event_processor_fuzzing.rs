@@ -11,11 +11,12 @@ use crate::{
             rotating_proposer_election::RotatingProposer,
         },
         network::NetworkSender,
-        persistent_storage::{PersistentStorage, RecoveryData},
+        persistent_liveness_storage::{PersistentLivenessStorage, RecoveryData},
         test_utils::{EmptyStateComputer, MockStorage, MockTransactionManager, TestPayload},
     },
     util::mock_time_service::SimulatedTimeService,
 };
+use channel::{self, libra_channel, message_queues::QueueStyle};
 use consensus_types::proposal_msg::{ProposalMsg, ProposalUncheckedSignatures};
 use futures::{channel::mpsc, executor::block_on};
 use libra_prost_ext::MessageExt;
@@ -23,8 +24,9 @@ use libra_types::crypto_proxies::{LedgerInfoWithSignatures, ValidatorSigner, Val
 use network::{proto::Proposal, validator_network::ConsensusNetworkSender};
 use once_cell::sync::Lazy;
 use prost::Message as _;
-use safety_rules::{PersistentStorage as SafetyStorage, SafetyRules};
+use safety_rules::{PersistentSafetyStorage, SafetyRules};
 use std::convert::TryFrom;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -55,7 +57,7 @@ static FUZZING_SIGNER: Lazy<ValidatorSigner> = Lazy::new(|| ValidatorSigner::fro
 
 // helpers
 fn build_empty_store(
-    storage: Arc<dyn PersistentStorage<TestPayload>>,
+    storage: Arc<dyn PersistentLivenessStorage<TestPayload>>,
     initial_data: RecoveryData<TestPayload>,
 ) -> Arc<BlockStore<TestPayload>> {
     let (_commit_cb_sender, _commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
@@ -92,12 +94,14 @@ fn create_node_for_fuzzing() -> EventProcessor<TestPayload> {
     // TODO: remove
     let safety_rules = SafetyRules::new(
         signer.author(),
-        SafetyStorage::in_memory(signer.private_key().clone()),
+        PersistentSafetyStorage::in_memory(signer.private_key().clone()),
     );
 
     // TODO: mock channels
-    let (network_reqs_tx, _network_reqs_rx) = channel::new_test(8);
-    let network_sender = ConsensusNetworkSender::new(network_reqs_tx);
+    let (network_reqs_tx, _network_reqs_rx) =
+        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+    let (conn_mgr_reqs_tx, _conn_mgr_reqs_rx) = channel::new_test(8);
+    let network_sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
     let (self_sender, _self_receiver) = channel::new_test(8);
     let network = NetworkSender::new(
         signer.author(),

@@ -13,7 +13,7 @@ use crate::{
             rotating_proposer_election::{choose_leader, RotatingProposer},
         },
         network::NetworkSender,
-        persistent_storage::{PersistentStorage, RecoveryData},
+        persistent_liveness_storage::{PersistentLivenessStorage, RecoveryData},
     },
     counters,
     state_replication::{StateComputer, TxnManager},
@@ -54,7 +54,7 @@ pub struct EpochManager<T> {
     timeout_sender: channel::Sender<Round>,
     txn_manager: Box<dyn TxnManager<Payload = T>>,
     state_computer: Arc<dyn StateComputer<Payload = T>>,
-    storage: Arc<dyn PersistentStorage<T>>,
+    storage: Arc<dyn PersistentLivenessStorage<T>>,
     safety_rules_manager: SafetyRulesManager<T>,
 }
 
@@ -69,7 +69,7 @@ impl<T: Payload> EpochManager<T> {
         timeout_sender: channel::Sender<Round>,
         txn_manager: Box<dyn TxnManager<Payload = T>>,
         state_computer: Arc<dyn StateComputer<Payload = T>>,
-        storage: Arc<dyn PersistentStorage<T>>,
+        storage: Arc<dyn PersistentLivenessStorage<T>>,
         safety_rules_manager: SafetyRulesManager<T>,
     ) -> Self {
         Self {
@@ -153,7 +153,7 @@ impl<T: Payload> EpochManager<T> {
         let msg = ConsensusMsg {
             message: Some(ConsensusMsg_oneof::EpochChange(proof.into())),
         };
-        if let Err(e) = self.network_sender.send_to(peer_id, msg).await {
+        if let Err(e) = self.network_sender.send_to(peer_id, msg) {
             warn!(
                 "Failed to send a epoch retrieval to peer {}: {:?}",
                 peer_id, e
@@ -189,7 +189,7 @@ impl<T: Payload> EpochManager<T> {
                         return;
                     }
                 };
-                if let Err(e) = self.network_sender.send_to(peer_id, msg).await {
+                if let Err(e) = self.network_sender.send_to(peer_id, msg) {
                     warn!(
                         "Failed to send a epoch retrieval to peer {}: {:?}",
                         peer_id, e

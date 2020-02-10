@@ -38,7 +38,7 @@
 use crate::{
     account_address::AccountAddress,
     account_config::{
-        account_resource_path, association_address, ACCOUNT_RECEIVED_EVENT_PATH,
+        association_address, ACCOUNT_RECEIVED_EVENT_PATH, ACCOUNT_RESOURCE_PATH,
         ACCOUNT_SENT_EVENT_PATH,
     },
     identifier::{IdentStr, Identifier},
@@ -217,18 +217,7 @@ impl AccessPath {
 
     /// Given an address, returns the corresponding access path that stores the Account resource.
     pub fn new_for_account(address: AccountAddress) -> Self {
-        Self::new(address, account_resource_path())
-    }
-
-    /// Create an AccessPath for a ContractEvent.
-    /// That is an AccessPah that uniquely identifies a given event for a published resource.
-    pub fn new_for_event(address: AccountAddress, root: &[u8], key: &[u8]) -> Self {
-        let mut path: Vec<u8> = Vec::new();
-        path.extend_from_slice(root);
-        path.push(b'/');
-        path.extend_from_slice(key);
-        path.push(b'/');
-        Self::new(address, path)
+        Self::new(address, ACCOUNT_RESOURCE_PATH.to_vec())
     }
 
     /// Create an AccessPath to the event for the sender account in a deposit operation.

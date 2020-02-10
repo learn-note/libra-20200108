@@ -33,11 +33,11 @@ ensures old(b#Boolean(ExistsResource(__m, TestSpecs_R_type_value(), a#Address(Ad
 
 {
     // declare local variables
-    var t0: Value; // AddressType()
-    var t1: Value; // BooleanType()
-    var t2: Value; // IntegerType()
-    var t3: Value; // IntegerType()
-    var t4: Value; // TestSpecs_R_type_value()
+    var __t0: Value; // AddressType()
+    var __t1: Value; // BooleanType()
+    var __t2: Value; // IntegerType()
+    var __t3: Value; // IntegerType()
+    var __t4: Value; // TestSpecs_R_type_value()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -73,7 +73,10 @@ Label_5:
     __m := UpdateLocal(__m, __frame + 4, __tmp);
 
     call MoveToSender(TestSpecs_R_type_value(), GetLocal(__m, __frame + 4));
-    if (__abort_flag) { goto Label_Abort; }
+    if (__abort_flag) {
+      assume $DebugTrackAbort(0, 0, 264);
+      goto Label_Abort;
+    }
 
     return;
 
@@ -84,7 +87,7 @@ Label_Abort:
 
 procedure TestSpecs_create_resource_verify () returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestSpecs_create_resource();
 }
 
@@ -96,9 +99,9 @@ ensures old(b#Boolean(ExistsResource(__m, TestSpecs_R_type_value(), a#Address(Ad
 
 {
     // declare local variables
-    var t0: Value; // AddressType()
-    var t1: Value; // BooleanType()
-    var t2: Value; // IntegerType()
+    var __t0: Value; // AddressType()
+    var __t1: Value; // BooleanType()
+    var __t2: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -136,6 +139,6 @@ Label_Abort:
 
 procedure TestSpecs_create_resource_error_verify () returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestSpecs_create_resource_error();
 }

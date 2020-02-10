@@ -46,13 +46,12 @@ use tokio::runtime::Runtime;
 use std::cmp::{max, min};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use util::retry;
 
 const MAX_TXN_BATCH_SIZE: usize = 100; // Max transactions per account in mempool
 
-#[derive(Clone)]
 pub struct TxEmitter {
     accounts: Vec<AccountData>,
     mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
@@ -61,6 +60,14 @@ pub struct TxEmitter {
 pub struct EmitJob {
     workers: Vec<Worker>,
     stop: Arc<AtomicBool>,
+    stats: Arc<TxStats>,
+}
+
+#[derive(Default)]
+pub struct TxStats {
+    pub submitted: AtomicU64,
+    pub committed: AtomicU64,
+    pub expired: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -81,7 +88,19 @@ impl Default for EmitThreadParams {
 pub struct EmitJobRequest {
     pub instances: Vec<Instance>,
     pub accounts_per_client: usize,
+    pub threads_per_ac: Option<usize>,
     pub thread_params: EmitThreadParams,
+}
+
+impl EmitJobRequest {
+    pub fn for_instances(instances: Vec<Instance>) -> Self {
+        Self {
+            instances,
+            accounts_per_client: 10,
+            threads_per_ac: None,
+            thread_params: EmitThreadParams::default(),
+        }
+    }
 }
 
 impl TxEmitter {
@@ -105,7 +124,21 @@ impl TxEmitter {
     }
 
     pub async fn start_job(&mut self, req: EmitJobRequest) -> Result<EmitJob> {
-        let num_clients = req.instances.len();
+        let threads_per_ac = match req.threads_per_ac {
+            Some(x) => x,
+            None => {
+                // Trying to create somewhere between 75-150 threads
+                // We want to have equal numbers of threads for each AC, so that they are equally loaded
+                // Otherwise things like flamegrap/perf going to show different numbers depending on which AC is chosen
+                // Also limiting number of threads as max 10 per AC for use cases with very small number of nodes or use --peers
+                min(10, max(1, 150 / req.instances.len()))
+            }
+        };
+        let num_clients = req.instances.len() * threads_per_ac;
+        info!(
+            "Will use {} threads per AC with total {} AC clients",
+            threads_per_ac, num_clients
+        );
         let num_accounts = req.accounts_per_client * num_clients;
         self.mint_accounts(&req, num_accounts).await?;
         let all_accounts = self.accounts.split_off(self.accounts.len() - num_accounts);
@@ -114,32 +147,42 @@ impl TxEmitter {
         let all_addresses = Arc::new(all_addresses);
         let mut all_accounts = all_accounts.into_iter();
         let stop = Arc::new(AtomicBool::new(false));
-        for instance in req.instances {
-            let client = Self::make_client(&instance);
-            let accounts = (&mut all_accounts).take(req.accounts_per_client).collect();
-            let all_addresses = all_addresses.clone();
-            let stop = stop.clone();
-            let peer_id = instance.peer_name().clone();
-            let params = req.thread_params.clone();
-            let thread = SubmissionThread {
-                accounts,
-                instance,
-                client,
-                all_addresses,
-                stop,
-                params,
-            };
-            let join_handle = thread::Builder::new()
-                .name(format!("txem-{}", peer_id))
-                .spawn(move || {
-                    let mut rt = Runtime::new().unwrap();
-                    rt.block_on(thread.run())
-                })
-                .unwrap();
-            workers.push(Worker { join_handle });
-            thread::sleep(Duration::from_millis(10)); // Small stagger between starting threads
+        let stats = Arc::new(TxStats::default());
+        for _ in 0..threads_per_ac {
+            for instance in &req.instances {
+                let instance = instance.clone();
+                let client = Self::make_client(&instance);
+                let accounts = (&mut all_accounts).take(req.accounts_per_client).collect();
+                let all_addresses = all_addresses.clone();
+                let stop = stop.clone();
+                let peer_id = instance.peer_name().clone();
+                let params = req.thread_params.clone();
+                let stats = Arc::clone(&stats);
+                let thread = SubmissionThread {
+                    accounts,
+                    instance,
+                    client,
+                    all_addresses,
+                    stop,
+                    params,
+                    stats,
+                };
+                let join_handle = thread::Builder::new()
+                    .name(format!("txem-{}", peer_id))
+                    .spawn(move || {
+                        let mut rt = Runtime::new().unwrap();
+                        rt.block_on(thread.run())
+                    })
+                    .unwrap();
+                workers.push(Worker { join_handle });
+                thread::sleep(Duration::from_millis(10)); // Small stagger between starting threads
+            }
         }
-        Ok(EmitJob { workers, stop })
+        Ok(EmitJob {
+            workers,
+            stop,
+            stats,
+        })
     }
 
     pub async fn mint_accounts(&mut self, req: &EmitJobRequest, num_accounts: usize) -> Result<()> {
@@ -214,7 +257,7 @@ impl TxEmitter {
         Ok(())
     }
 
-    pub fn stop_job(&mut self, job: EmitJob) {
+    pub fn stop_job(&mut self, job: EmitJob) -> TxStats {
         job.stop.store(true, Ordering::Relaxed);
         for worker in job.workers {
             let mut accounts = worker
@@ -222,6 +265,11 @@ impl TxEmitter {
                 .join()
                 .expect("TxEmitter worker thread failed");
             self.accounts.append(&mut accounts);
+        }
+        #[allow(clippy::match_wild_err_arm)]
+        match Arc::try_unwrap(job.stats) {
+            Ok(stats) => stats,
+            Err(_) => panic!("Failed to unwrap job.stats - worker thread did not exit?"),
         }
     }
 
@@ -233,17 +281,13 @@ impl TxEmitter {
         &mut self,
         duration: Duration,
         instances: Vec<Instance>,
-    ) -> Result<()> {
+    ) -> Result<TxStats> {
         let job = self
-            .start_job(EmitJobRequest {
-                instances,
-                accounts_per_client: 10,
-                thread_params: EmitThreadParams::default(),
-            })
+            .start_job(EmitJobRequest::for_instances(instances))
             .await?;
         thread::sleep(duration);
-        self.stop_job(job);
-        Ok(())
+        let stats = self.stop_job(job);
+        Ok(stats)
     }
 }
 
@@ -258,6 +302,7 @@ struct SubmissionThread {
     all_addresses: Arc<Vec<AccountAddress>>,
     stop: Arc<AtomicBool>,
     params: EmitThreadParams,
+    stats: Arc<TxStats>,
 }
 
 impl SubmissionThread {
@@ -267,7 +312,9 @@ impl SubmissionThread {
         let mut rng = ThreadRng::default();
         while !self.stop.load(Ordering::Relaxed) {
             let requests = self.gen_requests(&mut rng);
+            let num_requests = requests.len();
             for request in requests {
+                self.stats.submitted.fetch_add(1, Ordering::Relaxed);
                 let wait_util = Instant::now() + wait;
                 let resp = self.client.submit_transaction(request).await;
                 match resp {
@@ -293,10 +340,20 @@ impl SubmissionThread {
                 if let Err(uncommitted) =
                     wait_for_accounts_sequence(&mut self.client, &mut self.accounts).await
                 {
+                    self.stats
+                        .committed
+                        .fetch_add((num_requests - uncommitted.len()) as u64, Ordering::Relaxed);
+                    self.stats
+                        .expired
+                        .fetch_add(uncommitted.len() as u64, Ordering::Relaxed);
                     info!(
                         "[{}] Transactions were not committed before expiration: {:?}",
                         self.instance, uncommitted
                     );
+                } else {
+                    self.stats
+                        .committed
+                        .fetch_add(num_requests as u64, Ordering::Relaxed);
                 }
             }
         }

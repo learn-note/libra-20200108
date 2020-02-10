@@ -10,8 +10,8 @@ procedure {:inline 1} TestSpecs_mut_b (b: Reference) returns ()
 requires ExistsTxnSenderAccount(__m, __txn);
 {
     // declare local variables
-    var t1: Value; // IntegerType()
-    var t2: Reference; // ReferenceType(IntegerType())
+    var __t1: Value; // IntegerType()
+    var __t2: Reference; // ReferenceType(IntegerType())
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -25,14 +25,16 @@ requires ExistsTxnSenderAccount(__m, __txn);
     // process and type check arguments
     assume IsValidU64(Dereference(__m, b));
     assume IsValidReferenceParameter(__m, __frame, b);
+    assume IsValidU64(Dereference(__m, b));
+    assume $DebugTrackLocal(0, 0, 0, 24, Dereference(__m, b));
 
     // bytecode translation starts here
     call __tmp := LdConst(10);
     __m := UpdateLocal(__m, __frame + 1, __tmp);
 
-    call t2 := CopyOrMoveRef(b);
+    call __t2 := CopyOrMoveRef(b);
 
-    call WriteRef(t2, GetLocal(__m, __frame + 1));
+    call WriteRef(__t2, GetLocal(__m, __frame + 1));
 
     return;
 
@@ -43,7 +45,7 @@ Label_Abort:
 
 procedure TestSpecs_mut_b_verify (b: Reference) returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestSpecs_mut_b(b);
 }
 
@@ -52,18 +54,18 @@ requires ExistsTxnSenderAccount(__m, __txn);
 ensures old(b#Boolean(Boolean(true))) ==> !__abort_flag;
 {
     // declare local variables
-    var t0: Value; // IntegerType()
-    var t1: Reference; // ReferenceType(IntegerType())
-    var t2: Value; // IntegerType()
-    var t3: Reference; // ReferenceType(IntegerType())
-    var t4: Reference; // ReferenceType(IntegerType())
-    var t5: Reference; // ReferenceType(IntegerType())
-    var t6: Value; // IntegerType()
-    var t7: Value; // IntegerType()
-    var t8: Value; // IntegerType()
-    var t9: Value; // BooleanType()
-    var t10: Value; // BooleanType()
-    var t11: Value; // IntegerType()
+    var b: Value; // IntegerType()
+    var b_ref: Reference; // ReferenceType(IntegerType())
+    var __t2: Value; // IntegerType()
+    var __t3: Reference; // ReferenceType(IntegerType())
+    var __t4: Reference; // ReferenceType(IntegerType())
+    var __t5: Reference; // ReferenceType(IntegerType())
+    var __t6: Value; // IntegerType()
+    var __t7: Value; // IntegerType()
+    var __t8: Value; // IntegerType()
+    var __t9: Value; // BooleanType()
+    var __t10: Value; // BooleanType()
+    var __t11: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -82,24 +84,32 @@ ensures old(b#Boolean(Boolean(true))) ==> !__abort_flag;
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 2));
     __m := UpdateLocal(__m, __frame + 0, __tmp);
+    assume $DebugTrackLocal(0, 1, 0, 252, __tmp);
 
-    call t3 := BorrowLoc(__frame + 0);
+    call __t3 := BorrowLoc(__frame + 0);
 
-    call t1 := CopyOrMoveRef(t3);
+    call b_ref := CopyOrMoveRef(__t3);
+    assume IsValidU64(Dereference(__m, b_ref));
+    assume $DebugTrackLocal(0, 1, 1, 268, Dereference(__m, b_ref));
 
-    call t4 := CopyOrMoveRef(t1);
+    call __t4 := CopyOrMoveRef(b_ref);
 
-    call TestSpecs_mut_b(t4);
-    if (__abort_flag) { goto Label_Abort; }
+    call TestSpecs_mut_b(__t4);
+    if (__abort_flag) {
+      assume $DebugTrackAbort(0, 1, 349);
+      goto Label_Abort;
+    }
+    assume $DebugTrackLocal(0, 1, 0, 349, GetLocal(__m, __frame + 0));
 
-    call t5 := CopyOrMoveRef(t1);
+    call __t5 := CopyOrMoveRef(b_ref);
 
-    call __tmp := ReadRef(t5);
+    call __tmp := ReadRef(__t5);
     assume IsValidU64(__tmp);
     __m := UpdateLocal(__m, __frame + 6, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 6));
     __m := UpdateLocal(__m, __frame + 0, __tmp);
+    assume $DebugTrackLocal(0, 1, 0, 382, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
     __m := UpdateLocal(__m, __frame + 7, __tmp);
@@ -131,7 +141,7 @@ Label_Abort:
 
 procedure TestSpecs_mut_ref_verify () returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestSpecs_mut_ref();
 }
 
@@ -140,18 +150,18 @@ requires ExistsTxnSenderAccount(__m, __txn);
 ensures old(b#Boolean(Boolean(true))) ==> !__abort_flag;
 {
     // declare local variables
-    var t0: Value; // IntegerType()
-    var t1: Reference; // ReferenceType(IntegerType())
-    var t2: Value; // IntegerType()
-    var t3: Reference; // ReferenceType(IntegerType())
-    var t4: Reference; // ReferenceType(IntegerType())
-    var t5: Reference; // ReferenceType(IntegerType())
-    var t6: Value; // IntegerType()
-    var t7: Value; // IntegerType()
-    var t8: Value; // IntegerType()
-    var t9: Value; // BooleanType()
-    var t10: Value; // BooleanType()
-    var t11: Value; // IntegerType()
+    var b: Value; // IntegerType()
+    var b_ref: Reference; // ReferenceType(IntegerType())
+    var __t2: Value; // IntegerType()
+    var __t3: Reference; // ReferenceType(IntegerType())
+    var __t4: Reference; // ReferenceType(IntegerType())
+    var __t5: Reference; // ReferenceType(IntegerType())
+    var __t6: Value; // IntegerType()
+    var __t7: Value; // IntegerType()
+    var __t8: Value; // IntegerType()
+    var __t9: Value; // BooleanType()
+    var __t10: Value; // BooleanType()
+    var __t11: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -170,24 +180,32 @@ ensures old(b#Boolean(Boolean(true))) ==> !__abort_flag;
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 2));
     __m := UpdateLocal(__m, __frame + 0, __tmp);
+    assume $DebugTrackLocal(0, 2, 0, 621, __tmp);
 
-    call t3 := BorrowLoc(__frame + 0);
+    call __t3 := BorrowLoc(__frame + 0);
 
-    call t1 := CopyOrMoveRef(t3);
+    call b_ref := CopyOrMoveRef(__t3);
+    assume IsValidU64(Dereference(__m, b_ref));
+    assume $DebugTrackLocal(0, 2, 1, 637, Dereference(__m, b_ref));
 
-    call t4 := CopyOrMoveRef(t1);
+    call __t4 := CopyOrMoveRef(b_ref);
 
-    call TestSpecs_mut_b(t4);
-    if (__abort_flag) { goto Label_Abort; }
+    call TestSpecs_mut_b(__t4);
+    if (__abort_flag) {
+      assume $DebugTrackAbort(0, 2, 661);
+      goto Label_Abort;
+    }
+    assume $DebugTrackLocal(0, 2, 0, 661, GetLocal(__m, __frame + 0));
 
-    call t5 := CopyOrMoveRef(t1);
+    call __t5 := CopyOrMoveRef(b_ref);
 
-    call __tmp := ReadRef(t5);
+    call __tmp := ReadRef(__t5);
     assume IsValidU64(__tmp);
     __m := UpdateLocal(__m, __frame + 6, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 6));
     __m := UpdateLocal(__m, __frame + 0, __tmp);
+    assume $DebugTrackLocal(0, 2, 0, 694, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
     __m := UpdateLocal(__m, __frame + 7, __tmp);
@@ -219,6 +237,6 @@ Label_Abort:
 
 procedure TestSpecs_mut_ref_failure_verify () returns ()
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
+    call InitVerification();
     call TestSpecs_mut_ref_failure();
 }

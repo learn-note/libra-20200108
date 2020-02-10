@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    chained_bft::{chained_bft_smr::ChainedBftSMR, persistent_storage::StorageWriteProxy},
+    chained_bft::{chained_bft_smr::ChainedBftSMR, persistent_liveness_storage::StorageWriteProxy},
     state_computer::ExecutionProxy,
     txn_manager::MempoolProxy,
 };
@@ -55,8 +55,5 @@ pub fn make_consensus_provider(
 
 /// Create a storage read client based on the config
 pub fn create_storage_read_client(config: &NodeConfig) -> Arc<dyn StorageRead> {
-    Arc::new(StorageReadServiceClient::new(
-        &config.storage.address,
-        config.storage.port,
-    ))
+    Arc::new(StorageReadServiceClient::new(&config.storage.address))
 }

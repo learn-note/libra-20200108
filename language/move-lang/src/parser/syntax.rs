@@ -17,49 +17,36 @@ use crate::shared::*;
 // Error Handling
 //**************************************************************************************************
 
-fn unexpected_token_error(
-    file: &'static str,
-    start_loc: usize,
-    actual: &str,
-    expected: Vec<String>,
-) -> Error {
-    let fmt_expected =
-        |expected: Vec<String>| -> String { format!("Expected: {}", expected.join(", ")) };
-    let loc = make_loc(file, start_loc, start_loc + actual.len());
+fn unexpected_token_error<'input>(tokens: &Lexer<'input>, expected: &str) -> Error {
+    let loc = current_token_loc(tokens);
+    let unexpected = if tokens.peek() == Tok::EOF {
+        "end-of-file".to_string()
+    } else {
+        format!("'{}'", tokens.content())
+    };
     vec![
-        (loc, format!("Unexpected token: '{}'", actual)),
-        (loc, fmt_expected(expected)),
+        (loc, format!("Unexpected {}", unexpected)),
+        (loc, format!("Expected {}", expected)),
     ]
-}
-
-fn user_error(file: &'static str, start_loc: usize, error: String) -> Error {
-    let loc = make_loc(file, start_loc, start_loc);
-    vec![(loc, error)]
 }
 
 //**************************************************************************************************
 // Miscellaneous Utilities
 //**************************************************************************************************
 
-macro_rules! token_match {
-    ($x:expr, $file:expr, $loc:expr, $actual:expr,
-     { $($c:ident::$p:ident => $e_p:expr),* }) => {{
-        $(use $c::$p;)*
-        match $x {
-            $($p => {{ $e_p }},)*
-            _ => {{
-                let mut v = vec![];
-                $(v.push(format!("'{}'", $p.to_string()));)*
-                return Err(unexpected_token_error($file, $loc, $actual, v));
-            }}
-        }
-    }}
-}
-
 fn make_loc(file: &'static str, start: usize, end: usize) -> Loc {
     Loc::new(
         file,
         Span::new(ByteIndex(start as u32), ByteIndex(end as u32)),
+    )
+}
+
+fn current_token_loc<'input>(tokens: &Lexer<'input>) -> Loc {
+    let start_loc = tokens.start_loc();
+    make_loc(
+        tokens.file_name(),
+        start_loc,
+        start_loc + tokens.content().len(),
     )
 }
 
@@ -84,12 +71,8 @@ fn match_token<'input>(tokens: &mut Lexer<'input>, tok: Tok) -> Result<bool, Err
 // Check for the specified token and return an error if it does not match.
 fn consume_token<'input>(tokens: &mut Lexer<'input>, tok: Tok) -> Result<(), Error> {
     if tokens.peek() != tok {
-        return Err(unexpected_token_error(
-            tokens.file_name(),
-            tokens.start_loc(),
-            tokens.content(),
-            vec![format!("'{}'", tok.to_string())],
-        ));
+        let expected = format!("'{}'", &tok.to_string());
+        return Err(unexpected_token_error(tokens, &expected));
     }
     tokens.advance()?;
     Ok(())
@@ -184,15 +167,10 @@ where
 // Parse a name:
 //      Name = <NameValue>
 fn parse_name<'input>(tokens: &mut Lexer<'input>) -> Result<Spanned<String>, Error> {
-    let start_loc = tokens.start_loc();
     if tokens.peek() != Tok::NameValue {
-        return Err(unexpected_token_error(
-            tokens.file_name(),
-            start_loc,
-            tokens.content(),
-            vec!["a name value".to_string()],
-        ));
+        return Err(unexpected_token_error(tokens, "a name value"));
     }
+    let start_loc = tokens.start_loc();
     let name = tokens.content().to_string();
     tokens.advance()?;
     let end_loc = tokens.previous_end_loc();
@@ -203,15 +181,10 @@ fn parse_name<'input>(tokens: &mut Lexer<'input>) -> Result<Spanned<String>, Err
 //      Address = <AddressValue>
 fn parse_address<'input>(tokens: &mut Lexer<'input>) -> Result<Address, Error> {
     if tokens.peek() != Tok::AddressValue {
-        return Err(unexpected_token_error(
-            tokens.file_name(),
-            tokens.start_loc(),
-            tokens.content(),
-            vec!["an account address value".to_string()],
-        ));
+        return Err(unexpected_token_error(tokens, "an account address value"));
     }
-    let addr = Address::parse_str(&tokens.content())
-        .map_err(|msg| user_error(tokens.file_name(), tokens.start_loc(), msg));
+    let addr =
+        Address::parse_str(&tokens.content()).map_err(|msg| vec![(current_token_loc(tokens), msg)]);
     tokens.advance()?;
     addr
 }
@@ -256,9 +229,12 @@ fn parse_module_ident<'input>(tokens: &mut Lexer<'input>) -> Result<ModuleIdent,
 //          <Name>
 //          | <ModuleName> "::" <Name>
 //          | <ModuleIdent> "::" <Name>
-fn parse_module_access<'input>(tokens: &mut Lexer<'input>) -> Result<ModuleAccess, Error> {
+fn parse_module_access<'input, F: FnOnce() -> String>(
+    tokens: &mut Lexer<'input>,
+    item_description: F,
+) -> Result<ModuleAccess, Error> {
     let start_loc = tokens.start_loc();
-    let acc = token_match!(tokens.peek(), tokens.file_name(), start_loc, tokens.content(), {
+    let acc = match tokens.peek() {
         Tok::NameValue => {
             // Check if this is a ModuleName followed by "::".
             let m = parse_name(tokens)?;
@@ -268,7 +244,7 @@ fn parse_module_access<'input>(tokens: &mut Lexer<'input>) -> Result<ModuleAcces
             } else {
                 ModuleAccess_::Name(m)
             }
-        },
+        }
 
         Tok::AddressValue => {
             let m = parse_module_ident(tokens)?;
@@ -276,7 +252,11 @@ fn parse_module_access<'input>(tokens: &mut Lexer<'input>) -> Result<ModuleAcces
             let n = parse_name(tokens)?;
             ModuleAccess_::QualifiedModuleAccess(m, n)
         }
-    });
+
+        _ => {
+            return Err(unexpected_token_error(tokens, &item_description()));
+        }
+    };
     let end_loc = tokens.previous_end_loc();
     Ok(spanned(tokens.file_name(), start_loc, end_loc, acc))
 }
@@ -327,7 +307,10 @@ fn parse_bind<'input>(tokens: &mut Lexer<'input>) -> Result<Bind, Error> {
             return Ok(spanned(tokens.file_name(), start_loc, end_loc, v));
         }
     }
-    let ty = parse_module_access(tokens)?;
+    // The item description specified here should include the special case above for
+    // variable names, because if the current tokens cannot be parsed as a struct name
+    // it is possible that the user intention was to use a variable name.
+    let ty = parse_module_access(tokens, || "a variable or struct name".to_string())?;
     let ty_args = if tokens.peek() == Tok::Less {
         Some(parse_comma_list(
             tokens,
@@ -387,25 +370,26 @@ fn parse_bind_list<'input>(tokens: &mut Lexer<'input>) -> Result<BindList, Error
 //          | <U64>
 fn parse_value<'input>(tokens: &mut Lexer<'input>) -> Result<Value, Error> {
     let start_loc = tokens.start_loc();
-    let val = token_match!(tokens.peek(), tokens.file_name(), start_loc, tokens.content(), {
+    let val = match tokens.peek() {
         Tok::AddressValue => {
             let addr = parse_address(tokens)?;
             Value_::Address(addr)
-        },
+        }
         Tok::True => {
             tokens.advance()?;
             Value_::Bool(true)
-        },
+        }
         Tok::False => {
             tokens.advance()?;
             Value_::Bool(false)
-        },
+        }
         Tok::U64Value => {
             let i = u64::from_str(tokens.content()).unwrap();
             tokens.advance()?;
             Value_::U64(i)
         }
-    });
+        _ => unreachable!("parse_value called with invalid token"),
+    };
     let end_loc = tokens.previous_end_loc();
     Ok(spanned(tokens.file_name(), start_loc, end_loc, val))
 }
@@ -492,26 +476,26 @@ fn parse_sequence<'input>(tokens: &mut Lexer<'input>) -> Result<Sequence, Error>
 //          | "::" <Name> ("<" Comma<BaseType> ">")? "(" Comma<Exp> ")"
 fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
     let start_loc = tokens.start_loc();
-    let term = token_match!(tokens.peek(), tokens.file_name(), start_loc, tokens.content(), {
+    let term = match tokens.peek() {
         Tok::Move => {
             tokens.advance()?;
             Exp_::Move(parse_var(tokens)?)
-        },
+        }
 
         Tok::Copy => {
             tokens.advance()?;
             Exp_::Copy(parse_var(tokens)?)
-        },
+        }
 
         Tok::Break => {
             tokens.advance()?;
             Exp_::Break
-        },
+        }
 
         Tok::Continue => {
             tokens.advance()?;
             Exp_::Continue
-        },
+        }
 
         Tok::NameValue => {
             // Check if this is a ModuleAccess for a pack or call expression.
@@ -527,17 +511,19 @@ fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
                             Ok(x) => x,
                             Err(mut e) => {
                                 let loc = make_loc(tokens.file_name(), next_start, next_start);
-                                e.push((loc, "Perhaps you need a blank space before this '<' operator?".to_string()));
-                                return Err(e)
-                            },
+                                let msg =
+                                    "Perhaps you need a blank space before this '<' operator?";
+                                e.push((loc, msg.to_owned()));
+                                return Err(e);
+                            }
                         }
                     } else {
                         Exp_::Name(parse_name(tokens)?)
                     }
-                },
+                }
                 _ => Exp_::Name(parse_name(tokens)?),
             }
-        },
+        }
 
         Tok::AddressValue => {
             // Check if this is a ModuleIdent (in a ModuleAccess).
@@ -546,11 +532,9 @@ fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
             } else {
                 Exp_::Value(parse_value(tokens)?)
             }
-        },
+        }
 
-        Tok::True => Exp_::Value(parse_value(tokens)?),
-        Tok::False => Exp_::Value(parse_value(tokens)?),
-        Tok::U64Value => Exp_::Value(parse_value(tokens)?),
+        Tok::True | Tok::False | Tok::U64Value => Exp_::Value(parse_value(tokens)?),
 
         // "(" Comma<Exp> ")"
         // "(" <Exp> ":" <Type> ")"
@@ -587,13 +571,13 @@ fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
                     }
                 }
             }
-        },
+        }
 
         // "{" <Sequence>
         Tok::LBrace => {
             tokens.advance()?; // consume the LBrace
             Exp_::Block(parse_sequence(tokens)?)
-        },
+        }
 
         // "::" <Name> ("<" Comma<BaseType> ">")? "(" Comma<Exp> ")"
         Tok::ColonColon => {
@@ -613,7 +597,11 @@ fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
             let rhs = parse_call_args(tokens)?;
             Exp_::GlobalCall(n, tys, rhs)
         }
-    });
+
+        _ => {
+            return Err(unexpected_token_error(tokens, "an expression term"));
+        }
+    };
     let end_loc = tokens.previous_end_loc();
     Ok(spanned(tokens.file_name(), start_loc, end_loc, term))
 }
@@ -621,7 +609,9 @@ fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
 // Parse the subset of expression terms for pack and call operations.
 // This is a helper function for parse_term.
 fn parse_pack_or_call<'input>(tokens: &mut Lexer<'input>) -> Result<Exp_, Error> {
-    let n = parse_module_access(tokens)?;
+    let n = parse_module_access(tokens, || {
+        panic!("parse_pack_or_call with something other than a NameValue or AddressValue token")
+    })?;
     let tys = if tokens.peek() == Tok::Less {
         Some(parse_comma_list(
             tokens,
@@ -633,8 +623,7 @@ fn parse_pack_or_call<'input>(tokens: &mut Lexer<'input>) -> Result<Exp_, Error>
     } else {
         None
     };
-    token_match!(tokens.peek(), tokens.file_name(), tokens.start_loc(), tokens.content(), {
-
+    match tokens.peek() {
         // <ModuleAccess> ("<" Comma<BaseType> ">")? "{" Comma<ExpField> "}"
         Tok::LBrace => {
             let fs = parse_comma_list(
@@ -645,14 +634,20 @@ fn parse_pack_or_call<'input>(tokens: &mut Lexer<'input>) -> Result<Exp_, Error>
                 "a field expression",
             )?;
             Ok(Exp_::Pack(n, tys, fs))
-        },
+        }
 
         // <ModuleAccess> ("<" Comma<BaseType> ">")? "(" Comma<Exp> ")"
         Tok::LParen => {
             let rhs = parse_call_args(tokens)?;
             Ok(Exp_::Call(n, tys, rhs))
         }
-    })
+
+        _ => {
+            let expected = "either a brace-enclosed list of field expressions or \
+                            a parenthesized list of arguments for a function call";
+            Err(unexpected_token_error(tokens, expected))
+        }
+    }
 }
 
 // Parse the arguments to a call: "(" Comma<Exp> ")"
@@ -906,7 +901,7 @@ fn parse_dot_chain<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
 //      BaseType = <ModuleAccess> ("<" Comma<BaseType> ">")?
 fn parse_base_type<'input>(tokens: &mut Lexer<'input>) -> Result<SingleType, Error> {
     let start_loc = tokens.start_loc();
-    let tn = parse_module_access(tokens)?;
+    let tn = parse_module_access(tokens, || "a type name".to_string())?;
     let tys = if tokens.peek() == Tok::Less {
         parse_comma_list(tokens, Tok::Less, Tok::Greater, parse_base_type, "a type")?
     } else {
@@ -979,10 +974,14 @@ fn parse_type_parameter<'input>(tokens: &mut Lexer<'input>) -> Result<(Name, Kin
 
     let kind = if match_token(tokens, Tok::Colon)? {
         let start_loc = tokens.start_loc();
-        let k = token_match!(tokens.peek(), tokens.file_name(), start_loc, tokens.content(), {
+        let k = match tokens.peek() {
             Tok::Copyable => Kind_::Affine,
-            Tok::Resource => Kind_::Resource
-        });
+            Tok::Resource => Kind_::Resource,
+            _ => {
+                let expected = "either 'copyable' or 'resource'";
+                return Err(unexpected_token_error(tokens, expected));
+            }
+        };
         tokens.advance()?;
         let end_loc = tokens.previous_end_loc();
         spanned(tokens.file_name(), start_loc, end_loc, k)
@@ -1004,13 +1003,13 @@ fn parse_type_parameter<'input>(tokens: &mut Lexer<'input>) -> Result<(Name, Kin
 //          "native" "public"?
 //          <FunctionDefName> "(" Comma<Parameter> ")"
 //          (":" <Type>)?
-//          ("acquires" <BaseType> ("," <BaseType>)*)?
+//          ("acquires" <ModuleAccess> ("," <ModuleAccess>)*)?
 //          ";"
 //      MoveFunctionDecl =
 //          "public"?
 //          <FunctionDefName> "(" Comma<Parameter> ")"
 //          (":" <Type>)?
-//          ("acquires" <BaseType> ("," <BaseType>)*)?
+//          ("acquires" <ModuleAccess> ("," <ModuleAccess>)*)?
 //          "{" <Sequence>
 //      FunctionDefName =
 //          <Name>
@@ -1027,11 +1026,11 @@ fn parse_function_decl<'input>(
         consume_optional_token_with_loc(tokens, Tok::Native)?
     } else {
         if tokens.peek() == Tok::Native {
-            return Err(user_error(
-                tokens.file_name(),
-                tokens.start_loc(),
+            let loc = current_token_loc(tokens);
+            return Err(vec![(
+                loc,
                 "Native functions can only be declared inside a module".to_string(),
-            ));
+            )]);
         }
         None
     };
@@ -1074,11 +1073,13 @@ fn parse_function_decl<'input>(
         sp(name.loc(), Type_::Unit)
     };
 
-    // ("acquires" (<BaseType> ",")* <BaseType> ","?
+    // ("acquires" (<ModuleAccess> ",")* <ModuleAccess> ","?
     let mut acquires = vec![];
     if match_token(tokens, Tok::Acquires)? {
         loop {
-            acquires.push(parse_module_access(tokens)?);
+            acquires.push(parse_module_access(tokens, || {
+                "a resource struct name".to_string()
+            })?);
             if tokens.peek() == Tok::Semicolon || tokens.peek() == Tok::LBrace {
                 break;
             }
@@ -1285,15 +1286,13 @@ fn parse_file<'input>(tokens: &mut Lexer<'input>) -> Result<FileDefinition, Erro
             } else {
                 let addr_name = parse_name(tokens)?;
                 if addr_name.value != "address" {
-                    let msg = format!(
-                        "Invalid address directive. Expected 'address' got '{}'",
-                        addr_name.value
-                    );
-                    return Err(user_error(
-                        tokens.file_name(),
-                        addr_name.loc.span().start().to_usize(),
-                        msg,
-                    ));
+                    return Err(vec![(
+                        addr_name.loc,
+                        format!(
+                            "Invalid address directive. Expected 'address' got '{}'",
+                            addr_name.value
+                        ),
+                    )]);
                 }
                 let start_loc = tokens.start_loc();
                 let addr = parse_address(tokens)?;
@@ -1312,12 +1311,11 @@ fn parse_file<'input>(tokens: &mut Lexer<'input>) -> Result<FileDefinition, Erro
         }
         let function = parse_function_decl(tokens, /* allow_native */ false)?;
         if tokens.peek() != Tok::EOF {
-            return Err(unexpected_token_error(
-                tokens.file_name(),
-                tokens.start_loc(),
-                tokens.content(),
-                vec![],
-            ));
+            let loc = current_token_loc(tokens);
+            return Err(vec![(
+                loc,
+                "Unexpected characters after end of main function".to_string(),
+            )]);
         }
         FileDefinition::Main(Main { uses, function })
     };

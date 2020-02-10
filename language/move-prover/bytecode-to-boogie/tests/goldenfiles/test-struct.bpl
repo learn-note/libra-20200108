@@ -97,12 +97,12 @@ procedure {:inline 1} Unpack_TestStruct_T(_struct: Value) returns (x: Value)
 
 // ** functions of module TestStruct
 
-procedure {:inline 1} TestStruct_identity (a: Value, c: Value) returns (ret0: Value, ret1: Value)
+procedure {:inline 1} TestStruct_identity (a: Value, c: Value) returns (__ret0: Value, __ret1: Value)
 requires ExistsTxnSenderAccount(__m, __txn);
 {
     // declare local variables
-    var t2: Value; // TestStruct_A_type_value()
-    var t3: Value; // TestStruct_C_type_value()
+    var __t2: Value; // TestStruct_A_type_value()
+    var __t3: Value; // TestStruct_C_type_value()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -116,8 +116,10 @@ requires ExistsTxnSenderAccount(__m, __txn);
     // process and type check arguments
     assume is#Vector(a);
     __m := UpdateLocal(__m, __frame + 0, a);
+    assume $DebugTrackLocal(0, 0, 0, 252, a);
     assume is#Vector(c);
     __m := UpdateLocal(__m, __frame + 1, c);
+    assume $DebugTrackLocal(0, 0, 1, 252, c);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -126,46 +128,48 @@ requires ExistsTxnSenderAccount(__m, __txn);
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 1));
     __m := UpdateLocal(__m, __frame + 3, __tmp);
 
-    ret0 := GetLocal(__m, __frame + 2);
-    ret1 := GetLocal(__m, __frame + 3);
+    __ret0 := GetLocal(__m, __frame + 2);
+    assume $DebugTrackLocal(0, 0, 2, 315, __ret0);
+    __ret1 := GetLocal(__m, __frame + 3);
+    assume $DebugTrackLocal(0, 0, 3, 315, __ret1);
     return;
 
 Label_Abort:
     __abort_flag := true;
     __m := __saved_m;
-    ret0 := DefaultValue;
-    ret1 := DefaultValue;
+    __ret0 := DefaultValue;
+    __ret1 := DefaultValue;
 }
 
-procedure TestStruct_identity_verify (a: Value, c: Value) returns (ret0: Value, ret1: Value)
+procedure TestStruct_identity_verify (a: Value, c: Value) returns (__ret0: Value, __ret1: Value)
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
-    call ret0, ret1 := TestStruct_identity(a, c);
+    call InitVerification();
+    call __ret0, __ret1 := TestStruct_identity(a, c);
 }
 
-procedure {:inline 1} TestStruct_module_builtins (a: Value) returns (ret0: Value)
+procedure {:inline 1} TestStruct_module_builtins (a: Value) returns (__ret0: Value)
 requires ExistsTxnSenderAccount(__m, __txn);
 {
     // declare local variables
-    var t1: Value; // TestStruct_T_type_value()
-    var t2: Reference; // ReferenceType(TestStruct_T_type_value())
-    var t3: Reference; // ReferenceType(TestStruct_T_type_value())
-    var t4: Value; // BooleanType()
-    var t5: Value; // AddressType()
-    var t6: Value; // BooleanType()
-    var t7: Value; // BooleanType()
-    var t8: Value; // BooleanType()
-    var t9: Value; // IntegerType()
-    var t10: Value; // AddressType()
-    var t11: Reference; // ReferenceType(TestStruct_T_type_value())
-    var t12: Reference; // ReferenceType(TestStruct_T_type_value())
-    var t13: Value; // AddressType()
-    var t14: Reference; // ReferenceType(TestStruct_T_type_value())
-    var t15: Reference; // ReferenceType(TestStruct_T_type_value())
-    var t16: Value; // AddressType()
-    var t17: Value; // TestStruct_T_type_value()
-    var t18: Value; // TestStruct_T_type_value()
-    var t19: Value; // BooleanType()
+    var t: Value; // TestStruct_T_type_value()
+    var t_ref1: Reference; // ReferenceType(TestStruct_T_type_value())
+    var t_ref2: Reference; // ReferenceType(TestStruct_T_type_value())
+    var b: Value; // BooleanType()
+    var __t5: Value; // AddressType()
+    var __t6: Value; // BooleanType()
+    var __t7: Value; // BooleanType()
+    var __t8: Value; // BooleanType()
+    var __t9: Value; // IntegerType()
+    var __t10: Value; // AddressType()
+    var __t11: Reference; // ReferenceType(TestStruct_T_type_value())
+    var __t12: Reference; // ReferenceType(TestStruct_T_type_value())
+    var __t13: Value; // AddressType()
+    var __t14: Reference; // ReferenceType(TestStruct_T_type_value())
+    var __t15: Reference; // ReferenceType(TestStruct_T_type_value())
+    var __t16: Value; // AddressType()
+    var __t17: Value; // TestStruct_T_type_value()
+    var __t18: Value; // TestStruct_T_type_value()
+    var __t19: Value; // BooleanType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -179,6 +183,7 @@ requires ExistsTxnSenderAccount(__m, __txn);
     // process and type check arguments
     assume is#Address(a);
     __m := UpdateLocal(__m, __frame + 0, a);
+    assume $DebugTrackLocal(0, 1, 0, 351, a);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -189,6 +194,7 @@ requires ExistsTxnSenderAccount(__m, __txn);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 6));
     __m := UpdateLocal(__m, __frame + 4, __tmp);
+    assume $DebugTrackLocal(0, 1, 4, 528, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 4));
     __m := UpdateLocal(__m, __frame + 7, __tmp);
@@ -208,24 +214,34 @@ Label_8:
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
     __m := UpdateLocal(__m, __frame + 10, __tmp);
 
-    call t11 := BorrowGlobal(GetLocal(__m, __frame + 10), TestStruct_T_type_value());
-    if (__abort_flag) { goto Label_Abort; }
+    call __t11 := BorrowGlobal(GetLocal(__m, __frame + 10), TestStruct_T_type_value());
+    if (__abort_flag) {
+      assume $DebugTrackAbort(0, 1, 598);
+      goto Label_Abort;
+    }
 
-    call t2 := CopyOrMoveRef(t11);
+    call t_ref1 := CopyOrMoveRef(__t11);
+    assume is#Vector(Dereference(__m, t_ref1));
+    assume $DebugTrackLocal(0, 1, 2, 589, Dereference(__m, t_ref1));
 
-    call t12 := CopyOrMoveRef(t2);
+    call __t12 := CopyOrMoveRef(t_ref1);
 
     // unimplemented instruction: NoOp
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
     __m := UpdateLocal(__m, __frame + 13, __tmp);
 
-    call t14 := BorrowGlobal(GetLocal(__m, __frame + 13), TestStruct_T_type_value());
-    if (__abort_flag) { goto Label_Abort; }
+    call __t14 := BorrowGlobal(GetLocal(__m, __frame + 13), TestStruct_T_type_value());
+    if (__abort_flag) {
+      assume $DebugTrackAbort(0, 1, 672);
+      goto Label_Abort;
+    }
 
-    call t3 := CopyOrMoveRef(t14);
+    call t_ref2 := CopyOrMoveRef(__t14);
+    assume is#Vector(Dereference(__m, t_ref2));
+    assume $DebugTrackLocal(0, 1, 3, 663, Dereference(__m, t_ref2));
 
-    call t15 := CopyOrMoveRef(t3);
+    call __t15 := CopyOrMoveRef(t_ref2);
 
     // unimplemented instruction: NoOp
 
@@ -234,66 +250,74 @@ Label_8:
 
     call __tmp := MoveFrom(GetLocal(__m, __frame + 16), TestStruct_T_type_value());
     __m := UpdateLocal(__m, __frame + 17, __tmp);
-    assume is#Vector(t17);
-    if (__abort_flag) { goto Label_Abort; }
+    assume is#Vector(__t17);
+    if (__abort_flag) {
+      assume $DebugTrackAbort(0, 1, 741);
+      goto Label_Abort;
+    }
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 17));
     __m := UpdateLocal(__m, __frame + 1, __tmp);
+    assume $DebugTrackLocal(0, 1, 1, 737, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 1));
     __m := UpdateLocal(__m, __frame + 18, __tmp);
 
     call MoveToSender(TestStruct_T_type_value(), GetLocal(__m, __frame + 18));
-    if (__abort_flag) { goto Label_Abort; }
+    if (__abort_flag) {
+      assume $DebugTrackAbort(0, 1, 772);
+      goto Label_Abort;
+    }
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 4));
     __m := UpdateLocal(__m, __frame + 19, __tmp);
 
-    ret0 := GetLocal(__m, __frame + 19);
+    __ret0 := GetLocal(__m, __frame + 19);
+    assume $DebugTrackLocal(0, 1, 5, 808, __ret0);
     return;
 
 Label_Abort:
     __abort_flag := true;
     __m := __saved_m;
-    ret0 := DefaultValue;
+    __ret0 := DefaultValue;
 }
 
-procedure TestStruct_module_builtins_verify (a: Value) returns (ret0: Value)
+procedure TestStruct_module_builtins_verify (a: Value) returns (__ret0: Value)
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
-    call ret0 := TestStruct_module_builtins(a);
+    call InitVerification();
+    call __ret0 := TestStruct_module_builtins(a);
 }
 
-procedure {:inline 1} TestStruct_nested_struct (a: Value) returns (ret0: Value)
+procedure {:inline 1} TestStruct_nested_struct (a: Value) returns (__ret0: Value)
 requires ExistsTxnSenderAccount(__m, __txn);
 ensures old(!(b#Boolean(Boolean(false)))) ==> !__abort_flag;
 ensures old(b#Boolean(Boolean(false))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t1: Value; // TestStruct_A_type_value()
-    var t2: Value; // TestStruct_B_type_value()
-    var t3: Reference; // ReferenceType(TestStruct_B_type_value())
-    var t4: Reference; // ReferenceType(IntegerType())
-    var t5: Value; // IntegerType()
-    var t6: Value; // BooleanType()
-    var t7: Value; // AddressType()
-    var t8: Value; // IntegerType()
-    var t9: Value; // TestStruct_B_type_value()
-    var t10: Value; // AddressType()
-    var t11: Value; // IntegerType()
-    var t12: Value; // TestStruct_B_type_value()
-    var t13: Reference; // ReferenceType(TestStruct_B_type_value())
-    var t14: Reference; // ReferenceType(TestStruct_B_type_value())
-    var t15: Reference; // ReferenceType(IntegerType())
-    var t16: Reference; // ReferenceType(IntegerType())
-    var t17: Value; // IntegerType()
-    var t18: Value; // IntegerType()
-    var t19: Value; // IntegerType()
-    var t20: Value; // BooleanType()
-    var t21: Value; // BooleanType()
-    var t22: Value; // IntegerType()
-    var t23: Value; // TestStruct_B_type_value()
+    var var_a: Value; // TestStruct_A_type_value()
+    var var_b: Value; // TestStruct_B_type_value()
+    var var_b_ref: Reference; // ReferenceType(TestStruct_B_type_value())
+    var b_val_ref: Reference; // ReferenceType(IntegerType())
+    var b_val: Value; // IntegerType()
+    var __t6: Value; // BooleanType()
+    var __t7: Value; // AddressType()
+    var __t8: Value; // IntegerType()
+    var __t9: Value; // TestStruct_B_type_value()
+    var __t10: Value; // AddressType()
+    var __t11: Value; // IntegerType()
+    var __t12: Value; // TestStruct_B_type_value()
+    var __t13: Reference; // ReferenceType(TestStruct_B_type_value())
+    var __t14: Reference; // ReferenceType(TestStruct_B_type_value())
+    var __t15: Reference; // ReferenceType(IntegerType())
+    var __t16: Reference; // ReferenceType(IntegerType())
+    var __t17: Value; // IntegerType()
+    var __t18: Value; // IntegerType()
+    var __t19: Value; // IntegerType()
+    var __t20: Value; // BooleanType()
+    var __t21: Value; // BooleanType()
+    var __t22: Value; // IntegerType()
+    var __t23: Value; // TestStruct_B_type_value()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -307,6 +331,7 @@ ensures old(b#Boolean(Boolean(false))) ==> __abort_flag;
     // process and type check arguments
     assume is#Address(a);
     __m := UpdateLocal(__m, __frame + 0, a);
+    assume $DebugTrackLocal(0, 2, 0, 835, a);
 
     // bytecode translation starts here
     call __tmp := LdFalse();
@@ -326,6 +351,7 @@ ensures old(b#Boolean(Boolean(false))) ==> __abort_flag;
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 9));
     __m := UpdateLocal(__m, __frame + 2, __tmp);
+    assume $DebugTrackLocal(0, 2, 2, 1076, __tmp);
 
     goto Label_11;
 
@@ -341,26 +367,32 @@ Label_7:
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 12));
     __m := UpdateLocal(__m, __frame + 2, __tmp);
+    assume $DebugTrackLocal(0, 2, 2, 1142, __tmp);
 
 Label_11:
-    call t13 := BorrowLoc(__frame + 2);
+    call __t13 := BorrowLoc(__frame + 2);
 
-    call t3 := CopyOrMoveRef(t13);
+    call var_b_ref := CopyOrMoveRef(__t13);
+    assume is#Vector(Dereference(__m, var_b_ref));
+    assume $DebugTrackLocal(0, 2, 3, 1198, Dereference(__m, var_b_ref));
 
-    call t14 := CopyOrMoveRef(t3);
+    call __t14 := CopyOrMoveRef(var_b_ref);
 
-    call t15 := BorrowField(t14, TestStruct_B_val);
+    call __t15 := BorrowField(__t14, TestStruct_B_val);
 
-    call t4 := CopyOrMoveRef(t15);
+    call b_val_ref := CopyOrMoveRef(__t15);
+    assume IsValidU64(Dereference(__m, b_val_ref));
+    assume $DebugTrackLocal(0, 2, 4, 1226, Dereference(__m, b_val_ref));
 
-    call t16 := CopyOrMoveRef(t4);
+    call __t16 := CopyOrMoveRef(b_val_ref);
 
-    call __tmp := ReadRef(t16);
+    call __tmp := ReadRef(__t16);
     assume IsValidU64(__tmp);
     __m := UpdateLocal(__m, __frame + 17, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 17));
     __m := UpdateLocal(__m, __frame + 5, __tmp);
+    assume $DebugTrackLocal(0, 2, 5, 1268, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 5));
     __m := UpdateLocal(__m, __frame + 18, __tmp);
@@ -386,43 +418,44 @@ Label_26:
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 2));
     __m := UpdateLocal(__m, __frame + 23, __tmp);
 
-    ret0 := GetLocal(__m, __frame + 23);
+    __ret0 := GetLocal(__m, __frame + 23);
+    assume $DebugTrackLocal(0, 2, 6, 1341, __ret0);
     return;
 
 Label_Abort:
     __abort_flag := true;
     __m := __saved_m;
-    ret0 := DefaultValue;
+    __ret0 := DefaultValue;
 }
 
-procedure TestStruct_nested_struct_verify (a: Value) returns (ret0: Value)
+procedure TestStruct_nested_struct_verify (a: Value) returns (__ret0: Value)
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
-    call ret0 := TestStruct_nested_struct(a);
+    call InitVerification();
+    call __ret0 := TestStruct_nested_struct(a);
 }
 
-procedure {:inline 1} TestStruct_try_unpack (a: Value) returns (ret0: Value)
+procedure {:inline 1} TestStruct_try_unpack (a: Value) returns (__ret0: Value)
 requires ExistsTxnSenderAccount(__m, __txn);
 ensures old(!(b#Boolean(Boolean(false)))) ==> !__abort_flag;
 ensures old(b#Boolean(Boolean(false))) ==> __abort_flag;
 
 {
     // declare local variables
-    var t1: Value; // IntegerType()
-    var t2: Value; // TestStruct_B_type_value()
-    var t3: Value; // AddressType()
-    var t4: Value; // AddressType()
-    var t5: Value; // IntegerType()
-    var t6: Value; // TestStruct_B_type_value()
-    var t7: Value; // TestStruct_B_type_value()
-    var t8: Value; // AddressType()
-    var t9: Value; // IntegerType()
-    var t10: Value; // AddressType()
-    var t11: Value; // AddressType()
-    var t12: Value; // BooleanType()
-    var t13: Value; // BooleanType()
-    var t14: Value; // IntegerType()
-    var t15: Value; // IntegerType()
+    var v: Value; // IntegerType()
+    var b: Value; // TestStruct_B_type_value()
+    var aa: Value; // AddressType()
+    var __t4: Value; // AddressType()
+    var __t5: Value; // IntegerType()
+    var __t6: Value; // TestStruct_B_type_value()
+    var __t7: Value; // TestStruct_B_type_value()
+    var __t8: Value; // AddressType()
+    var __t9: Value; // IntegerType()
+    var __t10: Value; // AddressType()
+    var __t11: Value; // AddressType()
+    var __t12: Value; // BooleanType()
+    var __t13: Value; // BooleanType()
+    var __t14: Value; // IntegerType()
+    var __t15: Value; // IntegerType()
     var __tmp: Value;
     var __frame: int;
     var __saved_m: Memory;
@@ -436,6 +469,7 @@ ensures old(b#Boolean(Boolean(false))) ==> __abort_flag;
     // process and type check arguments
     assume is#Address(a);
     __m := UpdateLocal(__m, __frame + 0, a);
+    assume $DebugTrackLocal(0, 3, 0, 1372, a);
 
     // bytecode translation starts here
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
@@ -449,19 +483,22 @@ ensures old(b#Boolean(Boolean(false))) ==> __abort_flag;
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 6));
     __m := UpdateLocal(__m, __frame + 2, __tmp);
+    assume $DebugTrackLocal(0, 3, 2, 1509, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 2));
     __m := UpdateLocal(__m, __frame + 7, __tmp);
 
-    call t8, t9 := Unpack_TestStruct_B(GetLocal(__m, __frame + 7));
-    __m := UpdateLocal(__m, __frame + 8, t8);
-    __m := UpdateLocal(__m, __frame + 9, t9);
+    call __t8, __t9 := Unpack_TestStruct_B(GetLocal(__m, __frame + 7));
+    __m := UpdateLocal(__m, __frame + 8, __t8);
+    __m := UpdateLocal(__m, __frame + 9, __t9);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 9));
     __m := UpdateLocal(__m, __frame + 1, __tmp);
+    assume $DebugTrackLocal(0, 3, 1, 1559, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 8));
     __m := UpdateLocal(__m, __frame + 3, __tmp);
+    assume $DebugTrackLocal(0, 3, 3, 1555, __tmp);
 
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 0));
     __m := UpdateLocal(__m, __frame + 10, __tmp);
@@ -487,17 +524,18 @@ Label_15:
     call __tmp := CopyOrMoveValue(GetLocal(__m, __frame + 1));
     __m := UpdateLocal(__m, __frame + 15, __tmp);
 
-    ret0 := GetLocal(__m, __frame + 15);
+    __ret0 := GetLocal(__m, __frame + 15);
+    assume $DebugTrackLocal(0, 3, 4, 1622, __ret0);
     return;
 
 Label_Abort:
     __abort_flag := true;
     __m := __saved_m;
-    ret0 := DefaultValue;
+    __ret0 := DefaultValue;
 }
 
-procedure TestStruct_try_unpack_verify (a: Value) returns (ret0: Value)
+procedure TestStruct_try_unpack_verify (a: Value) returns (__ret0: Value)
 {
-    assume ExistsTxnSenderAccount(__m, __txn);
-    call ret0 := TestStruct_try_unpack(a);
+    call InitVerification();
+    call __ret0 := TestStruct_try_unpack(a);
 }

@@ -12,18 +12,9 @@ use futures::{channel::mpsc::channel, executor::block_on};
 use libra_config::config::{NetworkConfig, NodeConfig, RoleType};
 use libra_logger::prelude::*;
 use libra_metrics::metric_server;
-use network::{
-    validator_network::{
-        network_builder::{NetworkBuilder, TransportType},
-        LibraNetworkProvider,
-        // when you add a new protocol const, you must add this in either
-        // .direct_send_protocols or .rpc_protocols vector of network_builder in setup_network()
-        CONSENSUS_DIRECT_SEND_PROTOCOL,
-        CONSENSUS_RPC_PROTOCOL,
-        MEMPOOL_DIRECT_SEND_PROTOCOL,
-        STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL,
-    },
-    ProtocolId,
+use network::validator_network::{
+    self,
+    network_builder::{NetworkBuilder, TransportType},
 };
 use state_synchronizer::StateSynchronizer;
 use std::collections::HashMap;
@@ -55,14 +46,8 @@ impl Drop for LibraHandle {
 }
 
 fn setup_executor(config: &NodeConfig) -> Arc<Executor<LibraVM>> {
-    let storage_read_client = Arc::new(StorageReadServiceClient::new(
-        &config.storage.address,
-        config.storage.port,
-    ));
-    let storage_write_client = Arc::new(StorageWriteServiceClient::new(
-        &config.storage.address,
-        config.storage.port,
-    ));
+    let storage_read_client = Arc::new(StorageReadServiceClient::new(&config.storage.address));
+    let storage_write_client = Arc::new(StorageWriteServiceClient::new(&config.storage.address));
 
     Arc::new(Executor::new(
         storage_read_client,
@@ -90,10 +75,7 @@ fn setup_debug_interface(config: &NodeConfig) -> Runtime {
 }
 
 // TODO(abhayb): Move to network crate (similar to consensus).
-pub fn setup_network(
-    config: &mut NetworkConfig,
-    role: RoleType,
-) -> (Runtime, Box<dyn LibraNetworkProvider>) {
+pub fn setup_network(config: &mut NetworkConfig, role: RoleType) -> (Runtime, NetworkBuilder) {
     let runtime = Builder::new()
         .thread_name("network-")
         .threaded_scheduler()
@@ -109,15 +91,10 @@ pub fn setup_network(
     network_builder
         .enable_remote_authentication(config.enable_remote_authentication)
         .advertised_address(config.advertised_address.clone())
-        .direct_send_protocols(vec![
-            ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL),
-            ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL),
-            ProtocolId::from_static(STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL),
-        ])
-        .rpc_protocols(vec![ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL)]);
+        .add_connection_monitoring();
     if config.enable_remote_authentication {
-        // If the node wants to run in enable_remote_authentication mode, it should also use noise for
-        // authentication and encryption.
+        // If the node wants to run in permissioned mode, it should also have authentication and
+        // encryption.
         assert!(
             config.enable_noise,
             "Permissioned network end-points should use authentication"
@@ -153,7 +130,8 @@ pub fn setup_network(
             .seed_peers(seed_peers)
             .trusted_peers(trusted_peers)
             .signing_keys((signing_private, signing_public))
-            .discovery_interval_ms(config.discovery_interval_ms);
+            .discovery_interval_ms(config.discovery_interval_ms)
+            .add_discovery();
     } else if config.enable_noise {
         let identity_keys = &mut config
             .network_keypairs
@@ -174,8 +152,7 @@ pub fn setup_network(
     } else {
         network_builder.transport(TransportType::Tcp);
     }
-    let (_listen_addr, network_provider) = network_builder.build();
-    (runtime, network_provider)
+    (runtime, network_builder)
 }
 
 pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
@@ -204,27 +181,26 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     let mut validator_network_provider = None;
 
     if let Some(network) = node_config.validator_network.as_mut() {
-        let (runtime, mut network_provider) = setup_network(network, RoleType::Validator);
-        state_sync_network_handles.push(network_provider.add_state_synchronizer(vec![
-            ProtocolId::from_static(STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL),
-        ]));
+        let (runtime, mut network_builder) = setup_network(network, RoleType::Validator);
+        state_sync_network_handles.push(validator_network::state_synchronizer::add_to_network(
+            &mut network_builder,
+        ));
 
-        let (mempool_sender, mempool_events) = network_provider
-            .add_mempool(vec![ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL)]);
+        let (mempool_sender, mempool_events) =
+            validator_network::mempool::add_to_network(&mut network_builder);
         mempool_network_handles.push((network.peer_id, mempool_sender, mempool_events));
-
-        validator_network_provider = Some((network.peer_id, runtime, network_provider));
+        validator_network_provider = Some((network.peer_id, runtime, network_builder));
     }
 
     for i in 0..node_config.full_node_networks.len() {
-        let (runtime, mut network_provider) =
+        let (runtime, mut network_builder) =
             setup_network(&mut node_config.full_node_networks[i], RoleType::FullNode);
-        state_sync_network_handles.push(network_provider.add_state_synchronizer(vec![
-            ProtocolId::from_static(STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL),
-        ]));
+        state_sync_network_handles.push(validator_network::state_synchronizer::add_to_network(
+            &mut network_builder,
+        ));
 
-        let (mempool_sender, mempool_events) = network_provider
-            .add_mempool(vec![ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL)]);
+        let (mempool_sender, mempool_events) =
+            validator_network::mempool::add_to_network(&mut network_builder);
         mempool_network_handles.push((
             node_config.full_node_networks[i].peer_id,
             mempool_sender,
@@ -233,7 +209,7 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
 
         let network = &node_config.full_node_networks[i];
         // Start the network provider.
-        runtime.handle().spawn(network_provider.start());
+        let _listen_addr = network_builder.build();
         network_runtimes.push(runtime);
         debug!("Network started for peer_id: {}", network.peer_id);
     }
@@ -260,7 +236,7 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     let mut consensus = None;
     let (_, rcv) = channel(1_024); // TODO replace this placeholder with connection with state sync for full nodes
     let mut consensus_events = rcv;
-    if let Some((peer_id, runtime, mut network_provider)) = validator_network_provider {
+    if let Some((peer_id, runtime, mut network_builder)) = validator_network_provider {
         let (mempool_channel, consensus_mp_receiver) = channel(1_024);
         consensus_events = consensus_mp_receiver;
 
@@ -274,11 +250,8 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         // was observed in GitHub Issue #749. A long term fix might be make
         // consensus initialization async instead of blocking on state synchronizer.
         let (consensus_network_sender, consensus_network_events) =
-            network_provider.add_consensus(vec![
-                ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL),
-                ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL),
-            ]);
-        runtime.handle().spawn(network_provider.start());
+            validator_network::consensus::add_to_network(&mut network_builder);
+        let _listen_addr = network_builder.build();
         network_runtimes.push(runtime);
         debug!("Network started for peer_id: {}", peer_id);
 

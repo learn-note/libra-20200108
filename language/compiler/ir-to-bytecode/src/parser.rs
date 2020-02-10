@@ -6,13 +6,11 @@ use codespan::{ByteIndex, CodeMap, Span};
 use codespan_reporting::{emit, termcolor::Buffer, Diagnostic, Label, Severity};
 use ir_to_bytecode_syntax::syntax::{self, ParseError};
 use libra_types::account_address::AccountAddress;
+use move_ir_types::ast;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
 };
-
-// Re-export this to make it convenient for other crates.
-pub use ir_to_bytecode_syntax::ast;
 
 /// Determine if a character is an allowed eye-visible (printable) character.
 ///
@@ -109,9 +107,9 @@ pub fn parse_module(modules_str: &str) -> Result<ast::ModuleDefinition> {
     syntax::parse_module_string(stripped_string).or_else(|e| handle_error(e, stripped_string))
 }
 
-/// Given the raw input of a file, creates a single `Cmd` struct
+/// Given the raw input of a file, creates a single `Cmd_` struct
 /// Fails with `Err(_)` if the text cannot be parsed
-pub fn parse_cmd(cmd_str: &str, _sender_address: AccountAddress) -> Result<ast::Cmd> {
+pub fn parse_cmd_(cmd_str: &str, _sender_address: AccountAddress) -> Result<ast::Cmd_> {
     let stripped_string = &strip_comments_and_verify(cmd_str)?;
     syntax::parse_cmd_string(stripped_string).or_else(|e| handle_error(e, stripped_string))
 }
