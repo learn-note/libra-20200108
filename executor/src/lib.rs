@@ -4,26 +4,27 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod benchmark;
 #[cfg(test)]
 mod executor_test;
 #[cfg(test)]
 mod mock_vm;
+pub mod utils;
 
 use anyhow::{bail, ensure, format_err, Result};
 use futures::executor::block_on;
-use libra_config::config::NodeConfig;
-use libra_config::config::VMConfig;
+use libra_config::config::{NodeConfig, VMConfig};
 use libra_crypto::{
     hash::{
         CryptoHash, EventAccumulatorHasher, TransactionAccumulatorHasher,
-        ACCUMULATOR_PLACEHOLDER_HASH, GENESIS_BLOCK_ID, PRE_GENESIS_BLOCK_ID,
-        SPARSE_MERKLE_PLACEHOLDER_HASH,
+        ACCUMULATOR_PLACEHOLDER_HASH, PRE_GENESIS_BLOCK_ID, SPARSE_MERKLE_PLACEHOLDER_HASH,
     },
     HashValue,
 };
 use libra_logger::prelude::*;
 use libra_types::{
     account_address::AccountAddress,
+    account_state::AccountState,
     account_state_blob::AccountStateBlob,
     block_info::{BlockInfo, Round},
     contract_event::ContractEvent,
@@ -311,7 +312,12 @@ where
         storage_write_client: Arc<dyn StorageWrite>,
         config: &NodeConfig,
     ) -> Self {
-        let rt = Runtime::new().unwrap();
+        let rt = tokio::runtime::Builder::new()
+            .threaded_scheduler()
+            .enable_all()
+            .thread_name("tokio-executor")
+            .build()
+            .unwrap();
 
         let mut executor = Executor {
             rt,
@@ -323,7 +329,7 @@ where
 
         let startup_info = block_on(executor.rt.spawn(async move {
             storage_read_client
-                .get_startup_info_async()
+                .get_startup_info()
                 .await
                 .expect("Shouldn't fail")
         }))
@@ -351,13 +357,7 @@ where
         // We create `PRE_GENESIS_BLOCK_ID` as the parent of the genesis block.
         let pre_genesis_trees = ExecutedTrees::new_empty();
         let output = self
-            .execute_block(
-                genesis_txns.clone(),
-                &pre_genesis_trees,
-                &pre_genesis_trees,
-                *PRE_GENESIS_BLOCK_ID,
-                *GENESIS_BLOCK_ID,
-            )
+            .execute_block(genesis_txns.clone(), &pre_genesis_trees, &pre_genesis_trees)
             .expect("Failed to execute genesis block.");
 
         let root_hash = output.accu_root();
@@ -390,14 +390,7 @@ where
         transactions: Vec<Transaction>,
         parent_trees: &ExecutedTrees,
         committed_trees: &ExecutedTrees,
-        parent_id: HashValue,
-        id: HashValue,
     ) -> Result<ProcessedVMOutput> {
-        debug!(
-            "Received request to execute block. Parent id: {:x}. Id: {:x}.",
-            parent_id, id
-        );
-
         let _timer = OP_COUNTERS.timer("block_execute_time_s");
         // Construct a StateView and pass the transactions to VM.
         let state_view = VerifiedStateView::new(
@@ -422,9 +415,9 @@ where
             debug!("Execution status: {:?}", status);
         }
 
-        let (account_to_btree, account_to_proof) = state_view.into();
+        let (account_to_state, account_to_proof) = state_view.into();
         let output = Self::process_vm_outputs(
-            account_to_btree,
+            account_to_state,
             account_to_proof,
             &transactions,
             vm_outputs,
@@ -443,13 +436,16 @@ where
     /// ```
     /// and only `C` and `E` have signatures, we will send `A`, `B` and `C` in the first batch,
     /// then `D` and `E` later in the another batch.
-    /// Commits a block and all its ancestors in a batch manner. Returns `Ok(())` if successful.
+    /// Commits a block and all its ancestors in a batch manner.
+    ///
+    /// Returns `Ok(Result<Vec<Transaction>>)` if successful, where Vec<Transaction>
+    /// is a vector of transactions that were kept in the submitted blocks
     pub fn commit_blocks(
         &self,
         blocks: Vec<(Vec<Transaction>, Arc<ProcessedVMOutput>)>,
         ledger_info_with_sigs: LedgerInfoWithSignatures,
         synced_trees: &ExecutedTrees,
-    ) -> Result<()> {
+    ) -> Result<Vec<Transaction>> {
         debug!(
             "Received request to commit block {:x}.",
             ledger_info_with_sigs.ledger_info().consensus_block_id()
@@ -460,6 +456,7 @@ where
         // transactions in A, B and C whose status == TransactionStatus::Keep.
         // This must be done before calculate potential skipping of transactions in idempotent commit.
         let mut txns_to_keep = vec![];
+        let mut blocks_txns = vec![];
         for (txn, txn_data) in blocks
             .iter()
             .map(|block| itertools::zip_eq(&block.0, block.1.transaction_data()))
@@ -476,6 +473,7 @@ where
                     ),
                     txn_data.num_account_created(),
                 ));
+                blocks_txns.push(txn.clone());
             }
         }
 
@@ -536,7 +534,7 @@ where
             let write_client = self.storage_write_client.clone();
             block_on(self.rt.spawn(async move {
                 write_client
-                    .save_transactions_async(
+                    .save_transactions(
                         txns_to_commit,
                         first_version_to_commit,
                         Some(ledger_info_with_sigs),
@@ -554,7 +552,7 @@ where
             }
         }
         // Now that the blocks are persisted successfully, we can reply to consensus
-        Ok(())
+        Ok(blocks_txns)
     }
 
     /// Verifies the transactions based on the provided proofs and ledger info. If the transactions
@@ -611,10 +609,10 @@ where
             }
         }
 
-        let (account_to_btree, account_to_proof) = state_view.into();
+        let (account_to_state, account_to_proof) = state_view.into();
 
         let output = Self::process_vm_outputs(
-            account_to_btree,
+            account_to_state,
             account_to_proof,
             &transactions,
             vm_outputs,
@@ -643,7 +641,7 @@ where
         let ledger_info = ledger_info_to_commit.clone();
         block_on(self.rt.spawn(async move {
             write_client
-                .save_transactions_async(txns_to_commit, first_version, ledger_info)
+                .save_transactions(txns_to_commit, first_version, ledger_info)
                 .await
         }))
         .unwrap()?;
@@ -745,7 +743,7 @@ where
 
     /// Post-processing of what the VM outputs. Returns the entire block's output.
     fn process_vm_outputs(
-        mut account_to_btree: HashMap<AccountAddress, BTreeMap<Vec<u8>, Vec<u8>>>,
+        mut account_to_state: HashMap<AccountAddress, AccountState>,
         account_to_proof: HashMap<HashValue, SparseMerkleProof>,
         transactions: &[Transaction],
         vm_outputs: Vec<TransactionOutput>,
@@ -766,7 +764,7 @@ where
         for (vm_output, txn) in itertools::zip_eq(vm_outputs.into_iter(), transactions.iter()) {
             let (blobs, state_tree, num_accounts_created) = Self::process_write_set(
                 txn,
-                &mut account_to_btree,
+                &mut account_to_state,
                 &proof_reader,
                 vm_output.write_set().clone(),
                 &current_state_tree,
@@ -799,15 +797,15 @@ where
                     txn_info_hashes.push(real_txn_info_hash);
                     txn_info_hash = Some(real_txn_info_hash);
                 }
-                TransactionStatus::Discard(_) => {
-                    ensure!(
-                        vm_output.write_set().is_empty(),
-                        "Discarded transaction has non-empty write set.",
-                    );
-                    ensure!(
-                        vm_output.events().is_empty(),
-                        "Discarded transaction has non-empty events.",
-                    );
+                TransactionStatus::Discard(status) => {
+                    if !vm_output.write_set().is_empty() || !vm_output.events().is_empty() {
+                        crit!(
+                            "Discarded transaction has non-empty write set or events. \
+                             Transaction: {:?}. Status: {}.",
+                            txn,
+                            status,
+                        );
+                    }
                 }
             }
 
@@ -851,7 +849,7 @@ where
     /// constructed state tree.
     fn process_write_set(
         transaction: &Transaction,
-        account_to_btree: &mut HashMap<AccountAddress, BTreeMap<Vec<u8>, Vec<u8>>>,
+        account_to_state: &mut HashMap<AccountAddress, AccountState>,
         proof_reader: &ProofReader,
         write_set: WriteSet,
         previous_state_tree: &SparseMerkleTree,
@@ -868,15 +866,15 @@ where
         for (access_path, write_op) in write_set.into_iter() {
             let address = access_path.address;
             let path = access_path.path;
-            match account_to_btree.entry(address) {
+            match account_to_state.entry(address) {
                 hash_map::Entry::Occupied(mut entry) => {
-                    let account_btree = entry.get_mut();
+                    let account_state = entry.get_mut();
                     // TODO(gzh): we check account creation here for now. Will remove it once we
                     // have a better way.
-                    if account_btree.is_empty() {
+                    if account_state.is_empty() {
                         num_accounts_created += 1;
                     }
-                    Self::update_account_btree(account_btree, path, write_op);
+                    Self::update_account_state(account_state, path, write_op);
                 }
                 hash_map::Entry::Vacant(entry) => {
                     // Before writing to an account, VM should always read that account. So we
@@ -891,17 +889,17 @@ where
                         TransactionPayload::WriteSet(_) => (),
                     }
 
-                    let mut account_btree = BTreeMap::new();
-                    Self::update_account_btree(&mut account_btree, path, write_op);
-                    entry.insert(account_btree);
+                    let mut account_state = Default::default();
+                    Self::update_account_state(&mut account_state, path, write_op);
+                    entry.insert(account_state);
                 }
             }
             addrs.insert(address);
         }
 
         for addr in addrs {
-            let account_btree = account_to_btree.get(&addr).expect("Address should exist.");
-            let account_blob = AccountStateBlob::try_from(account_btree)?;
+            let account_state = account_to_state.get(&addr).expect("Address should exist.");
+            let account_blob = AccountStateBlob::try_from(account_state)?;
             updated_blobs.insert(addr, account_blob);
         }
         let state_tree = Arc::new(
@@ -919,14 +917,10 @@ where
         Ok((updated_blobs, state_tree, num_accounts_created))
     }
 
-    fn update_account_btree(
-        account_btree: &mut BTreeMap<Vec<u8>, Vec<u8>>,
-        path: Vec<u8>,
-        write_op: WriteOp,
-    ) {
+    fn update_account_state(account_state: &mut AccountState, path: Vec<u8>, write_op: WriteOp) {
         match write_op {
-            WriteOp::Value(new_value) => account_btree.insert(path, new_value),
-            WriteOp::Deletion => account_btree.remove(&path),
+            WriteOp::Value(new_value) => account_state.insert(path, new_value),
+            WriteOp::Deletion => account_state.remove(&path),
         };
     }
 }

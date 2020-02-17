@@ -3,7 +3,7 @@
 
 use crate::keys::KeyPair;
 use libra_crypto::{ed25519::Ed25519PrivateKey, Uniform};
-use libra_tools::tempdir::TempPath;
+use libra_temppath::TempPath;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -66,5 +66,38 @@ impl TestConfig {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn verify_test_config_equality_using_keys() {
+        // Create default test config without keys
+        let mut test_config = TestConfig::new_with_temp_dir();
+        assert_eq!(test_config.account_keypair, None);
+        assert_eq!(test_config.consensus_keypair, None);
+
+        // Clone the config and verify equality
+        let mut clone_test_config = test_config.clone();
+        assert_eq!(clone_test_config, test_config);
+
+        // Generate keys for original test config
+        let mut rng = StdRng::from_seed([0u8; 32]);
+        test_config.random_account_key(&mut rng);
+        test_config.random_consensus_key(&mut rng);
+
+        // Verify that configs differ
+        assert_ne!(clone_test_config, test_config);
+
+        // Copy keys across configs
+        clone_test_config.account_keypair = test_config.account_keypair.clone();
+        clone_test_config.consensus_keypair = test_config.consensus_keypair.clone();
+
+        // Verify both configs are identical
+        assert_eq!(clone_test_config, test_config);
     }
 }

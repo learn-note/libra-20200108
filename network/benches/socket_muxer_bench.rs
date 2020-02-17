@@ -39,8 +39,7 @@
 
 use bytes::{Bytes, BytesMut};
 use criterion::{
-    criterion_group, criterion_main, AxisScale, Bencher, Criterion, ParameterizedBenchmark,
-    PlotConfiguration, Throughput,
+    criterion_group, criterion_main, Bencher, Criterion, ParameterizedBenchmark, Throughput,
 };
 use futures::{
     executor::block_on,
@@ -50,7 +49,7 @@ use futures::{
 };
 use netcore::{
     compat::IoCompat,
-    multiplexing::StreamMultiplexer,
+    multiplexing::{Control, StreamMultiplexer},
     transport::{memory::MemoryTransport, tcp::TcpTransport, Transport},
 };
 use parity_multiaddr::Multiaddr;
@@ -131,7 +130,7 @@ fn bench_client_muxer_send<T, M>(
     runtime: &mut Runtime,
     server_addr: Multiaddr,
     client_transport: T,
-) -> (M, impl Stream)
+) -> (<M as StreamMultiplexer>::Listener, impl Stream)
 where
     T: Transport<Output = M> + Send + Sync + 'static,
     M: StreamMultiplexer + 'static,
@@ -140,10 +139,11 @@ where
     // which means the futures must be run on a tokio Runtime.
     let f_client = async move {
         let client_muxer = client_transport.dial(server_addr).unwrap().await.unwrap();
-        let client_substream = client_muxer.open_outbound().await.unwrap();
-        (client_muxer, client_substream)
+        let (stream_listener, mut control) = client_muxer.start().await;
+        let client_substream = control.open_stream().await.unwrap();
+        (stream_listener, client_substream)
     };
-    let (client_muxer, client_substream) = runtime.block_on(f_client);
+    let (stream_listener, client_substream) = runtime.block_on(f_client);
     let mut client_stream =
         Framed::new(IoCompat::new(client_substream), LengthDelimitedCodec::new());
 
@@ -151,7 +151,7 @@ where
     bench_client_send(b, msg_len, &mut client_stream);
 
     // Return the muxer and stream so we can drop them after the bench completes
-    (client_muxer, client_stream)
+    (stream_listener, client_stream)
 }
 
 /// Benchmark the throughput of sending messages of size `msg_len` over an
@@ -186,7 +186,7 @@ fn bench_memsocket_muxer_send(b: &mut Bencher, msg_len: &usize, server_addr: Mul
     let client_transport = build_memsocket_muxer_transport();
 
     // Benchmark sending some data to the server.
-    let (_client_muxer, _client_stream) =
+    let (_stream_listener, _client_stream) =
         bench_client_muxer_send(b, *msg_len, &mut runtime, server_addr, client_transport);
 }
 
@@ -196,7 +196,7 @@ fn bench_memsocket_dual_muxed_send(b: &mut Bencher, msg_len: &usize, server_addr
     let mut runtime = Runtime::new().unwrap();
     let client_transport = build_memsocket_dual_muxed_transport();
     // Benchmark sending some data to the server.
-    let (_client_muxer, _client_stream) =
+    let (_stream_listener, _client_stream) =
         bench_client_muxer_send(b, *msg_len, &mut runtime, server_addr, client_transport);
 }
 
@@ -208,7 +208,7 @@ fn bench_memsocket_noise_muxer_send(b: &mut Bencher, msg_len: &usize, server_add
     let client_transport = build_memsocket_noise_muxer_transport();
 
     // Benchmark sending some data to the server.
-    let (_client_muxer, _client_stream) =
+    let (_stream_listener, _client_stream) =
         bench_client_muxer_send(b, *msg_len, &mut runtime, server_addr, client_transport);
 }
 
@@ -259,7 +259,7 @@ fn bench_tcp_muxer_send(b: &mut Bencher, msg_len: &usize, server_addr: Multiaddr
     let client_transport = build_tcp_muxer_transport();
 
     // Benchmark sending some data to the server.
-    let (_client_muxer, _client_stream) =
+    let (_stream_listener, _client_stream) =
         bench_client_muxer_send(b, *msg_len, &mut runtime, server_addr, client_transport);
 }
 
@@ -271,7 +271,7 @@ fn bench_tcp_noise_muxer_send(b: &mut Bencher, msg_len: &usize, server_addr: Mul
     let client_transport = build_tcp_noise_muxer_transport();
 
     // Benchmark sending some data to the server.
-    let (_client_muxer, _client_stream) =
+    let (_stream_listener, _client_stream) =
         bench_client_muxer_send(b, *msg_len, &mut runtime, server_addr, client_transport);
 }
 
@@ -449,7 +449,6 @@ fn socket_muxer_bench(c: &mut Criterion) {
         .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(2))
         .sample_size(10)
-        .plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic))
         .throughput(|msg_len| {
             let msg_len = *msg_len as u32;
             let num_msgs = SENDS_PER_ITER as u32;

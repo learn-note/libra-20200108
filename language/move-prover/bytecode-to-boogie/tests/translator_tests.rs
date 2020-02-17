@@ -35,8 +35,21 @@ fn test_struct() {
 }
 
 #[test]
-fn test_aborts_if() {
-    test(VERIFY, &["test_mvir/test-aborts-if.mvir"]);
+fn test_access_path() {
+    test(
+        &["--native-stubs"],
+        &[
+            &std_mvir("u64_util"),
+            &std_mvir("address_util"),
+            &std_mvir("bytearray_util"),
+            &std_mvir("hash"),
+            &std_mvir("libra_coin"),
+            &std_mvir("libra_time"),
+            &std_mvir("libra_transaction_timeout"),
+            &std_mvir("libra_account"),
+            "test_mvir/test-access-path.mvir",
+        ],
+    );
 }
 
 #[test]
@@ -55,6 +68,8 @@ fn test_lib() {
             &std_mvir("gas_schedule"),
             &std_mvir("validator_config"),
             &std_mvir("libra_coin"),
+            &std_mvir("libra_time"),
+            &std_mvir("libra_transaction_timeout"),
             &std_mvir("libra_account"),
             // TODO(wrwg): this currently fails with boogie compilation errors
             //   call to undeclared procedure: Vector_contains (etc)

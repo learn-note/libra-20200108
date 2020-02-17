@@ -1,17 +1,18 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-mod state;
+pub mod state;
 
 use super::{absint::*, ast::*};
 use crate::shared::unique_map::UniqueMap;
 use crate::{
     errors::*,
     hlir::translate::{display_var, DisplayVar},
-    parser::ast::{Kind_, Var},
+    parser::ast::{Kind_, StructName, Var},
     shared::*,
 };
 use state::*;
+use std::collections::{BTreeMap, BTreeSet};
 
 //**************************************************************************************************
 // Entry and trait bindings
@@ -86,13 +87,15 @@ impl<'a> AbstractInterpreter for LocalsSafety<'a> {}
 pub fn verify(
     errors: &mut Errors,
     signature: &FunctionSignature,
+    _acquires: &BTreeSet<StructName>,
     locals: &UniqueMap<Var, SingleType>,
     cfg: &super::cfg::BlockCFG,
-) {
+) -> BTreeMap<Label, LocalStates> {
     let initial_state = LocalStates::initial(&signature.parameters, locals);
     let mut locals_safety = LocalsSafety::new(locals);
-    let result = locals_safety.analyze_function(cfg, initial_state);
-    errors.append(&mut result.err().unwrap_or_else(Errors::new));
+    let (final_state, mut es) = locals_safety.analyze_function(cfg, initial_state);
+    errors.append(&mut es);
+    final_state
 }
 
 //**************************************************************************************************
@@ -138,10 +141,11 @@ fn command(context: &mut Context, sp!(loc, cmd_): &Command) {
                                     l, verb
                                 ),
                             };
-                            errors.push(vec![
-                                (*loc, "Invalid return".into()),
-                                (available, format!("{}. The resource must be consumed before the function returns", stmt))
-                            ])
+                            let msg = format!(
+                                "{}. The resource must be consumed before the function returns",
+                                stmt
+                            );
+                            errors.push(vec![(*loc, "Invalid return".into()), (available, msg)])
                         }
                     }
                 }
@@ -179,9 +183,14 @@ fn lvalue(context: &mut Context, sp!(loc, l_): &LValue) {
                             DisplayVar::Tmp => panic!("ICE invalid assign tmp local"),
                             DisplayVar::Orig(s) => s,
                         };
+                        let msg = format!(
+                            "The local {} a resource value due to this assignment. The \
+                             resource must be used before you assign to this local again",
+                            verb
+                        );
                         context.error(vec![
                             (*loc, format!("Invalid assignment to local '{}'", vstr)),
-                            (available, format!("The local {} a resource value due to this assignment. The resource must be used before you assign to this local again", verb))
+                            (available, msg),
                         ])
                     }
                 }
@@ -220,6 +229,8 @@ fn exp(context: &mut Context, parent_e: &Exp) {
         E::Pack(_, _, fields) => fields.iter().for_each(|(_, _, e)| exp(context, e)),
 
         E::ExpList(es) => es.iter().for_each(|item| exp_list_item(context, item)),
+
+        E::Unreachable => panic!("ICE should not analyze dead code"),
     }
 }
 
@@ -242,13 +253,18 @@ fn use_local(context: &mut Context, loc: &Loc, local: &Var) {
             };
             let unavailable = *unavailable;
             let vstr = match display_var(local.value()) {
-                DisplayVar::Tmp => panic!("ICE invalid use tmp local"),
+                DisplayVar::Tmp => panic!("ICE invalid use tmp local {}", local.value()),
                 DisplayVar::Orig(s) => s,
             };
+            let msg = format!(
+                "The local {} not have a value due to this position. The local must be assigned \
+                 a value before being used",
+                verb
+            );
             context.error(vec![
-                    (*loc, format!("Invalid usage of local '{}'", vstr)),
-                    (unavailable, format!("The local {} not have a value due to this position. The local must be assigned a value before being used", verb))
-                ])
+                (*loc, format!("Invalid usage of local '{}'", vstr)),
+                (unavailable, msg),
+            ])
         }
     }
 }

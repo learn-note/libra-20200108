@@ -2,79 +2,122 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    core_mempool::{unit_tests::common::TestTransaction, CoreMempool, TimelineState},
-    shared_mempool::{start_shared_mempool, SharedMempoolNotification, SyncEvent},
+    core_mempool::{
+        unit_tests::common::{batch_add_signed_txn, TestTransaction},
+        CoreMempool, TimelineState,
+    },
+    mocks::MockSharedMempool,
+    shared_mempool::{
+        start_shared_mempool, ConsensusRequest, SharedMempoolNotification, SyncEvent,
+    },
+    CommitNotification, CommittedTransaction,
 };
-use channel;
+use channel::{self, libra_channel, message_queues::QueueStyle};
 use futures::{
-    channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+    channel::{
+        mpsc::{self, unbounded, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     executor::block_on,
-    SinkExt, StreamExt,
+    sink::SinkExt,
+    StreamExt,
 };
-use libra_config::config::NodeConfig;
+use libra_config::config::{NetworkConfig, NodeConfig};
 use libra_types::{transaction::SignedTransaction, PeerId};
 use network::{
-    interface::{NetworkNotification, NetworkRequest},
+    peer_manager::{
+        conn_status_channel, ConnectionStatusNotification, PeerManagerNotification,
+        PeerManagerRequest,
+    },
     proto::MempoolSyncMsg,
     validator_network::{MempoolNetworkEvents, MempoolNetworkSender},
+    DisconnectReason, ProtocolId,
 };
+use parity_multiaddr::Multiaddr;
 use prost::Message;
 use std::{
     collections::{HashMap, HashSet},
     convert::TryFrom,
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use storage_service::mocks::mock_storage_client::MockStorageReadClient;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Runtime};
 use vm_validator::mocks::mock_vm_validator::MockVMValidator;
 
 #[derive(Default)]
 struct SharedMempoolNetwork {
     mempools: HashMap<PeerId, Arc<Mutex<CoreMempool>>>,
-    network_reqs_rxs: HashMap<PeerId, channel::Receiver<NetworkRequest>>,
-    network_notifs_txs: HashMap<PeerId, channel::Sender<NetworkNotification>>,
+    network_reqs_rxs:
+        HashMap<PeerId, libra_channel::Receiver<(PeerId, ProtocolId), PeerManagerRequest>>,
+    network_notifs_txs:
+        HashMap<PeerId, libra_channel::Sender<(PeerId, ProtocolId), PeerManagerNotification>>,
+    network_conn_event_notifs_txs: HashMap<PeerId, conn_status_channel::Sender>,
     runtimes: HashMap<PeerId, Runtime>,
     subscribers: HashMap<PeerId, UnboundedReceiver<SharedMempoolNotification>>,
     timers: HashMap<PeerId, UnboundedSender<SyncEvent>>,
 }
 
 impl SharedMempoolNetwork {
-    fn bootstrap_with_config(peers: Vec<PeerId>, mut config: NodeConfig) -> Self {
+    fn bootstrap_validator_network(validator_nodes_count: u32) -> (Self, Vec<PeerId>) {
         let mut smp = Self::default();
-        config.mempool.shared_mempool_batch_size = 1;
+        let mut peers = vec![];
 
-        for peer in peers {
+        for _ in 0..validator_nodes_count {
+            let peer_id = PeerId::random();
+            let mut validator_network_config = NetworkConfig::default();
+            validator_network_config.peer_id = peer_id;
+            let mut config = NodeConfig::random();
+            config.validator_network = Some(validator_network_config);
+            config.mempool.shared_mempool_batch_size = 1;
+
             let mempool = Arc::new(Mutex::new(CoreMempool::new(&config)));
-            let (network_reqs_tx, network_reqs_rx) = channel::new_test(8);
-            let (network_notifs_tx, network_notifs_rx) = channel::new_test(8);
+            let (network_reqs_tx, network_reqs_rx) =
+                libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+            let (network_notifs_tx, network_notifs_rx) =
+                libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+            let (conn_status_tx, conn_status_rx) = conn_status_channel::new();
             let network_sender = MempoolNetworkSender::new(network_reqs_tx);
-            let network_events = MempoolNetworkEvents::new(network_notifs_rx);
+            let network_events = MempoolNetworkEvents::new(network_notifs_rx, conn_status_rx);
             let (sender, subscriber) = unbounded();
             let (timer_sender, timer_receiver) = unbounded();
+            let (_ac_endpoint_sender, ac_endpoint_receiver) = mpsc::channel(1_024);
+            let network_handles = vec![(peer_id, network_sender, network_events)];
+            let (_consensus_sender, consensus_events) = mpsc::channel(1_024);
+            let (_state_sync_sender, state_sync_events) = mpsc::channel(1_024);
 
-            let runtime = start_shared_mempool(
+            let runtime = Builder::new()
+                .thread_name("shared-mem-")
+                .threaded_scheduler()
+                .enable_all()
+                .build()
+                .expect("[shared mempool] failed to create runtime");
+            start_shared_mempool(
+                runtime.handle(),
                 &config,
                 Arc::clone(&mempool),
-                network_sender,
-                network_events,
+                network_handles,
+                ac_endpoint_receiver,
+                consensus_events,
+                state_sync_events,
                 Arc::new(MockStorageReadClient),
                 Arc::new(MockVMValidator),
                 vec![sender],
                 Some(timer_receiver.map(|_| SyncEvent).boxed()),
             );
 
-            smp.mempools.insert(peer, mempool);
-            smp.network_reqs_rxs.insert(peer, network_reqs_rx);
-            smp.network_notifs_txs.insert(peer, network_notifs_tx);
-            smp.subscribers.insert(peer, subscriber);
-            smp.timers.insert(peer, timer_sender);
-            smp.runtimes.insert(peer, runtime);
+            peers.push(peer_id);
+            smp.mempools.insert(peer_id, mempool);
+            smp.network_reqs_rxs.insert(peer_id, network_reqs_rx);
+            smp.network_notifs_txs.insert(peer_id, network_notifs_tx);
+            smp.network_conn_event_notifs_txs
+                .insert(peer_id, conn_status_tx);
+            smp.subscribers.insert(peer_id, subscriber);
+            smp.timers.insert(peer_id, timer_sender);
+            smp.runtimes.insert(peer_id, runtime);
         }
-        smp
-    }
-
-    fn bootstrap(peers: Vec<PeerId>) -> Self {
-        Self::bootstrap_with_config(peers, NodeConfig::random())
+        (smp, peers)
     }
 
     fn add_txns(&mut self, peer_id: &PeerId, txns: Vec<TestTransaction>) {
@@ -85,9 +128,9 @@ impl SharedMempoolNetwork {
         }
     }
 
-    fn send_event(&mut self, peer: &PeerId, notif: NetworkNotification) {
-        let network_notifs_tx = self.network_notifs_txs.get_mut(peer).unwrap();
-        block_on(network_notifs_tx.send(notif)).unwrap();
+    fn send_connection_event(&mut self, peer: &PeerId, notif: ConnectionStatusNotification) {
+        let conn_notifs_tx = self.network_conn_event_notifs_txs.get_mut(peer).unwrap();
+        conn_notifs_tx.push(*peer, notif).unwrap();
         self.wait_for_event(peer, SharedMempoolNotification::PeerStateChange);
     }
 
@@ -112,16 +155,23 @@ impl SharedMempoolNetwork {
         let network_req = block_on(network_reqs_rx.next()).unwrap();
 
         match network_req {
-            NetworkRequest::SendMessage(peer_id, msg) => {
+            PeerManagerRequest::SendMessage(peer_id, msg) => {
                 let mut sync_msg = MempoolSyncMsg::decode(msg.mdata.as_ref()).unwrap();
                 let transaction =
                     SignedTransaction::try_from(sync_msg.transactions.pop().unwrap()).unwrap();
                 // send it to peer
                 let receiver_network_notif_tx = self.network_notifs_txs.get_mut(&peer_id).unwrap();
-                block_on(
-                    receiver_network_notif_tx.send(NetworkNotification::RecvMessage(*peer, msg)),
-                )
-                .unwrap();
+                receiver_network_notif_tx
+                    .push(
+                        (
+                            *peer,
+                            ProtocolId::from_static(
+                                network::validator_network::MEMPOOL_DIRECT_SEND_PROTOCOL,
+                            ),
+                        ),
+                        PeerManagerNotification::RecvMessage(*peer, msg),
+                    )
+                    .unwrap();
 
                 // await message delivery
                 self.wait_for_event(&peer_id, SharedMempoolNotification::NewTransactions);
@@ -150,9 +200,8 @@ impl SharedMempoolNetwork {
 
 #[test]
 fn test_basic_flow() {
-    let (peer_a, peer_b) = (PeerId::random(), PeerId::random());
-
-    let mut smp = SharedMempoolNetwork::bootstrap(vec![peer_a, peer_b]);
+    let (mut smp, peers) = SharedMempoolNetwork::bootstrap_validator_network(2);
+    let (peer_a, peer_b) = (peers.get(0).unwrap(), peers.get(1).unwrap());
     smp.add_txns(
         &peer_a,
         vec![
@@ -163,7 +212,10 @@ fn test_basic_flow() {
     );
 
     // A discovers new peer B
-    smp.send_event(&peer_a, NetworkNotification::NewPeer(peer_b));
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::NewPeer(*peer_b, Multiaddr::empty()),
+    );
 
     for seq in 0..3 {
         // A attempts to send message
@@ -174,9 +226,9 @@ fn test_basic_flow() {
 
 #[test]
 fn test_metric_cache_ignore_shared_txns() {
-    let (peer_a, peer_b) = (PeerId::random(), PeerId::random());
+    let (mut smp, peers) = SharedMempoolNetwork::bootstrap_validator_network(2);
+    let (peer_a, peer_b) = (peers.get(0).unwrap(), peers.get(1).unwrap());
 
-    let mut smp = SharedMempoolNetwork::bootstrap(vec![peer_a, peer_b]);
     let txns = vec![
         TestTransaction::new(1, 0, 1),
         TestTransaction::new(1, 1, 1),
@@ -192,7 +244,10 @@ fn test_metric_cache_ignore_shared_txns() {
     assert_eq!(smp.exist_in_metrics_cache(&peer_a, &txns[2]), true);
 
     // Let peer_a discover new peer_b.
-    smp.send_event(&peer_a, NetworkNotification::NewPeer(peer_b));
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::NewPeer(*peer_b, Multiaddr::empty()),
+    );
     for txn in txns.iter().take(3) {
         // Let peer_a share txns with peer_b
         let (_transaction, rx_peer) = smp.deliver_message(&peer_a);
@@ -203,13 +258,23 @@ fn test_metric_cache_ignore_shared_txns() {
 
 #[test]
 fn test_interruption_in_sync() {
-    let (peer_a, peer_b, peer_c) = (PeerId::random(), PeerId::random(), PeerId::random());
-    let mut smp = SharedMempoolNetwork::bootstrap(vec![peer_a, peer_b, peer_c]);
+    let (mut smp, peers) = SharedMempoolNetwork::bootstrap_validator_network(3);
+    let (peer_a, peer_b, peer_c) = (
+        peers.get(0).unwrap(),
+        peers.get(1).unwrap(),
+        peers.get(2).unwrap(),
+    );
     smp.add_txns(&peer_a, vec![TestTransaction::new(1, 0, 1)]);
 
     // A discovers 2 peers
-    smp.send_event(&peer_a, NetworkNotification::NewPeer(peer_b));
-    smp.send_event(&peer_a, NetworkNotification::NewPeer(peer_c));
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::NewPeer(*peer_b, Multiaddr::empty()),
+    );
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::NewPeer(*peer_c, Multiaddr::empty()),
+    );
 
     // make sure it delivered first transaction to both nodes
     let mut peers = vec![
@@ -217,43 +282,56 @@ fn test_interruption_in_sync() {
         smp.deliver_message(&peer_a).1,
     ];
     peers.sort();
-    let mut expected_peers = vec![peer_b, peer_c];
+    let mut expected_peers = vec![*peer_b, *peer_c];
     expected_peers.sort();
     assert_eq!(peers, expected_peers);
 
     // A loses connection to B
-    smp.send_event(&peer_a, NetworkNotification::LostPeer(peer_b));
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::LostPeer(
+            *peer_b,
+            Multiaddr::empty(),
+            DisconnectReason::ConnectionLost,
+        ),
+    );
 
     // only C receives following transactions
     smp.add_txns(&peer_a, vec![TestTransaction::new(1, 1, 1)]);
     let (txn, peer_id) = smp.deliver_message(&peer_a);
-    assert_eq!(peer_id, peer_c);
+    assert_eq!(peer_id, *peer_c);
     assert_eq!(txn.sequence_number(), 1);
 
     smp.add_txns(&peer_a, vec![TestTransaction::new(1, 2, 1)]);
     let (txn, peer_id) = smp.deliver_message(&peer_a);
-    assert_eq!(peer_id, peer_c);
+    assert_eq!(peer_id, *peer_c);
     assert_eq!(txn.sequence_number(), 2);
 
     // A reconnects to B
-    smp.send_event(&peer_a, NetworkNotification::NewPeer(peer_b));
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::NewPeer(*peer_b, Multiaddr::empty()),
+    );
 
     // B should receive transaction 2
     let (txn, peer_id) = smp.deliver_message(&peer_a);
-    assert_eq!(peer_id, peer_b);
+    assert_eq!(peer_id, *peer_b);
     assert_eq!(txn.sequence_number(), 1);
 }
 
 #[test]
 fn test_ready_transactions() {
-    let (peer_a, peer_b) = (PeerId::random(), PeerId::random());
-    let mut smp = SharedMempoolNetwork::bootstrap(vec![peer_a, peer_b]);
+    let (mut smp, peers) = SharedMempoolNetwork::bootstrap_validator_network(2);
+    let (peer_a, peer_b) = (peers.get(0).unwrap(), peers.get(1).unwrap());
     smp.add_txns(
         &peer_a,
         vec![TestTransaction::new(1, 0, 1), TestTransaction::new(1, 2, 1)],
     );
     // first message delivery
-    smp.send_event(&peer_a, NetworkNotification::NewPeer(peer_b));
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::NewPeer(*peer_b, Multiaddr::empty()),
+    );
     smp.deliver_message(&peer_a);
 
     // add txn1 to Mempool
@@ -267,13 +345,19 @@ fn test_ready_transactions() {
 
 #[test]
 fn test_broadcast_self_transactions() {
-    let (peer_a, peer_b) = (PeerId::random(), PeerId::random());
-    let mut smp = SharedMempoolNetwork::bootstrap(vec![peer_a, peer_b]);
+    let (mut smp, peers) = SharedMempoolNetwork::bootstrap_validator_network(2);
+    let (peer_a, peer_b) = (peers.get(0).unwrap(), peers.get(1).unwrap());
     smp.add_txns(&peer_a, vec![TestTransaction::new(0, 0, 1)]);
 
     // A and B discover each other
-    smp.send_event(&peer_a, NetworkNotification::NewPeer(peer_b));
-    smp.send_event(&peer_b, NetworkNotification::NewPeer(peer_a));
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::NewPeer(*peer_b, Multiaddr::empty()),
+    );
+    smp.send_connection_event(
+        &peer_b,
+        ConnectionStatusNotification::NewPeer(*peer_a, Multiaddr::empty()),
+    );
 
     // A sends txn to B
     smp.deliver_message(&peer_a);
@@ -288,8 +372,8 @@ fn test_broadcast_self_transactions() {
 
 #[test]
 fn test_broadcast_dependencies() {
-    let (peer_a, peer_b) = (PeerId::random(), PeerId::random());
-    let mut smp = SharedMempoolNetwork::bootstrap(vec![peer_a, peer_b]);
+    let (mut smp, peers) = SharedMempoolNetwork::bootstrap_validator_network(2);
+    let (peer_a, peer_b) = (peers.get(0).unwrap(), peers.get(1).unwrap());
     // Peer A has transactions with sequence numbers 0 and 2
     smp.add_txns(
         &peer_a,
@@ -299,8 +383,14 @@ fn test_broadcast_dependencies() {
     smp.add_txns(&peer_b, vec![TestTransaction::new(0, 1, 1)]);
 
     // A and B discover each other
-    smp.send_event(&peer_a, NetworkNotification::NewPeer(peer_b));
-    smp.send_event(&peer_b, NetworkNotification::NewPeer(peer_a));
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::NewPeer(*peer_b, Multiaddr::empty()),
+    );
+    smp.send_connection_event(
+        &peer_b,
+        ConnectionStatusNotification::NewPeer(*peer_a, Multiaddr::empty()),
+    );
 
     // B receives 0
     smp.deliver_message(&peer_a);
@@ -314,15 +404,21 @@ fn test_broadcast_dependencies() {
 
 #[test]
 fn test_broadcast_updated_transaction() {
-    let (peer_a, peer_b) = (PeerId::random(), PeerId::random());
-    let mut smp = SharedMempoolNetwork::bootstrap(vec![peer_a, peer_b]);
+    let (mut smp, peers) = SharedMempoolNetwork::bootstrap_validator_network(2);
+    let (peer_a, peer_b) = (peers.get(0).unwrap(), peers.get(1).unwrap());
 
     // Peer A has a transaction with sequence number 0 and gas price 1
     smp.add_txns(&peer_a, vec![TestTransaction::new(0, 0, 1)]);
 
     // A and B discover each other
-    smp.send_event(&peer_a, NetworkNotification::NewPeer(peer_b));
-    smp.send_event(&peer_b, NetworkNotification::NewPeer(peer_a));
+    smp.send_connection_event(
+        &peer_a,
+        ConnectionStatusNotification::NewPeer(*peer_b, Multiaddr::empty()),
+    );
+    smp.send_connection_event(
+        &peer_b,
+        ConnectionStatusNotification::NewPeer(*peer_a, Multiaddr::empty()),
+    );
 
     // B receives 0
     let txn = smp.deliver_message(&peer_a).0;
@@ -336,4 +432,107 @@ fn test_broadcast_updated_transaction() {
     let txn = smp.deliver_message(&peer_a).0;
     assert_eq!(txn.sequence_number(), 0);
     assert_eq!(txn.gas_unit_price(), 5);
+}
+
+#[test]
+fn test_consensus_events_rejected_txns() {
+    let smp = MockSharedMempool::new(None);
+
+    // add txns 1, 2, 3, 4
+    // txn 1: committed successfully
+    // txn 2: not committed but older than gc block timestamp
+    // txn 3: not committed and newer than block timestamp
+    let committed_txn = TestTransaction::new(0, 0, 1)
+        .make_signed_transaction_with_expiration_time(Duration::from_secs(0));
+    let kept_txn = TestTransaction::new(1, 0, 1).make_signed_transaction(); // not committed or cleaned out by block timestamp gc
+    let txns = vec![
+        committed_txn.clone(),
+        TestTransaction::new(0, 1, 1)
+            .make_signed_transaction_with_expiration_time(Duration::from_secs(0)),
+        kept_txn.clone(),
+    ];
+    // add txns to mempool
+    {
+        let mut pool = smp
+            .mempool
+            .lock()
+            .expect("[mempool test] failed to acquire lock");
+        assert!(batch_add_signed_txn(&mut pool, txns).is_ok());
+    }
+
+    // send commit notif
+    let committed_txns = vec![CommittedTransaction {
+        sender: committed_txn.sender(),
+        sequence_number: committed_txn.sequence_number(),
+    }];
+    let (callback, callback_rcv) = oneshot::channel();
+    let req = ConsensusRequest::RejectNotification(committed_txns, callback);
+    let mut consensus_sender = smp.consensus_sender.clone();
+    block_on(async {
+        assert!(consensus_sender.send(req).await.is_ok());
+        assert!(callback_rcv.await.is_ok());
+    });
+
+    // check mempool
+    let mut pool = smp
+        .mempool
+        .lock()
+        .expect("[mempool test] failed to acquire mempool lock");
+    let (timeline, _) = pool.read_timeline(0, 10);
+    assert_eq!(timeline.len(), 1);
+    assert!(timeline.contains(&kept_txn));
+}
+
+#[test]
+fn test_state_sync_events_committed_txns() {
+    let (mut state_sync_sender, state_sync_events) = mpsc::channel(1_024);
+    let smp = MockSharedMempool::new(Some(state_sync_events));
+
+    // add txns 1, 2, 3, 4
+    // txn 1: committed successfully
+    // txn 2: not committed but older than gc block timestamp
+    // txn 3: not committed and newer than block timestamp
+    let committed_txn = TestTransaction::new(0, 0, 1)
+        .make_signed_transaction_with_expiration_time(Duration::from_secs(0));
+    let kept_txn = TestTransaction::new(1, 0, 1).make_signed_transaction(); // not committed or cleaned out by block timestamp gc
+    let txns = vec![
+        committed_txn.clone(),
+        TestTransaction::new(0, 1, 1)
+            .make_signed_transaction_with_expiration_time(Duration::from_secs(0)),
+        kept_txn.clone(),
+    ];
+    // add txns to mempool
+    {
+        let mut pool = smp
+            .mempool
+            .lock()
+            .expect("[mempool test] failed to acquire lock");
+        assert!(batch_add_signed_txn(&mut pool, txns).is_ok());
+    }
+
+    // send commit notif
+    let committed_txns = vec![CommittedTransaction {
+        sender: committed_txn.sender(),
+        sequence_number: committed_txn.sequence_number(),
+    }];
+
+    let (callback, callback_rcv) = oneshot::channel();
+    let req = CommitNotification {
+        transactions: committed_txns,
+        block_timestamp_usecs: 1,
+        callback,
+    };
+    block_on(async {
+        assert!(state_sync_sender.send(req).await.is_ok());
+        assert!(callback_rcv.await.is_ok());
+    });
+
+    // check mempool
+    let mut pool = smp
+        .mempool
+        .lock()
+        .expect("[mempool test] failed to acquire mempool lock");
+    let (timeline, _) = pool.read_timeline(0, 10);
+    assert_eq!(timeline.len(), 1);
+    assert!(timeline.contains(&kept_txn));
 }

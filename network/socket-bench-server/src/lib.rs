@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use futures::{
-    future::Future,
+    future::{self, Future},
     io::{AsyncRead, AsyncWrite},
     sink::SinkExt,
     stream::{Stream, StreamExt},
@@ -12,7 +12,7 @@ use futures::{
 use memsocket::MemorySocket;
 use netcore::{
     compat::IoCompat,
-    multiplexing::{yamux::Yamux, StreamMultiplexer},
+    multiplexing::{yamux::Yamux, Control, StreamMultiplexer},
     transport::{
         memory::MemoryTransport,
         tcp::{TcpSocket, TcpTransport},
@@ -101,14 +101,16 @@ pub fn build_memsocket_dual_muxed_transport() -> impl Transport<Output = impl St
         .and_then(move |socket, origin| {
             async move {
                 let substream;
+                let (mut listener, mut control) = socket.start().await;
                 if origin == ConnectionOrigin::Outbound {
                     // Open outbound substream.
-                    substream = socket.open_outbound().await.unwrap();
+                    substream = control.open_stream().await.unwrap();
                 } else {
                     // Wait for inbound client substream.
-                    let mut inbounds = socket.listen_for_inbound();
-                    substream = inbounds.next().await.unwrap().unwrap();
+                    substream = listener.next().await.unwrap().unwrap();
                 }
+                // Spawn listener to avoid closing the underlying connection.
+                tokio::spawn(listener.for_each(|_| future::ready(())));
                 Yamux::upgrade_connection(substream, origin).await
             }
         })
@@ -191,10 +193,9 @@ where
     // Wait for next inbound connection
     while let Some(Ok((f_muxer, _client_addr))) = server_listener.next().await {
         let muxer = f_muxer.await.unwrap();
-
+        let (mut listener, _control) = muxer.start().await;
         // Wait for inbound client substream
-        let mut muxer_inbounds = muxer.listen_for_inbound();
-        let substream = muxer_inbounds.next().await.unwrap().unwrap();
+        let substream = listener.next().await.unwrap().unwrap();
         let mut stream = Framed::new(IoCompat::new(substream), LengthDelimitedCodec::new());
 
         // Drain all messages from the client.
@@ -215,7 +216,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     E: ::std::error::Error + Send + Sync + 'static,
 {
-    let (listener, server_addr) = transport.listen_on(listen_addr).unwrap();
+    let (listener, server_addr) = executor.enter(move || transport.listen_on(listen_addr).unwrap());
     executor.spawn(server_stream_handler(listener));
     server_addr
 }
@@ -232,7 +233,7 @@ where
     M: StreamMultiplexer + 'static,
     E: ::std::error::Error + Send + Sync + 'static,
 {
-    let (listener, server_addr) = transport.listen_on(listen_addr).unwrap();
+    let (listener, server_addr) = executor.enter(move || transport.listen_on(listen_addr).unwrap());
     executor.spawn(server_muxer_handler(listener));
     server_addr
 }

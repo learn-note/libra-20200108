@@ -42,10 +42,13 @@ use vm_runtime::{
     move_vm::MoveVM,
     system_module_names::*,
 };
-use vm_runtime_types::value::Value;
+use vm_runtime_types::values::Value;
 
 // The seed is arbitrarily picked to produce a consistent key. XXX make this more formal?
 const GENESIS_SEED: [u8; 32] = [42; 32];
+
+/// The initial balance of the association account.
+pub const ASSOCIATION_INIT_BALANCE: u64 = 1_000_000_000_000_000;
 
 pub static GENESIS_KEYPAIR: Lazy<(Ed25519PrivateKey, Ed25519PublicKey)> = Lazy::new(|| {
     let mut rng = StdRng::from_seed(GENESIS_SEED);
@@ -174,8 +177,6 @@ fn create_and_initialize_main_accounts(
     public_key: &Ed25519PublicKey,
     initial_gas_schedule: Value,
 ) {
-    const INIT_BALANCE: u64 = 1_000_000_000;
-
     let association_addr = account_config::association_address();
     let mut txn_data = TransactionMetadata::default();
     txn_data.sender = association_addr;
@@ -215,19 +216,6 @@ fn create_and_initialize_main_accounts(
             )
         });
 
-    // create the core code account
-    let core_code_address = account_config::core_code_address();
-    move_vm
-        .execute_function(
-            &ACCOUNT_MODULE,
-            &CREATE_ACCOUNT_NAME,
-            gas_schedule,
-            interpreter_context,
-            &txn_data,
-            vec![Value::address(core_code_address)],
-        )
-        .unwrap_or_else(|_| panic!("Failure creating core code account {:?}", core_code_address));
-
     move_vm
         .execute_function(
             &COIN_MODULE,
@@ -238,6 +226,17 @@ fn create_and_initialize_main_accounts(
             vec![],
         )
         .expect("Failure initializing LibraCoin");
+
+    move_vm
+        .execute_function(
+            &LIBRA_TRANSACTION_TIMEOUT,
+            &INITIALIZE,
+            &gas_schedule,
+            interpreter_context,
+            &txn_data,
+            vec![],
+        )
+        .expect("Failure initializing LibraTransactionTimeout");
 
     move_vm
         .execute_function(
@@ -268,7 +267,10 @@ fn create_and_initialize_main_accounts(
             &gas_schedule,
             interpreter_context,
             &txn_data,
-            vec![Value::address(association_addr), Value::u64(INIT_BALANCE)],
+            vec![
+                Value::address(association_addr),
+                Value::u64(ASSOCIATION_INIT_BALANCE),
+            ],
         )
         .expect("Failure minting to association");
 

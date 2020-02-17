@@ -11,6 +11,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
 };
 
+pub mod ast_debug;
 pub mod fake_natives;
 pub mod remembering_unique_map;
 pub mod unique_map;
@@ -46,19 +47,20 @@ impl Address {
 
         let mut result = hex::decode(hex_string.as_str()).unwrap();
         let len = result.len();
-        if len < 32 {
+        if len < ADDRESS_LENGTH {
             result.reverse();
-            for _ in len..32 {
+            for _ in len..ADDRESS_LENGTH {
                 result.push(0);
             }
             result.reverse();
         }
 
-        assert!(result.len() >= 32);
+        assert!(result.len() >= ADDRESS_LENGTH);
         Self::try_from(&result[..]).map_err(|_| {
             format!(
-                "The address {:?} is of invalid length. Addresses are at most 32-bytes long",
-                result
+                "Address is {} bytes long. The maximum size is {} bytes",
+                result.len(),
+                ADDRESS_LENGTH
             )
         })
     }
@@ -225,6 +227,12 @@ impl<T: fmt::Display> fmt::Display for Spanned<T> {
 impl<T: fmt::Debug> fmt::Debug for Spanned<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", &self.value)
+    }
+}
+
+impl<T: ast_debug::AstDebug> ast_debug::AstDebug for Spanned<T> {
+    fn ast_debug(&self, w: &mut ast_debug::AstWriter) {
+        self.value.ast_debug(w)
     }
 }
 

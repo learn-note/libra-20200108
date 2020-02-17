@@ -5,7 +5,8 @@ set -ex
 
 declare -a params
 if [ -n "${CFG_BASE_CONFIG}" ]; then # Path to base config
-	    params+="-t ${CFG_BASE_CONFIG} "
+	    echo "${CFG_BASE_CONFIG}" > /opt/libra/etc/base.config.toml
+	    params+="-t /opt/libra/etc/base.config.toml "
 fi
 if [ -n "${CFG_LISTEN_ADDR}" ]; then # Advertised listen address for network config
 	    params+="-a /ip4/${CFG_LISTEN_ADDR}/tcp/6180 "
@@ -48,6 +49,23 @@ if [ -n "${CFG_FULLNODE_SEED}" ]; then # We have a full node seed, add fullnode 
 	    --output-dir /opt/libra/etc/ \
 	    ${fullnode_params[@]}
 
+fi
+
+# Set CFG_OVERRIDES to any values that you want to override in the config
+# Example: CFG_OVERRIDES='grpc_max_receive_len=45,genesis_file_location="genesis2.blob",max_block_size=250'
+# Note: Double quotes are required for string parameters and should be
+# omitted for int parameters.
+# Note: This currently does not work with parameters which are repeated.
+if [ -n "${CFG_OVERRIDES}" ]; then
+  IFS=',' read -ra CFG_OVERRIDES <<< "$CFG_OVERRIDES"
+  for KEY_VAL in "${CFG_OVERRIDES[@]}"; do
+    IFS='=' read -ra KEY_VAL <<< "$KEY_VAL"
+      KEY="${KEY_VAL[0]}"
+      VAL="${KEY_VAL[1]}"
+      echo "Overriding ${KEY} = ${VAL} in node config"
+      sed "s/^${KEY} = .*/${KEY} = ${VAL}/g" /opt/libra/etc/node.config.toml > /tmp/node.config.toml
+      mv /tmp/node.config.toml /opt/libra/etc/node.config.toml
+  done
 fi
 
 exec /opt/libra/bin/libra-node -f /opt/libra/etc/node.config.toml

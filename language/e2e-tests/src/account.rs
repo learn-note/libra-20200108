@@ -18,7 +18,13 @@ use rand::{Rng, SeedableRng};
 use std::time::Duration;
 use vm_genesis::GENESIS_KEYPAIR;
 use vm_runtime::identifier::create_access_path;
-use vm_runtime_types::value::{Struct, Value};
+use vm_runtime_types::{
+    loaded_data::{struct_def::StructDef, types::Type},
+    values::{Struct, Value},
+};
+
+// TTL is 86400s. Initial time was set to 0.
+pub const DEFAULT_EXPIRATION_TIME: u64 = 40_000;
 
 /// Details about a Libra account.
 ///
@@ -141,7 +147,7 @@ impl Account {
                 TransactionPayload::Program,
                 max_gas_amount,
                 gas_unit_price,
-                Duration::from_secs(u64::max_value()),
+                Duration::from_secs(DEFAULT_EXPIRATION_TIME),
             ),
             TransactionPayload::WriteSet(writeset) => {
                 RawTransaction::new_change_set(*self.address(), sequence_number, writeset)
@@ -152,7 +158,7 @@ impl Account {
                 module,
                 max_gas_amount,
                 gas_unit_price,
-                Duration::from_secs(u64::max_value()),
+                Duration::from_secs(DEFAULT_EXPIRATION_TIME),
             ),
             TransactionPayload::Script(script) => RawTransaction::new_script(
                 *self.address(),
@@ -160,7 +166,7 @@ impl Account {
                 script,
                 max_gas_amount,
                 gas_unit_price,
-                Duration::from_secs(u64::max_value()),
+                Duration::from_secs(DEFAULT_EXPIRATION_TIME),
             ),
         };
 
@@ -227,7 +233,8 @@ impl Account {
             program,
             max_gas_amount,
             gas_unit_price,
-            Duration::from_secs(u64::max_value()),
+            // TTL is 86400s. Initial time was set to 0.
+            Duration::from_secs(DEFAULT_EXPIRATION_TIME),
         )
         .sign(&self.privkey, self.pubkey.clone())
         .unwrap()
@@ -311,27 +318,40 @@ impl AccountData {
         self.account.rotate_key(privkey, pubkey)
     }
 
+    pub fn layout() -> StructDef {
+        StructDef::new(vec![
+            Type::ByteArray,
+            Type::Struct(StructDef::new(vec![Type::U64])),
+            Type::Bool,
+            Type::Bool,
+            Type::Struct(StructDef::new(vec![Type::U64, Type::ByteArray])),
+            Type::Struct(StructDef::new(vec![Type::U64, Type::ByteArray])),
+            Type::U64,
+            Type::Struct(StructDef::new(vec![Type::U64])),
+        ])
+    }
+
     /// Creates and returns a resource [`Value`] for this data.
     pub fn to_resource(&self) -> Value {
         // TODO: publish some concept of Account
-        let coin = Value::struct_(Struct::new(vec![Value::u64(self.balance)]));
-        Value::struct_(Struct::new(vec![
+        let coin = Value::struct_(Struct::pack(vec![Value::u64(self.balance)]));
+        Value::struct_(Struct::pack(vec![
             Value::byte_array(ByteArray::new(
                 AccountAddress::from_public_key(&self.account.pubkey).to_vec(),
             )),
             coin,
             Value::bool(self.delegated_key_rotation_capability),
             Value::bool(self.delegated_withdrawal_capability),
-            Value::struct_(Struct::new(vec![
+            Value::struct_(Struct::pack(vec![
                 Value::u64(self.received_events.count()),
                 Value::byte_array(ByteArray::new(self.received_events.key().to_vec())),
             ])),
-            Value::struct_(Struct::new(vec![
+            Value::struct_(Struct::pack(vec![
                 Value::u64(self.sent_events.count()),
                 Value::byte_array(ByteArray::new(self.sent_events.key().to_vec())),
             ])),
             Value::u64(self.sequence_number),
-            Value::struct_(Struct::new(vec![Value::u64(self.event_generator)])),
+            Value::struct_(Struct::pack(vec![Value::u64(self.event_generator)])),
         ]))
     }
 

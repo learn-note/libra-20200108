@@ -5,19 +5,22 @@
 //! from external clients (such as wallets) and performs necessary processing before sending them to
 //! next step.
 
+use crate::counters;
 use admission_control_proto::proto::admission_control::{
-    admission_control_server::AdmissionControl, SubmitTransactionRequest, SubmitTransactionResponse,
+    admission_control_server::{AdmissionControl, AdmissionControlServer},
+    SubmitTransactionRequest, SubmitTransactionResponse,
 };
 use anyhow::Result;
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt,
 };
+use libra_config::config::NodeConfig;
 use libra_logger::prelude::*;
 use libra_types::proto::types::{UpdateToLatestLedgerRequest, UpdateToLatestLedgerResponse};
-use std::convert::TryFrom;
-use std::sync::Arc;
-use storage_client::StorageRead;
+use std::{convert::TryFrom, sync::Arc};
+use storage_client::{StorageRead, StorageReadServiceClient};
+use tokio::runtime::{Builder, Runtime};
 
 /// Struct implementing trait (service handle) AdmissionControlService.
 #[derive(Clone)]
@@ -45,6 +48,35 @@ impl AdmissionControlService {
         }
     }
 
+    /// Creates and spins up AdmissionControlService on runtime
+    /// Returns the runtime on which Admission Control Service is newly spawned
+    pub fn bootstrap(
+        config: &NodeConfig,
+        ac_sender: mpsc::Sender<(
+            SubmitTransactionRequest,
+            oneshot::Sender<Result<SubmitTransactionResponse>>,
+        )>,
+    ) -> Runtime {
+        let runtime = Builder::new()
+            .thread_name("ac-service-")
+            .threaded_scheduler()
+            .enable_all()
+            .build()
+            .expect("[admission control] failed to create runtime");
+
+        // Create storage read client
+        let storage_client: Arc<dyn StorageRead> =
+            Arc::new(StorageReadServiceClient::new(&config.storage.address));
+        let admission_control_service = AdmissionControlService::new(ac_sender, storage_client);
+
+        runtime.spawn(
+            tonic::transport::Server::builder()
+                .add_service(AdmissionControlServer::new(admission_control_service))
+                .serve(config.admission_control.address),
+        );
+        runtime
+    }
+
     /// Pass the UpdateToLatestLedgerRequest to Storage for read query.
     async fn update_to_latest_ledger_inner(
         &self,
@@ -58,7 +90,7 @@ impl AdmissionControlService {
             ledger_consistency_proof,
         ) = self
             .storage_read_client
-            .update_to_latest_ledger_async(rust_req.client_known_version, rust_req.requested_items)
+            .update_to_latest_ledger(rust_req.client_known_version, rust_req.requested_items)
             .await?;
         let rust_resp = libra_types::get_with_proof::UpdateToLatestLedgerResponse::new(
             response_items,
@@ -80,6 +112,9 @@ impl AdmissionControl for AdmissionControlService {
         request: tonic::Request<SubmitTransactionRequest>,
     ) -> Result<tonic::Response<SubmitTransactionResponse>, tonic::Status> {
         debug!("[GRPC] AdmissionControl::submit_transaction");
+        counters::REQUESTS
+            .with_label_values(&["submit_transaction"])
+            .inc();
         let req = request.into_inner();
 
         let (req_sender, res_receiver) = oneshot::channel();
@@ -121,6 +156,9 @@ impl AdmissionControl for AdmissionControlService {
         request: tonic::Request<UpdateToLatestLedgerRequest>,
     ) -> Result<tonic::Response<UpdateToLatestLedgerResponse>, tonic::Status> {
         debug!("[GRPC] AdmissionControl::update_to_latest_ledger");
+        counters::REQUESTS
+            .with_label_values(&["update_to_latest_ledger"])
+            .inc();
         let req = request.into_inner();
         let resp = self
             .update_to_latest_ledger_inner(req)

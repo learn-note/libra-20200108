@@ -2,12 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::shared::unique_map::UniqueMap;
-use crate::{errors::*, naming::ast as N, parser::ast::ModuleIdent, shared::*};
+use crate::{
+    errors::*,
+    naming::ast as N,
+    parser::ast::{ModuleIdent, StructName},
+    shared::*,
+};
 use petgraph::algo::astar as petgraph_astar;
 use petgraph::algo::toposort as petgraph_toposort;
 use petgraph::algo::Cycle;
 use petgraph::graphmap::DiGraphMap;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 //**************************************************************************************************
 // Entry
@@ -27,9 +32,8 @@ pub fn verify(errors: &mut Errors, modules: &mut UniqueMap<ModuleIdent, N::Modul
                 .into_iter()
                 .filter(|m| imm_modules.get(m).unwrap().is_source_module.is_some())
                 .cloned()
-                .enumerate()
                 .collect::<Vec<_>>();
-            for (order, mident) in ordering {
+            for (order, mident) in ordering.into_iter().rev().enumerate() {
                 modules.get_mut(&mident).unwrap().is_source_module = Some(order)
             }
         }
@@ -186,7 +190,7 @@ fn struct_def(context: &mut Context, sdef: &N::StructDefinition) {
 
 fn function(context: &mut Context, fdef: &N::Function) {
     function_signature(context, &fdef.signature);
-    base_types(context, &fdef.acquires);
+    function_acquires(context, &fdef.acquires);
     if let N::FunctionBody_::Defined(seq) = &fdef.body.value {
         sequence(context, seq)
     }
@@ -196,6 +200,8 @@ fn function_signature(context: &mut Context, sig: &N::FunctionSignature) {
     single_types(context, sig.parameters.iter().map(|(_, st)| st));
     type_(context, &sig.return_type)
 }
+
+fn function_acquires(_context: &mut Context, _acqs: &BTreeSet<StructName>) {}
 
 //**************************************************************************************************
 // Types

@@ -2,24 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    persistent_storage::PersistentStorage,
+    persistent_safety_storage::PersistentSafetyStorage,
     remote_service::{self, RemoteService},
     safety_rules_manager,
 };
-use consensus_types::common::{Payload, Round};
+use consensus_types::common::{Author, Payload, Round};
 use libra_config::config::{ConsensusType, NodeConfig, SafetyRulesService};
-use libra_types::{crypto_proxies::ValidatorSigner, transaction::SignedTransaction};
-use std::net::SocketAddr;
+use libra_types::transaction::SignedTransaction;
+use std::{marker::PhantomData, net::SocketAddr};
 
-pub struct ProcessService {
+pub struct Process {
     consensus_type: ConsensusType,
-    data: Option<ProcessServiceData>,
-    server_addr: SocketAddr,
+    data: Option<ProcessData>,
 }
 
-impl ProcessService {
+impl Process {
     pub fn new(mut config: NodeConfig) -> Self {
-        let (validator_signer, storage) = safety_rules_manager::extract_service_inputs(&mut config);
+        let (author, storage) = safety_rules_manager::extract_service_inputs(&mut config);
 
         let service = &config.consensus.safety_rules.service;
         let service = match &service {
@@ -27,14 +26,15 @@ impl ProcessService {
             SafetyRulesService::SpawnedProcess(service) => service,
             _ => panic!("Unexpected SafetyRules service: {:?}", service),
         };
+        let server_addr = service.server_address;
 
         Self {
             consensus_type: service.consensus_type,
-            data: Some(ProcessServiceData {
-                validator_signer,
+            data: Some(ProcessData {
+                author,
+                server_addr,
                 storage,
             }),
-            server_addr: service.server_address,
         }
     }
 
@@ -47,21 +47,33 @@ impl ProcessService {
     }
 
     fn start_internal<T: Payload>(&mut self) {
-        let data = self
-            .data
-            .take()
-            .expect("Unable to retrieve ProcessServiceData");
-        remote_service::execute::<T>(data.storage, data.validator_signer, self.server_addr);
+        let data = self.data.take().expect("Unable to retrieve ProcessData");
+        remote_service::execute::<T>(data.author, data.storage, data.server_addr);
     }
 }
 
-impl<T: Payload> RemoteService<T> for ProcessService {
+struct ProcessData {
+    author: Author,
+    server_addr: SocketAddr,
+    storage: PersistentSafetyStorage,
+}
+
+pub struct ProcessService<T> {
+    server_addr: SocketAddr,
+    phantom_data: PhantomData<T>,
+}
+
+impl<T> ProcessService<T> {
+    pub fn new(server_addr: SocketAddr) -> Self {
+        Self {
+            server_addr,
+            phantom_data: PhantomData,
+        }
+    }
+}
+
+impl<T: Payload> RemoteService<T> for ProcessService<T> {
     fn server_address(&self) -> SocketAddr {
         self.server_addr
     }
-}
-
-struct ProcessServiceData {
-    validator_signer: ValidatorSigner,
-    storage: Box<dyn PersistentStorage>,
 }

@@ -4,7 +4,7 @@
 use crate::{
     chained_bft::{
         block_storage::{BlockReader, BlockStore},
-        event_processor::EventProcessor,
+        event_processor::{EventProcessor, StartupSyncProcessor},
         liveness::{
             multi_proposer_election::MultiProposer,
             pacemaker::{ExponentialTimeInterval, Pacemaker},
@@ -12,8 +12,10 @@ use crate::{
             proposer_election::ProposerElection,
             rotating_proposer_election::{choose_leader, RotatingProposer},
         },
-        network::NetworkSender,
-        persistent_storage::{PersistentStorage, RecoveryData},
+        network::{ConsensusTypes, NetworkSender},
+        persistent_liveness_storage::{
+            LedgerRecoveryData, PersistentLivenessStorage, RecoveryData,
+        },
     },
     counters,
     state_replication::{StateComputer, TxnManager},
@@ -31,16 +33,53 @@ use libra_types::{
     crypto_proxies::{EpochInfo, LedgerInfoWithSignatures, ValidatorVerifier},
 };
 use network::{
-    proto::{ConsensusMsg, ConsensusMsg_oneof},
+    proto::ConsensusMsg,
     validator_network::{ConsensusNetworkSender, Event},
 };
 use safety_rules::SafetyRulesManager;
 use std::{
     cmp::Ordering,
-    convert::TryInto,
+    convert::TryFrom,
     sync::{Arc, RwLock},
     time::Duration,
 };
+
+/// The enum contains two processor
+/// StartupSyncProcessor is used to process events in order to sync up with peer if we can't recover from local consensusdb
+/// EventProcessor is used for normal event handling.
+/// We suppress clippy warning here because we expect most of the time we will have EventProcessor
+#[allow(clippy::large_enum_variant)]
+pub enum Processor<T> {
+    StartupSyncProcessor(StartupSyncProcessor<T>),
+    EventProcessor(EventProcessor<T>),
+}
+
+pub enum LivenessStorageData<T> {
+    RecoveryData(RecoveryData<T>),
+    LedgerRecoveryData(LedgerRecoveryData<T>),
+}
+
+impl<T: Payload> LivenessStorageData<T> {
+    pub fn epoch_info(&self) -> EpochInfo {
+        match self {
+            LivenessStorageData::RecoveryData(data) => EpochInfo {
+                epoch: data.epoch(),
+                verifier: data.validators(),
+            },
+            LivenessStorageData::LedgerRecoveryData(data) => EpochInfo {
+                epoch: data.epoch(),
+                verifier: data.validators(),
+            },
+        }
+    }
+
+    pub fn expect_recovery_data(self, msg: &str) -> RecoveryData<T> {
+        match self {
+            LivenessStorageData::RecoveryData(data) => data,
+            LivenessStorageData::LedgerRecoveryData(_) => panic!("{}", msg),
+        }
+    }
+}
 
 // Manager the components that shared across epoch and spawn per-epoch EventProcessor with
 // epoch-specific input.
@@ -54,7 +93,7 @@ pub struct EpochManager<T> {
     timeout_sender: channel::Sender<Round>,
     txn_manager: Box<dyn TxnManager<Payload = T>>,
     state_computer: Arc<dyn StateComputer<Payload = T>>,
-    storage: Arc<dyn PersistentStorage<T>>,
+    storage: Arc<dyn PersistentLivenessStorage<T>>,
     safety_rules_manager: SafetyRulesManager<T>,
 }
 
@@ -69,7 +108,7 @@ impl<T: Payload> EpochManager<T> {
         timeout_sender: channel::Sender<Round>,
         txn_manager: Box<dyn TxnManager<Payload = T>>,
         state_computer: Arc<dyn StateComputer<Payload = T>>,
-        storage: Arc<dyn PersistentStorage<T>>,
+        storage: Arc<dyn PersistentLivenessStorage<T>>,
         safety_rules_manager: SafetyRulesManager<T>,
     ) -> Self {
         Self {
@@ -150,10 +189,15 @@ impl<T: Payload> EpochManager<T> {
                 return;
             }
         };
-        let msg = ConsensusMsg {
-            message: Some(ConsensusMsg_oneof::EpochChange(proof.into())),
+        let msg = ConsensusTypes::ValidatorChangeProof::<T>(Box::new(proof));
+        let msg = match ConsensusMsg::try_from(msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Failed to serialize ValidatorChangeProof: {:?}", e);
+                return;
+            }
         };
-        if let Err(e) = self.network_sender.send_to(peer_id, msg).await {
+        if let Err(e) = self.network_sender.send_to(peer_id, msg) {
             warn!(
                 "Failed to send a epoch retrieval to peer {}: {:?}",
                 peer_id, e
@@ -180,16 +224,15 @@ impl<T: Payload> EpochManager<T> {
                     start_epoch: self.epoch(),
                     end_epoch: different_epoch,
                 };
-                let msg = match request.try_into() {
-                    Ok(bytes) => ConsensusMsg {
-                        message: Some(ConsensusMsg_oneof::RequestEpoch(bytes)),
-                    },
+                let request = ConsensusTypes::EpochRetrievalRequest::<T>(Box::new(request));
+                let msg = match ConsensusMsg::try_from(request) {
+                    Ok(msg) => msg,
                     Err(e) => {
                         warn!("Fail to serialize EpochRetrievalRequest: {:?}", e);
                         return;
                     }
                 };
-                if let Err(e) = self.network_sender.send_to(peer_id, msg).await {
+                if let Err(e) = self.network_sender.send_to(peer_id, msg) {
                     warn!(
                         "Failed to send a epoch retrieval to peer {}: {:?}",
                         peer_id, e
@@ -210,16 +253,21 @@ impl<T: Payload> EpochManager<T> {
         if let Err(e) = self.state_computer.sync_to(ledger_info.clone()).await {
             error!("State sync to new epoch {} failed with {:?}, we'll try to start from current libradb", ledger_info, e);
         }
-        let initial_data = self.storage.start().await;
+        let initial_data = self.storage.start().await.expect_recovery_data(
+            "[Epoch Manager] Failed to construct initial data when starting new epoch",
+        );
         *self.epoch_info.write().unwrap() = EpochInfo {
             epoch: initial_data.epoch(),
             verifier: initial_data.validators(),
         };
-        self.start_epoch(initial_data)
+        self.start_epoch_with_recovery_data(initial_data)
     }
 
-    pub fn start_epoch(&mut self, initial_data: RecoveryData<T>) -> EventProcessor<T> {
-        let validators = initial_data.validators();
+    pub fn start_epoch_with_recovery_data(
+        &mut self,
+        recovery_data: RecoveryData<T>,
+    ) -> EventProcessor<T> {
+        let validators = recovery_data.validators();
         let epoch = self.epoch();
         counters::EPOCH.set(epoch as i64);
         counters::CURRENT_EPOCH_VALIDATORS.set(validators.len() as i64);
@@ -227,19 +275,19 @@ impl<T: Payload> EpochManager<T> {
         info!(
             "Start EventProcessor with epoch {} with genesis {}, validators {}",
             epoch,
-            initial_data.root_block(),
+            recovery_data.root_block(),
             validators,
         );
         block_on(
             self.network_sender
-                .update_eligible_nodes(initial_data.validator_keys()),
+                .update_eligible_nodes(recovery_data.validator_keys()),
         )
         .expect("Unable to update network's eligible peers");
-        let last_vote = initial_data.last_vote();
+        let last_vote = recovery_data.last_vote();
 
         let block_store = Arc::new(BlockStore::new(
             Arc::clone(&self.storage),
-            initial_data,
+            recovery_data,
             Arc::clone(&self.state_computer),
             self.config.max_pruned_blocks_in_mem,
         ));
@@ -277,11 +325,47 @@ impl<T: Payload> EpochManager<T> {
             proposer_election,
             proposal_generator,
             safety_rules,
-            self.txn_manager.clone(),
             network_sender,
+            self.txn_manager.clone(),
             self.storage.clone(),
             self.time_service.clone(),
             validators,
         )
+    }
+
+    fn start_with_ledger_recovery_data(
+        &mut self,
+        ledger_recovery_data: LedgerRecoveryData<T>,
+    ) -> StartupSyncProcessor<T> {
+        block_on(
+            self.network_sender
+                .update_eligible_nodes(ledger_recovery_data.validator_keys().to_vec()),
+        )
+        .expect("Unable to update network's eligible peers");
+        let network_sender = NetworkSender::new(
+            self.author,
+            self.network_sender.clone(),
+            self.self_sender.clone(),
+            ledger_recovery_data.validators(),
+        );
+        StartupSyncProcessor::new(
+            network_sender,
+            self.storage.clone(),
+            self.state_computer.clone(),
+            ledger_recovery_data,
+        )
+    }
+
+    pub fn start(&mut self, liveness_storage_data: LivenessStorageData<T>) -> Processor<T> {
+        match liveness_storage_data {
+            LivenessStorageData::RecoveryData(initial_data) => {
+                Processor::EventProcessor(self.start_epoch_with_recovery_data(initial_data))
+            }
+            LivenessStorageData::LedgerRecoveryData(ledger_recovery_data) => {
+                Processor::StartupSyncProcessor(
+                    self.start_with_ledger_recovery_data(ledger_recovery_data),
+                )
+            }
+        }
     }
 }

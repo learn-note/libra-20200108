@@ -119,15 +119,28 @@ data "template_file" "user_data" {
   template = file("templates/ec2_user_data.sh")
 
   vars = {
-    ecs_cluster     = aws_ecs_cluster.testnet.name
+    ecs_cluster      = aws_ecs_cluster.testnet.name
+    host_log_path    = "/data/libra/libra.log"
+    enable_logrotate = var.log_to_file || var.enable_logstash
   }
 }
 
 locals {
-  image_repo         = var.image_repo
-  instance_public_ip = true
-  user_data          = data.template_file.user_data.rendered
-  image_version      = substr(var.image_tag, 0, 6) == "sha256" ? "@${var.image_tag}" : ":${var.image_tag}"
+  image_repo                 = var.image_repo
+  image_version              = substr(var.image_tag, 0, 6) == "sha256" ? "@${var.image_tag}" : ":${var.image_tag}"
+  safety_rules_image_repo    = var.safety_rules_image_repo
+  safety_rules_image_version = substr(var.safety_rules_image_tag, 0, 6) == "sha256" ? "@${var.safety_rules_image_tag}" : ":${var.safety_rules_image_tag}"
+  instance_public_ip         = true
+  user_data                  = data.template_file.user_data.rendered
+}
+
+resource "aws_ebs_snapshot" "restore_snapshot" {
+  count = var.restore_vol_id == "" ? 0 : 1
+  volume_id = var.restore_vol_id
+
+  tags = {
+    Name = "${terraform.workspace}-restore-snap"
+  }
 }
 
 resource "aws_instance" "validator" {
@@ -145,11 +158,13 @@ resource "aws_instance" "validator" {
   iam_instance_profile        = aws_iam_instance_profile.ecsInstanceRole.name
   user_data                   = local.user_data
 
-  dynamic "root_block_device" {
+  dynamic "ebs_block_device" {
     for_each = contains(local.ebs_types, split(var.validator_type, ".")[0]) ? [0] : []
     content {
+      device_name = "/dev/xvdb"
       volume_type = "io1"
-      volume_size = var.validator_ebs_size
+      volume_size = var.restore_vol_id == "" ? var.validator_ebs_size : aws_ebs_snapshot.restore_snapshot.0.volume_size
+      snapshot_id = var.restore_vol_id == "" ? "" : aws_ebs_snapshot.restore_snapshot.0.id
       iops        = var.validator_ebs_size * 50 # max 50iops/gb
     }
   }
@@ -160,21 +175,17 @@ resource "aws_instance" "validator" {
     Workspace = terraform.workspace
     NodeIndex = count.index
   }
-
 }
 
 locals {
-  seed_peer_ip = aws_instance.validator.0.private_ip
+  seed_peer_ip           = aws_instance.validator.0.private_ip
+  validator_command      = var.log_to_file || var.enable_logstash ? jsonencode(["bash", "-c", "/docker-run-dynamic.sh >> ${var.log_path} 2>&1"]) : ""
+  aws_elasticsearch_host = var.enable_logstash ? join(",", aws_elasticsearch_domain.logging.*.endpoint) : ""
+  logstash_config        = "input { file { path => '${var.log_path}'\\n}}\\n output {  amazon_es { \\nhosts => ['https://${local.aws_elasticsearch_host}']\\nregion => 'us-west-2'\\nindex => 'validator-logs-%%{+YYYY.MM.dd}'\\n}}"
 }
 
-variable "log_to_file" {
-  type        = bool
-  default     = false
-  description = "Set to true to log to /opt/libra/data/libra.log (in container) and /data/libra/libra.log (on host). This file won't be log rotated, you need to handle log rotation on your own if you choose this option"
-}
-
-locals {
-  validator_command = var.log_to_file ? jsonencode(["bash", "-c", "/docker-run-dynamic.sh >> /opt/libra/data/libra.log 2>&1"]) : ""
+data "template_file" "validator_config" {
+  template = file("templates/validator.config.toml")
 }
 
 data "template_file" "ecs_task_definition" {
@@ -182,25 +193,32 @@ data "template_file" "ecs_task_definition" {
   template = file("templates/validator.json")
 
   vars = {
-    image            = local.image_repo
-    image_version    = local.image_version
-    cpu              = local.cpu_by_instance[var.validator_type]
-    mem              = local.mem_by_instance[var.validator_type]
-    cfg_listen_addr  = var.validator_use_public_ip == true ? element(aws_instance.validator.*.public_ip, count.index) : element(aws_instance.validator.*.private_ip, count.index)
-    cfg_node_index   = count.index
+    image              = local.image_repo
+    image_version      = local.image_version
+    cpu                = (var.enable_logstash ? local.cpu_by_instance[var.validator_type] - 584 : local.cpu_by_instance[var.validator_type]) - 512
+    mem                = (var.enable_logstash ? local.mem_by_instance[var.validator_type] - 1024 : local.mem_by_instance[var.validator_type]) - 256
+    cfg_base_config    = jsonencode(data.template_file.validator_config.rendered)
+    cfg_listen_addr    = var.validator_use_public_ip == true ? element(aws_instance.validator.*.public_ip, count.index) : element(aws_instance.validator.*.private_ip, count.index)
+    cfg_node_index     = count.index
     cfg_num_validators = var.cfg_num_validators_override == 0 ? var.num_validators : var.cfg_num_validators_override
-    cfg_seed         = var.config_seed
-    cfg_seed_peer_ip = local.seed_peer_ip
+    cfg_seed           = var.config_seed
+    cfg_seed_peer_ip   = local.seed_peer_ip
 
     cfg_fullnode_seed = count.index < var.num_fullnode_networks ? var.fullnode_seed : ""
     cfg_num_fullnodes = var.num_fullnodes
 
-    log_level        = var.validator_log_level
-    log_group        = var.cloudwatch_logs ? aws_cloudwatch_log_group.testnet.name : ""
-    log_region       = var.region
-    log_prefix       = "validator-${count.index}"
-    capabilities     = jsonencode(var.validator_linux_capabilities)
-    command          = local.validator_command
+    log_level                  = var.validator_log_level
+    log_group                  = var.cloudwatch_logs ? aws_cloudwatch_log_group.testnet.name : ""
+    log_region                 = var.region
+    log_prefix                 = "validator-${count.index}"
+    capabilities               = jsonencode(var.validator_linux_capabilities)
+    command                    = local.validator_command
+    logstash                   = var.enable_logstash
+    logstash_image             = var.logstash_image
+    logstash_version           = ":${var.logstash_version}"
+    logstash_config            = local.logstash_config
+    safety_rules_image         = local.safety_rules_image_repo
+    safety_rules_image_version = local.safety_rules_image_version
   }
 }
 

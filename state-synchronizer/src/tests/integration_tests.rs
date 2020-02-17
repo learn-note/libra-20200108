@@ -1,19 +1,24 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::tests::mock_storage::MockStorage;
 use crate::{
-    executor_proxy::ExecutorProxyTrait, PeerId, StateSyncClient, StateSynchronizer,
-    SynchronizerState,
+    executor_proxy::ExecutorProxyTrait, tests::mock_storage::MockStorage, PeerId, StateSyncClient,
+    StateSynchronizer, SynchronizerState,
 };
 use anyhow::{bail, Result};
 use config_builder;
 use executor::ExecutedTrees;
 use futures::executor::block_on;
 use libra_config::config::RoleType;
-use libra_crypto::x25519::{X25519StaticPrivateKey, X25519StaticPublicKey};
-use libra_crypto::{ed25519::*, test_utils::TEST_SEED, x25519, HashValue};
+use libra_crypto::{
+    ed25519::*,
+    test_utils::TEST_SEED,
+    x25519,
+    x25519::{X25519StaticPrivateKey, X25519StaticPublicKey},
+    HashValue,
+};
 use libra_logger::set_simple_logger;
+use libra_mempool::mocks::MockSharedMempool;
 use libra_types::{
     block_info::BlockInfo,
     crypto_proxies::{
@@ -27,19 +32,18 @@ use libra_types::{
 };
 use network::{
     validator_network::{
+        self,
         network_builder::{NetworkBuilder, TransportType},
-        STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL,
     },
-    NetworkPublicKeys, ProtocolId,
+    NetworkPublicKeys,
 };
 use parity_multiaddr::Multiaddr;
 use rand::{rngs::StdRng, SeedableRng};
-use std::sync::RwLock;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, RwLock,
     },
 };
 use tokio::runtime::Runtime;
@@ -124,6 +128,7 @@ struct SynchronizerEnv {
     public_keys: Vec<ValidatorPublicKeys>,
     peer_ids: Vec<PeerId>,
     peer_addresses: Vec<Multiaddr>,
+    mempools: Vec<MockSharedMempool>,
 }
 
 impl SynchronizerEnv {
@@ -231,6 +236,7 @@ impl SynchronizerEnv {
             public_keys,
             peer_ids,
             peer_addresses: vec![],
+            mempools: vec![],
         }
     }
 
@@ -257,10 +263,6 @@ impl SynchronizerEnv {
 
         // setup network
         let addr: Multiaddr = "/memory/0".parse().unwrap();
-        let protocols = vec![ProtocolId::from_static(
-            STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL,
-        )];
-
         let mut seed_peers = HashMap::new();
         if new_peer_idx > 0 {
             seed_peers.insert(
@@ -268,31 +270,32 @@ impl SynchronizerEnv {
                 vec![self.peer_addresses[new_peer_idx - 1].clone()],
             );
         }
-        let (peer_addr, mut network_provider) = NetworkBuilder::new(
+        let mut network_builder = NetworkBuilder::new(
             self.runtime.handle().clone(),
             self.peer_ids[new_peer_idx],
             addr,
             RoleType::Validator,
-        )
-        .signing_keys((
-            self.network_signers[new_peer_idx].clone(),
-            self.public_keys[new_peer_idx]
-                .network_signing_public_key()
-                .clone(),
-        ))
-        .trusted_peers(trusted_peers)
-        .seed_peers(seed_peers)
-        .transport(TransportType::Memory)
-        .direct_send_protocols(protocols.clone())
-        .build();
+        );
+        network_builder
+            .signing_keys((
+                self.network_signers[new_peer_idx].clone(),
+                self.public_keys[new_peer_idx]
+                    .network_signing_public_key()
+                    .clone(),
+            ))
+            .trusted_peers(trusted_peers)
+            .seed_peers(seed_peers)
+            .transport(TransportType::Memory)
+            .add_discovery();
 
-        let (sender, events) = network_provider.add_state_synchronizer(protocols);
-        self.runtime.handle().spawn(network_provider.start());
+        let (sender, events) =
+            validator_network::state_synchronizer::add_to_network(&mut network_builder);
+        let peer_addr = network_builder.build();
 
         let mut config = config_builder::test_config().0;
         if !role.is_validator() {
             let mut network = config.validator_network.unwrap();
-            network.set_default_peer_id();
+            network.peer_id = PeerId::default();
             config.full_node_networks = vec![network];
             config.validator_network = None;
         }
@@ -311,13 +314,17 @@ impl SynchronizerEnv {
             genesis_li,
             self.signers[new_peer_idx].clone(),
         )));
+        let (mempool_channel, mempool_requests) = futures::channel::mpsc::channel(1_024);
         let synchronizer = StateSynchronizer::bootstrap_with_executor_proxy(
             vec![(sender, events)],
+            mempool_channel,
             role,
             waypoint,
             &config.state_sync,
             MockExecutorProxy::new(handler, storage_proxy.clone()),
         );
+        self.mempools
+            .push(MockSharedMempool::new(Some(mempool_requests)));
         let client = synchronizer.create_client();
         self.synchronizers.push(synchronizer);
         self.clients.push(client);
@@ -338,8 +345,21 @@ impl SynchronizerEnv {
         let mut storage = self.storage_proxies[peer_id].write().unwrap();
         let num_txns = version - storage.version();
         assert!(num_txns > 0);
-        storage.commit_new_txns(num_txns);
-        block_on(self.clients[peer_id].commit()).unwrap();
+        let (committed_txns, signed_txns) = storage.commit_new_txns(num_txns);
+        drop(storage);
+        // add txns to mempool
+        assert!(self.mempools[peer_id].add_txns(signed_txns.clone()).is_ok());
+
+        // we need to run StateSyncClient::commit on a tokio runtime to support tokio::timeout
+        // in commit()
+        assert!(Runtime::new()
+            .unwrap()
+            .block_on(self.clients[peer_id].commit(committed_txns))
+            .is_ok());
+        let mempool_txns = self.mempools[peer_id].read_timeline(0, signed_txns.len());
+        for txn in signed_txns.iter() {
+            assert!(!mempool_txns.contains(txn));
+        }
     }
 
     fn latest_li(&self, peer_id: usize) -> LedgerInfoWithSignatures {

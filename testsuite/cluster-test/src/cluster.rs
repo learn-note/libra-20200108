@@ -90,7 +90,7 @@ impl Cluster {
                 }
                 Ok(r) => r,
             };
-            let ac_port = AdmissionControlConfig::default().admission_control_service_port as u32;
+            let ac_port = AdmissionControlConfig::default().address.port() as u32;
             for reservation in result.reservations.expect("no reservations") {
                 for aws_instance in reservation.instances.expect("no instances") {
                     let ip = aws_instance
@@ -141,15 +141,17 @@ impl Cluster {
         self.validator_instances.choose(&mut rnd).unwrap().clone()
     }
 
-    pub fn validator_instances(&self) -> &Vec<Instance> {
+    pub fn validator_instances(&self) -> &[Instance] {
         &self.validator_instances
     }
+    pub fn fullnode_instances(&self) -> &[Instance] {
+        &self.fullnode_instances
+    }
 
-    pub fn get_all_instances(&self) -> Vec<Instance> {
-        let mut all_instances: Vec<Instance> = vec![];
-        all_instances.append(&mut self.validator_instances.clone());
-        all_instances.append(&mut self.fullnode_instances.clone());
-        all_instances
+    pub fn all_instances(&self) -> impl Iterator<Item = &Instance> {
+        self.validator_instances
+            .iter()
+            .chain(self.fullnode_instances.iter())
     }
 
     pub fn into_validator_instances(self) -> Vec<Instance> {

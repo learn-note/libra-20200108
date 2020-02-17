@@ -11,8 +11,10 @@ use crate::{
             proposal_generator::ProposalGenerator,
             proposer_election::ProposerElection,
         },
-        network::NetworkSender,
-        persistent_storage::PersistentStorage,
+        network::{ConsensusTypes, NetworkSender},
+        persistent_liveness_storage::{
+            LedgerRecoveryData, PersistentLivenessStorage, RecoveryData,
+        },
     },
     counters,
     state_replication::TxnManager,
@@ -20,7 +22,7 @@ use crate::{
         duration_since_epoch, wait_if_possible, TimeService, WaitingError, WaitingSuccess,
     },
 };
-use anyhow::{ensure, format_err, Context};
+use anyhow::{ensure, format_err, Context, Result};
 use consensus_types::{
     accumulator_extension_proof::AccumulatorExtensionProof,
     block::Block,
@@ -36,23 +38,26 @@ use consensus_types::{
 use libra_crypto::hash::TransactionAccumulatorHasher;
 use libra_logger::prelude::*;
 use libra_prost_ext::MessageExt;
-use libra_types::crypto_proxies::{
-    LedgerInfoWithSignatures, ValidatorChangeProof, ValidatorVerifier,
+use libra_types::{
+    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof, ValidatorVerifier},
+    transaction::TransactionStatus,
 };
-use mirai_annotations::{
-    debug_checked_precondition, debug_checked_precondition_eq, debug_checked_verify,
-    debug_checked_verify_eq,
-};
-use network::proto::{ConsensusMsg, ConsensusMsg_oneof};
+use network::proto::ConsensusMsg;
 
 use crate::chained_bft::network::IncomingBlockRetrievalRequest;
-use consensus_types::block_retrieval::{BlockRetrievalResponse, BlockRetrievalStatus};
+use crate::state_replication::StateComputer;
+use consensus_types::{
+    block_retrieval::{BlockRetrievalResponse, BlockRetrievalStatus},
+    executed_block::ExecutedBlock,
+};
 #[cfg(test)]
 use safety_rules::ConsensusState;
 use safety_rules::TSafetyRules;
-use std::convert::TryInto;
-use std::time::Instant;
-use std::{sync::Arc, time::Duration};
+use std::{
+    convert::TryFrom,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use termion::color::*;
 
 #[cfg(test)]
@@ -62,6 +67,83 @@ mod event_processor_test;
 #[cfg(any(feature = "fuzzing", test))]
 #[path = "event_processor_fuzzing.rs"]
 pub mod event_processor_fuzzing;
+
+/// During the event of the node can't recover from local data, StartupSyncProcessor is responsible
+/// for processing the events carrying sync info and use the info to retrieve blocks from peers
+#[allow(dead_code)]
+pub struct StartupSyncProcessor<T> {
+    network: NetworkSender<T>,
+    storage: Arc<dyn PersistentLivenessStorage<T>>,
+    state_computer: Arc<dyn StateComputer<Payload = T>>,
+    ledger_recovery_data: LedgerRecoveryData<T>,
+}
+
+#[allow(dead_code)]
+impl<T: Payload> StartupSyncProcessor<T> {
+    pub fn new(
+        network: NetworkSender<T>,
+        storage: Arc<dyn PersistentLivenessStorage<T>>,
+        state_computer: Arc<dyn StateComputer<Payload = T>>,
+        ledger_recovery_data: LedgerRecoveryData<T>,
+    ) -> Self {
+        StartupSyncProcessor {
+            network,
+            storage,
+            state_computer,
+            ledger_recovery_data,
+        }
+    }
+
+    pub async fn process_proposal_msg(
+        &mut self,
+        proposal_msg: ProposalMsg<T>,
+    ) -> Result<RecoveryData<T>> {
+        let author = proposal_msg.proposer();
+        let sync_info = proposal_msg.sync_info();
+        self.sync_up(&sync_info, author).await
+    }
+
+    pub async fn process_vote(&mut self, vote_msg: VoteMsg) -> Result<RecoveryData<T>> {
+        let author = vote_msg.vote().author();
+        let sync_info = vote_msg.sync_info();
+        self.sync_up(&sync_info, author).await
+    }
+
+    pub async fn process_sync_info_msg(
+        &mut self,
+        sync_info: SyncInfo,
+        peer: Author,
+    ) -> Result<RecoveryData<T>> {
+        debug!("Startup Sync received a sync info msg: {}", sync_info);
+        self.sync_up(&sync_info, peer).await
+    }
+
+    async fn sync_up(&mut self, sync_info: &SyncInfo, peer: Author) -> Result<RecoveryData<T>> {
+        ensure!(
+            sync_info.highest_round() > self.ledger_recovery_data.commit_round(),
+            "Received sync info has lower round number than committed block"
+        );
+        ensure!(
+            sync_info.epoch() == self.ledger_recovery_data.epoch(),
+            "Received sync info is in different epoch than committed block"
+        );
+        let mut retriever = BlockRetriever::new(
+            self.network.clone(),
+            // Give a timeout of 5 sec per attempt try to fetch block from peer
+            Instant::now() + Duration::new(5, 0),
+            peer,
+        );
+        let recovery_data = BlockStore::fast_forward_sync(
+            &sync_info.highest_commit_cert(),
+            &mut retriever,
+            self.storage.clone(),
+            self.state_computer.clone(),
+        )
+        .await?;
+
+        Ok(recovery_data)
+    }
+}
 
 /// Consensus SMR is working in an event based fashion: EventProcessor is responsible for
 /// processing the individual events (e.g., process_new_round, process_proposal, process_vote,
@@ -75,9 +157,9 @@ pub struct EventProcessor<T> {
     proposer_election: Box<dyn ProposerElection<T> + Send + Sync>,
     proposal_generator: ProposalGenerator<T>,
     safety_rules: Box<dyn TSafetyRules<T> + Send + Sync>,
+    network: NetworkSender<T>,
     txn_manager: Box<dyn TxnManager<Payload = T>>,
-    network: NetworkSender,
-    storage: Arc<dyn PersistentStorage<T>>,
+    storage: Arc<dyn PersistentLivenessStorage<T>>,
     time_service: Arc<dyn TimeService>,
     // Cache of the last sent vote message.
     last_vote_sent: Option<(Vote, Round)>,
@@ -92,9 +174,9 @@ impl<T: Payload> EventProcessor<T> {
         proposer_election: Box<dyn ProposerElection<T> + Send + Sync>,
         proposal_generator: ProposalGenerator<T>,
         safety_rules: Box<dyn TSafetyRules<T> + Send + Sync>,
+        network: NetworkSender<T>,
         txn_manager: Box<dyn TxnManager<Payload = T>>,
-        network: NetworkSender,
-        storage: Arc<dyn PersistentStorage<T>>,
+        storage: Arc<dyn PersistentLivenessStorage<T>>,
         time_service: Arc<dyn TimeService>,
         validators: Arc<ValidatorVerifier>,
     ) -> Self {
@@ -122,7 +204,7 @@ impl<T: Payload> EventProcessor<T> {
         }
     }
 
-    fn create_block_retriever(&self, deadline: Instant, author: Author) -> BlockRetriever {
+    fn create_block_retriever(&self, deadline: Instant, author: Author) -> BlockRetriever<T> {
         BlockRetriever::new(self.network.clone(), deadline, author)
     }
 
@@ -243,12 +325,7 @@ impl<T: Payload> EventProcessor<T> {
     }
 
     /// In case some peer's round or HQC is stale, send a SyncInfo message to that peer.
-    async fn help_remote_if_stale(
-        &self,
-        peer: Author,
-        remote_round: Round,
-        remote_hqc_round: Round,
-    ) {
+    fn help_remote_if_stale(&self, peer: Author, remote_round: Round, remote_hqc_round: Round) {
         if self.proposal_generator.author() == peer {
             return;
         }
@@ -271,7 +348,7 @@ impl<T: Payload> EventProcessor<T> {
                 sync_info,
             );
             counters::SYNC_INFO_MSGS_SENT_COUNT.inc();
-            self.network.send_sync_info(sync_info, peer).await;
+            self.network.send_sync_info(sync_info, peer);
         }
     }
 
@@ -286,8 +363,7 @@ impl<T: Payload> EventProcessor<T> {
         help_remote: bool,
     ) -> anyhow::Result<()> {
         if help_remote {
-            self.help_remote_if_stale(author, sync_info.highest_round(), sync_info.hqc_round())
-                .await;
+            self.help_remote_if_stale(author, sync_info.highest_round(), sync_info.hqc_round());
         }
 
         let current_hqc_round = self
@@ -378,15 +454,17 @@ impl<T: Payload> EventProcessor<T> {
             // The timeout event is late: the node has already moved to another round.
             return;
         }
-        let last_voted_round = self
-            .safety_rules
-            .consensus_state()
-            .unwrap()
-            .last_voted_round();
+
+        let use_last_vote = if let Some((_, last_voted_round)) = self.last_vote_sent {
+            last_voted_round == round
+        } else {
+            false
+        };
+
         warn!(
             "Round {} timed out: {}, expected round proposer was {:?}, broadcasting the vote to all replicas",
             round,
-            if last_voted_round == round { "already executed and voted at this round" } else { "will try to generate a backup vote" },
+            if use_last_vote { "already executed and voted at this round" } else { "will try to generate a backup vote" },
             self.proposer_election.get_valid_proposers(round).iter().map(|p| p.short_str()).collect::<Vec<String>>(),
         );
 
@@ -488,18 +566,6 @@ impl<T: Payload> EventProcessor<T> {
     /// position.
     async fn process_proposed_block(&mut self, proposal: Block<T>) {
         debug!("EventProcessor: process_proposed_block {}", proposal);
-        // Safety invariant: For any valid proposed block, its parent block == the block pointed to
-        // by its QC.
-        debug_checked_precondition_eq!(
-            proposal.parent_id(),
-            proposal.quorum_cert().certified_block().id()
-        );
-        // Safety invariant: QC of the parent block is present in the block store
-        // (Ensured by the call to pre-process proposal before this function is called).
-        debug_checked_precondition!(self
-            .block_store
-            .get_quorum_cert_for_block(proposal.parent_id())
-            .is_some());
 
         if let Some(time_to_receival) =
             duration_since_epoch().checked_sub(Duration::from_micros(proposal.timestamp_usecs()))
@@ -508,11 +574,6 @@ impl<T: Payload> EventProcessor<T> {
         }
 
         let proposal_round = proposal.round();
-        // Creating these variables here since proposal gets moved in the call to execute_and_vote.
-        // Used in MIRAI annotation later.
-        let proposal_id = proposal.id();
-        let proposal_parent_id = proposal.parent_id();
-        let certified_parent_block_round = proposal.quorum_cert().parent_block().round();
 
         let vote = match self.execute_and_vote(proposal).await {
             Err(e) => {
@@ -522,38 +583,11 @@ impl<T: Payload> EventProcessor<T> {
             Ok(vote) => vote,
         };
 
-        // Safety invariant: The vote being sent is for the proposal that was received.
-        debug_checked_verify_eq!(proposal_id, vote.vote_data().proposed().id());
-        // Safety invariant: The last voted round is updated to be the same as the proposed block's
-        // round. At this point, the replica has decided to vote for the proposed block.
-        debug_checked_verify_eq!(
-            self.safety_rules
-                .consensus_state()
-                .unwrap()
-                .last_voted_round(),
-            proposal_round
-        );
-        // Safety invariant: qc_parent <-- qc
-        // the preferred block round must be at least as large as qc_parent's round.
-        debug_checked_verify!(
-            self.safety_rules
-                .consensus_state()
-                .unwrap()
-                .preferred_round()
-                >= certified_parent_block_round
-        );
-
         let recipients = self
             .proposer_election
             .get_valid_proposers(proposal_round + 1);
         debug!("{}Voted: {} {}", Fg(Green), Fg(Reset), vote);
 
-        // Safety invariant: The parent block must be present in the block store and the replica
-        // only votes for blocks with round greater than the parent block's round.
-        debug_checked_verify!(self
-            .block_store
-            .get_block(proposal_parent_id)
-            .map_or(false, |parent_block| parent_block.round() < proposal_round));
         let vote_msg = VoteMsg::new(vote, self.gen_sync_info());
         self.network.send_vote(vote_msg, recipients).await;
     }
@@ -808,10 +842,7 @@ impl<T: Payload> EventProcessor<T> {
         .await
     }
 
-    /// Upon (potentially) new commit:
-    /// 1. Commit the blocks via block store.
-    /// 2. After the state is finalized, update the txn manager with the status of the committed
-    /// transactions.
+    /// Upon (potentially) new commit, commit the blocks via block store.
     async fn process_commit(&mut self, finality_proof: LedgerInfoWithSignatures) {
         let blocks_to_commit = match self.block_store.commit(finality_proof.clone()).await {
             Ok(blocks) => blocks,
@@ -820,26 +851,18 @@ impl<T: Payload> EventProcessor<T> {
                 return;
             }
         };
-        // At this moment the new state is persisted and we can notify the clients.
-        // Multiple blocks might be committed at once: notify about all the transactions in the
-        // path from the old root to the new root.
+        Self::update_counters_for_committed_blocks(blocks_to_commit.clone());
+
+        // notify mempool of rejected txns via txn_manager
         for committed in blocks_to_commit {
-            if let Some(time_to_commit) = duration_since_epoch()
-                .checked_sub(Duration::from_micros(committed.timestamp_usecs()))
-            {
-                counters::CREATION_TO_COMMIT_S.observe_duration(time_to_commit);
-            }
             if let Some(payload) = committed.payload() {
                 let compute_result = committed.compute_result();
-                if let Err(e) = self
-                    .txn_manager
-                    .commit_txns(payload, &compute_result, committed.timestamp_usecs())
-                    .await
-                {
-                    error!("Failed to notify mempool: {:?}", e);
+                if let Err(e) = self.txn_manager.commit_txns(payload, &compute_result).await {
+                    error!("Failed to notify mempool of rejected txns: {:?}", e);
                 }
             }
         }
+
         if finality_proof.ledger_info().next_validator_set().is_some() {
             self.network
                 .broadcast_epoch_change(ValidatorChangeProof::new(
@@ -847,6 +870,48 @@ impl<T: Payload> EventProcessor<T> {
                     /* more = */ false,
                 ))
                 .await
+        }
+    }
+
+    fn update_counters_for_committed_blocks(blocks_to_commit: Vec<Arc<ExecutedBlock<T>>>) {
+        for block in blocks_to_commit {
+            if let Some(time_to_commit) =
+                duration_since_epoch().checked_sub(Duration::from_micros(block.timestamp_usecs()))
+            {
+                counters::CREATION_TO_COMMIT_S.observe_duration(time_to_commit);
+            }
+            counters::COMMITTED_BLOCKS_COUNT.inc();
+            let block_txns = block.output().transaction_data();
+            counters::NUM_TXNS_PER_BLOCK.observe(block_txns.len() as f64);
+
+            for txn in block_txns.iter() {
+                match txn.txn_info_hash() {
+                    Some(_) => {
+                        counters::COMMITTED_TXNS_COUNT
+                            .with_label_values(&["success"])
+                            .inc();
+                    }
+                    None => {
+                        counters::COMMITTED_TXNS_COUNT
+                            .with_label_values(&["failed"])
+                            .inc();
+                    }
+                }
+            }
+            for status in block.compute_result().compute_status.iter() {
+                match status {
+                    TransactionStatus::Keep(_) => {
+                        counters::COMMITTED_TXNS_COUNT
+                            .with_label_values(&["success"])
+                            .inc();
+                    }
+                    TransactionStatus::Discard(_) => {
+                        counters::COMMITTED_TXNS_COUNT
+                            .with_label_values(&["failed"])
+                            .inc();
+                    }
+                }
+            }
         }
     }
 
@@ -874,24 +939,17 @@ impl<T: Payload> EventProcessor<T> {
             status = BlockRetrievalStatus::IdNotFound;
         }
 
-        let response = BlockRetrievalResponse::new(status, blocks);
-        if let Err(e) = response
-            .try_into()
-            .and_then(|proto| {
-                let bytes = ConsensusMsg {
-                    message: Some(ConsensusMsg_oneof::RespondBlock(proto)),
-                }
-                .to_bytes()?;
-                Ok(bytes)
-            })
-            .and_then(|response_data| {
+        let response = Box::new(BlockRetrievalResponse::new(status, blocks));
+        if let Err(e) = ConsensusMsg::try_from(ConsensusTypes::BlockRetrievalResponse(response))
+            .and_then(|proto| Ok(proto.to_bytes()?))
+            .and_then(|bytes| {
                 request
                     .response_sender
-                    .send(Ok(response_data))
+                    .send(Ok(bytes))
                     .map_err(|e| format_err!("{:?}", e))
             })
         {
-            error!("Failed to return the requested block: {:?}", e);
+            warn!("Failed to serialize BlockRetrievalResponse: {:?}", e);
         }
     }
 

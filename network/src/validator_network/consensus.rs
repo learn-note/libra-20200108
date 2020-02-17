@@ -4,14 +4,19 @@
 //! Interface between Consensus and Network layers.
 
 use crate::{
+    common::NetworkPublicKeys,
+    connectivity_manager::ConnectivityRequest,
+    counters,
     error::NetworkError,
-    interface::NetworkRequest,
-    proto::{ConsensusMsg, ConsensusMsg_oneof, RequestBlock, RespondBlock},
+    peer_manager::{PeerManagerRequest, PeerManagerRequestSender},
+    proto::ConsensusMsg,
     protocols::rpc::error::RpcError,
+    validator_network::network_builder::NetworkBuilder,
     validator_network::{NetworkEvents, NetworkSender},
-    NetworkPublicKeys, ProtocolId,
+    ProtocolId,
 };
-use channel;
+use channel::{libra_channel, message_queues::QueueStyle};
+use futures::sink::SinkExt;
 use libra_types::{crypto_proxies::ValidatorPublicKeys, PeerId};
 use std::time::Duration;
 
@@ -22,16 +27,15 @@ pub const CONSENSUS_DIRECT_SEND_PROTOCOL: &[u8] = b"/libra/direct-send/0.1.0/con
 
 /// The interface from Network to Consensus layer.
 ///
-/// `ConsensusNetworkEvents` is a `Stream` of `NetworkNotification` where the
+/// `ConsensusNetworkEvents` is a `Stream` of `PeerManagerNotification` where the
 /// raw `Bytes` direct-send and rpc messages are deserialized into
 /// `ConsensusMessage` types. `ConsensusNetworkEvents` is a thin wrapper around
-/// an `channel::Receiver<NetworkNotification>`.
+/// an `channel::Receiver<PeerManagerNotification>`.
 pub type ConsensusNetworkEvents = NetworkEvents<ConsensusMsg>;
 
 /// The interface from Consensus to Networking layer.
 ///
-/// This is a thin wrapper around a `NetworkSender<ConsensusMsg>`, which is in
-/// turn a thin wrapper around a `channel::Sender<NetworkRequest>`, so it is easy
+/// This is a thin wrapper around a `NetworkSender<ConsensusMsg>`, so it is easy
 /// to clone and send off to a separate task. For example, the rpc requests
 /// return Futures that encapsulate the whole flow, from sending the request to
 /// remote, to finally receiving the response and deserializing. It therefore
@@ -39,64 +43,78 @@ pub type ConsensusNetworkEvents = NetworkEvents<ConsensusMsg>;
 /// requires the `ConsensusNetworkSender` to be `Clone` and `Send`.
 #[derive(Clone)]
 pub struct ConsensusNetworkSender {
-    inner: NetworkSender<ConsensusMsg>,
+    peer_mgr_reqs_tx: NetworkSender<ConsensusMsg>,
+    conn_mgr_reqs_tx: channel::Sender<ConnectivityRequest>,
+}
+
+pub fn add_to_network(
+    network: &mut NetworkBuilder,
+) -> (ConsensusNetworkSender, ConsensusNetworkEvents) {
+    let (network_sender, network_receiver, control_notifs_rx) = network.add_protocol_handler(
+        vec![ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL)],
+        vec![ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL)],
+        QueueStyle::LIFO,
+        Some(&counters::PENDING_CONSENSUS_NETWORK_EVENTS),
+    );
+    (
+        ConsensusNetworkSender::new(
+            network_sender,
+            network
+                .conn_mgr_reqs_tx()
+                .expect("ConnecitivtyManager not enabled"),
+        ),
+        ConsensusNetworkEvents::new(network_receiver, control_notifs_rx),
+    )
 }
 
 impl ConsensusNetworkSender {
-    pub fn new(inner: channel::Sender<NetworkRequest>) -> Self {
+    pub fn new(
+        peer_mgr_reqs_tx: libra_channel::Sender<(PeerId, ProtocolId), PeerManagerRequest>,
+        conn_mgr_reqs_tx: channel::Sender<ConnectivityRequest>,
+    ) -> Self {
         Self {
-            inner: NetworkSender::new(inner),
+            peer_mgr_reqs_tx: NetworkSender::new(PeerManagerRequestSender::new(peer_mgr_reqs_tx)),
+            conn_mgr_reqs_tx,
         }
     }
 
-    pub async fn send_to(
+    pub fn send_to(
         &mut self,
         recipient: PeerId,
         message: ConsensusMsg,
     ) -> Result<(), NetworkError> {
         let protocol = ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL);
-        self.inner.send_to(recipient, protocol, message).await
+        self.peer_mgr_reqs_tx.send_to(recipient, protocol, message)
     }
 
-    pub async fn send_to_many(
+    pub fn send_to_many(
         &mut self,
         recipients: impl Iterator<Item = PeerId>,
         message: ConsensusMsg,
     ) -> Result<(), NetworkError> {
         let protocol = ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL);
-        self.inner.send_to_many(recipients, protocol, message).await
+        self.peer_mgr_reqs_tx
+            .send_to_many(recipients, protocol, message)
     }
 
-    pub async fn request_block(
+    pub async fn send_rpc(
         &mut self,
         recipient: PeerId,
-        req_msg: RequestBlock,
+        message: ConsensusMsg,
         timeout: Duration,
-    ) -> Result<RespondBlock, RpcError> {
+    ) -> Result<ConsensusMsg, RpcError> {
         let protocol = ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL);
-        let req_msg_enum = ConsensusMsg {
-            message: Some(ConsensusMsg_oneof::RequestBlock(req_msg)),
-        };
-
-        let res_msg_enum = self
-            .inner
-            .unary_rpc(recipient, protocol, req_msg_enum, timeout)
-            .await?;
-
-        if let Some(ConsensusMsg_oneof::RespondBlock(response)) = res_msg_enum.message {
-            Ok(response)
-        } else {
-            // TODO: context
-            Err(RpcError::InvalidRpcResponse)
-        }
+        self.peer_mgr_reqs_tx
+            .unary_rpc(recipient, protocol, message, timeout)
+            .await
     }
 
     pub async fn update_eligible_nodes(
         &mut self,
         validators: Vec<ValidatorPublicKeys>,
     ) -> Result<(), NetworkError> {
-        self.inner
-            .update_eligible_nodes(
+        self.conn_mgr_reqs_tx
+            .send(ConnectivityRequest::UpdateEligibleNodes(
                 validators
                     .into_iter()
                     .map(|keys| {
@@ -109,8 +127,9 @@ impl ConsensusNetworkSender {
                         )
                     })
                     .collect(),
-            )
-            .await
+            ))
+            .await?;
+        Ok(())
     }
 }
 
@@ -118,76 +137,88 @@ impl ConsensusNetworkSender {
 mod tests {
     use super::*;
     use crate::{
-        interface::NetworkNotification,
-        proto::VoteMsg,
+        peer_manager::{self, conn_status_channel, PeerManagerNotification, PeerManagerRequest},
         protocols::{direct_send::Message, rpc::InboundRpcRequest},
         utils::MessageExt,
         validator_network::Event,
     };
-    use futures::{
-        channel::oneshot, executor::block_on, future::try_join, sink::SinkExt, stream::StreamExt,
-    };
+    use channel::{libra_channel, message_queues::QueueStyle};
+    use futures::{channel::oneshot, executor::block_on, future::try_join, stream::StreamExt};
+    use parity_multiaddr::Multiaddr;
     use prost::Message as _;
-
-    fn new_test_vote() -> ConsensusMsg {
-        let mut vote_msg = VoteMsg::default();
-        vote_msg.bytes = vec![];
-
-        ConsensusMsg {
-            message: Some(ConsensusMsg_oneof::VoteMsg(vote_msg)),
-        }
-    }
+    use std::num::NonZeroUsize;
 
     // Direct send messages should get deserialized through the
     // `ConsensusNetworkEvents` stream.
     #[test]
     fn test_consensus_network_events() {
-        let (mut consensus_tx, consensus_rx) = channel::new_test(8);
-        let mut stream = ConsensusNetworkEvents::new(consensus_rx);
+        let (mut control_notifs_tx, control_notifs_rx) = conn_status_channel::new();
+        let (mut consensus_tx, consensus_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let mut stream = ConsensusNetworkEvents::new(consensus_rx, control_notifs_rx);
 
+        let consensus_msg = ConsensusMsg::default();
         let peer_id = PeerId::random();
-        let consensus_msg = new_test_vote();
         let network_msg = Message {
             protocol: ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL),
             mdata: consensus_msg.clone().to_bytes().unwrap(),
         };
 
         // Network sends inbound message to consensus
-        block_on(consensus_tx.send(NetworkNotification::RecvMessage(peer_id, network_msg)))
+        consensus_tx
+            .push(
+                (
+                    peer_id,
+                    ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL),
+                ),
+                PeerManagerNotification::RecvMessage(peer_id, network_msg),
+            )
             .unwrap();
 
         // Consensus should receive deserialized message event
         let event = block_on(stream.next()).unwrap().unwrap();
         assert_eq!(event, Event::Message((peer_id, consensus_msg)));
 
-        // Network notifies consensus about new peer
-        block_on(consensus_tx.send(NetworkNotification::NewPeer(peer_id))).unwrap();
-
-        // Consensus should receive notification
-        let event = block_on(stream.next()).unwrap().unwrap();
-        assert_eq!(event, Event::NewPeer(peer_id));
+        let f = async {
+            // Network notifies consensus about new peer.
+            control_notifs_tx
+                .push(
+                    peer_id,
+                    peer_manager::ConnectionStatusNotification::NewPeer(
+                        peer_id,
+                        Multiaddr::empty(),
+                    ),
+                )
+                .unwrap();
+            // Consensus should receive notification.
+            let event = stream.next().await.unwrap().unwrap();
+            assert_eq!(event, Event::NewPeer(peer_id));
+        };
+        block_on(f);
     }
 
     // `ConsensusNetworkSender` should serialize outbound messages
     #[test]
     fn test_consensus_network_sender() {
-        let (network_reqs_tx, mut network_reqs_rx) = channel::new_test(8);
-        let mut sender = ConsensusNetworkSender::new(network_reqs_tx);
+        let (network_reqs_tx, mut network_reqs_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (conn_mgr_reqs_tx, _conn_mgr_reqs_rx) = channel::new_test(8);
+        let mut sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
 
+        let consensus_msg = ConsensusMsg::default();
         let peer_id = PeerId::random();
-        let consensus_msg = new_test_vote();
         let expected_network_msg = Message {
             protocol: ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL),
             mdata: consensus_msg.clone().to_bytes().unwrap(),
         };
 
         // Send the message to network layer
-        block_on(sender.send_to(peer_id, consensus_msg)).unwrap();
+        sender.send_to(peer_id, consensus_msg).unwrap();
 
         // Network layer should receive serialized message to send out
         let event = block_on(network_reqs_rx.next()).unwrap();
         match event {
-            NetworkRequest::SendMessage(recv_peer_id, network_msg) => {
+            PeerManagerRequest::SendMessage(recv_peer_id, network_msg) => {
                 assert_eq!(recv_peer_id, peer_id);
                 assert_eq!(network_msg, expected_network_msg);
             }
@@ -198,70 +229,66 @@ mod tests {
     // `ConsensusNetworkEvents` should deserialize inbound RPC requests
     #[test]
     fn test_consensus_inbound_rpc() {
-        let (mut consensus_tx, consensus_rx) = channel::new_test(8);
-        let mut stream = ConsensusNetworkEvents::new(consensus_rx);
+        let (_, control_notifs_rx) = conn_status_channel::new();
+        let (mut consensus_tx, consensus_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let mut stream = ConsensusNetworkEvents::new(consensus_rx, control_notifs_rx);
 
         // build rpc request
-        let req_msg = RequestBlock::default();
-        let req_msg_enum = ConsensusMsg {
-            message: Some(ConsensusMsg_oneof::RequestBlock(req_msg)),
-        };
-        let req_data = req_msg_enum.clone().to_bytes().unwrap();
-
         let (res_tx, _) = oneshot::channel();
         let rpc_req = InboundRpcRequest {
             protocol: ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL),
-            data: req_data,
+            data: ConsensusMsg::default().to_bytes().unwrap(),
             res_tx,
         };
 
         // mock receiving rpc request
         let peer_id = PeerId::random();
-        let event = NetworkNotification::RecvRpc(peer_id, rpc_req);
-        block_on(consensus_tx.send(event)).unwrap();
+        let event = PeerManagerNotification::RecvRpc(peer_id, rpc_req);
+        consensus_tx
+            .push(
+                (peer_id, ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL)),
+                event,
+            )
+            .unwrap();
 
         // request should be properly deserialized
         let (res_tx, _) = oneshot::channel();
-        let expected_event = Event::RpcRequest((peer_id, req_msg_enum, res_tx));
+        let expected_event = Event::RpcRequest((peer_id, ConsensusMsg::default(), res_tx));
         let event = block_on(stream.next()).unwrap().unwrap();
         assert_eq!(event, expected_event);
     }
 
-    // When consensus sends an rpc request, network should get a `NetworkRequest::SendRpc`
+    // When consensus sends an rpc request, network should get a `PeerManagerRequest::SendRpc`
     // with the serialized request.
     #[test]
     fn test_consensus_outbound_rpc() {
-        let (network_reqs_tx, mut network_reqs_rx) = channel::new_test(8);
-        let mut sender = ConsensusNetworkSender::new(network_reqs_tx);
+        let (network_reqs_tx, mut network_reqs_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (conn_mgr_reqs_tx, _conn_mgr_reqs_rx) = channel::new_test(8);
+        let mut sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
 
         // send get_block rpc request
         let peer_id = PeerId::random();
-        let req_msg = RequestBlock::default();
-        let f_res_msg = sender.request_block(peer_id, req_msg.clone(), Duration::from_secs(5));
+        let req_msg = ConsensusMsg::default();
+        let f_res_msg = sender.send_rpc(peer_id, req_msg, Duration::from_secs(5));
 
         // build rpc response
-        let res_msg = RespondBlock::default();
-        let res_msg_enum = ConsensusMsg {
-            message: Some(ConsensusMsg_oneof::RespondBlock(res_msg.clone())),
-        };
-        let res_data = res_msg_enum.to_bytes().unwrap();
+        let res_msg = ConsensusMsg::default().to_bytes().unwrap();
 
         // the future response
         let f_recv = async move {
             match network_reqs_rx.next().await.unwrap() {
-                NetworkRequest::SendRpc(recv_peer_id, req) => {
+                PeerManagerRequest::SendRpc(recv_peer_id, req) => {
                     assert_eq!(recv_peer_id, peer_id);
                     assert_eq!(req.protocol.as_ref(), CONSENSUS_RPC_PROTOCOL);
 
                     // check request deserializes
                     let req_msg_enum = ConsensusMsg::decode(req.data.as_ref()).unwrap();
-                    assert_eq!(
-                        req_msg_enum.message,
-                        Some(ConsensusMsg_oneof::RequestBlock(req_msg))
-                    );
+                    assert_eq!(req_msg_enum, ConsensusMsg::default());
 
                     // remote replies with some response message
-                    req.res_tx.send(Ok(res_data)).unwrap();
+                    req.res_tx.send(Ok(res_msg)).unwrap();
                     Ok(())
                 }
                 event => panic!("Unexpected event: {:?}", event),
@@ -269,6 +296,6 @@ mod tests {
         };
 
         let (recv_res_msg, _) = block_on(try_join(f_res_msg, f_recv)).unwrap();
-        assert_eq!(recv_res_msg, res_msg);
+        assert_eq!(recv_res_msg, ConsensusMsg::default());
     }
 }

@@ -4,14 +4,17 @@
 use crate::{BuildSwarm, Error};
 use anyhow::{ensure, Result};
 use libra_config::{
-    config::{NodeConfig, SeedPeersConfig},
+    config::{
+        ConsensusType, NodeConfig, RemoteService, SafetyRulesBackend, SafetyRulesService,
+        SeedPeersConfig, VaultConfig,
+    },
     generator,
 };
 use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
 use libra_types::transaction::Transaction;
 use parity_multiaddr::Multiaddr;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 use vm_genesis;
 
 const DEFAULT_SEED: [u8; 32] = [13u8; 32];
@@ -24,6 +27,10 @@ pub struct ValidatorConfig {
     index: usize,
     listen: Multiaddr,
     nodes: usize,
+    safety_rules_addr: Option<SocketAddr>,
+    safety_rules_backend: Option<String>,
+    safety_rules_host: Option<String>,
+    safety_rules_token: Option<String>,
     seed: [u8; 32],
     template: NodeConfig,
 }
@@ -36,6 +43,10 @@ impl Default for ValidatorConfig {
             index: 0,
             listen: DEFAULT_LISTEN.parse::<Multiaddr>().unwrap(),
             nodes: 1,
+            safety_rules_addr: None,
+            safety_rules_backend: None,
+            safety_rules_host: None,
+            safety_rules_token: None,
             seed: DEFAULT_SEED,
             template: NodeConfig::default(),
         }
@@ -72,6 +83,26 @@ impl ValidatorConfig {
         self
     }
 
+    pub fn safety_rules_addr(&mut self, safety_rules_addr: Option<SocketAddr>) -> &mut Self {
+        self.safety_rules_addr = safety_rules_addr;
+        self
+    }
+
+    pub fn safety_rules_backend(&mut self, safety_rules_backend: Option<String>) -> &mut Self {
+        self.safety_rules_backend = safety_rules_backend;
+        self
+    }
+
+    pub fn safety_rules_host(&mut self, safety_rules_host: Option<String>) -> &mut Self {
+        self.safety_rules_host = safety_rules_host;
+        self
+    }
+
+    pub fn safety_rules_token(&mut self, safety_rules_token: Option<String>) -> &mut Self {
+        self.safety_rules_token = safety_rules_token;
+        self
+    }
+
     pub fn seed(&mut self, seed: [u8; 32]) -> &mut Self {
         self.seed = seed;
         self
@@ -102,6 +133,8 @@ impl ValidatorConfig {
         seed_peers.insert(first_peer_id, vec![self.bootstrap.clone()]);
         let seed_peers_config = SeedPeersConfig { seed_peers };
         validator_network.seed_peers = seed_peers_config;
+
+        self.build_safety_rules(&mut config)?;
 
         Ok(config)
     }
@@ -162,6 +195,39 @@ impl ValidatorConfig {
         let faucet_key = Ed25519PrivateKey::generate_for_testing(&mut faucet_rng);
         let config_seed: [u8; 32] = faucet_rng.gen();
         (faucet_key, config_seed)
+    }
+
+    fn build_safety_rules(&self, config: &mut NodeConfig) -> Result<()> {
+        let safety_rules_config = &mut config.consensus.safety_rules;
+        if let Some(server_address) = self.safety_rules_addr {
+            safety_rules_config.service = SafetyRulesService::Process(RemoteService {
+                server_address,
+                consensus_type: ConsensusType::SignedTransactions,
+            })
+        }
+
+        if let Some(backend) = &self.safety_rules_backend {
+            safety_rules_config.backend = match backend.as_str() {
+                "in-memory" => SafetyRulesBackend::InMemoryStorage,
+                "on-disk" => safety_rules_config.backend.clone(),
+                "vault" => SafetyRulesBackend::Vault(VaultConfig {
+                    default: true,
+                    server: self
+                        .safety_rules_host
+                        .as_ref()
+                        .ok_or_else(|| Error::MissingSafetyRulesHost)?
+                        .clone(),
+                    token: self
+                        .safety_rules_token
+                        .as_ref()
+                        .ok_or_else(|| Error::MissingSafetyRulesToken)?
+                        .clone(),
+                }),
+                _ => return Err(Error::InvalidSafetyRulesBackend(backend.to_string()).into()),
+            };
+        }
+
+        Ok(())
     }
 }
 

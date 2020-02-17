@@ -19,6 +19,7 @@ use libra_logger::prelude::*;
 use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
+    account_config::core_code_address,
     byte_array::ByteArray,
     contract_event::ContractEvent,
     event::EventKey,
@@ -44,9 +45,10 @@ use vm::{
     transaction_metadata::TransactionMetadata,
 };
 use vm_runtime_types::{
-    loaded_data::struct_def::StructDef,
+    loaded_data::{struct_def::StructDef, types::Type},
     native_functions::dispatch::resolve_native_function,
-    value::{IntegerValue, Locals, ReferenceValue, Struct, Value},
+    type_context::TypeContext,
+    values::{IntegerValue, Locals, Reference, Struct, StructRef, VMValueCast, Value},
 };
 
 fn derive_type_tag(
@@ -220,7 +222,7 @@ impl<'txn> Interpreter<'txn> {
         for (i, value) in args.into_iter().enumerate() {
             locals.store_loc(i, value)?;
         }
-        let mut current_frame = Frame::new(function, vec![], locals);
+        let mut current_frame = Frame::new(function, vec![], vec![], locals);
         loop {
             let code = current_frame.code_definition();
             let exit_code = self
@@ -239,7 +241,7 @@ impl<'txn> Interpreter<'txn> {
                     }
                 }
                 ExitCode::Call(idx, type_actuals_idx) => {
-                    let type_actuals = &current_frame
+                    let type_actuals_sig = &current_frame
                         .module()
                         .locals_signature_at(type_actuals_idx)
                         .0;
@@ -247,15 +249,27 @@ impl<'txn> Interpreter<'txn> {
                         instr: context,
                         self,
                         Opcodes::CALL,
-                        AbstractMemorySize::new((type_actuals.len() + 1) as GasCarrier)
+                        AbstractMemorySize::new((type_actuals_sig.len() + 1) as GasCarrier)
                     )?;
-                    let type_actual_tags = type_actuals
+                    let type_actual_tags = type_actuals_sig
                         .iter()
                         .map(|ty| {
                             derive_type_tag(
                                 current_frame.module(),
                                 current_frame.type_actual_tags(),
                                 ty,
+                            )
+                        })
+                        .collect::<VMResult<Vec<_>>>()?;
+                    let type_context = TypeContext::new(current_frame.type_actuals().to_vec());
+                    let type_actuals = type_actuals_sig
+                        .iter()
+                        .map(|ty| {
+                            runtime.resolve_signature_token(
+                                current_frame.module(),
+                                ty,
+                                &type_context,
+                                context,
                             )
                         })
                         .collect::<VMResult<Vec<_>>>()?;
@@ -267,6 +281,7 @@ impl<'txn> Interpreter<'txn> {
                             current_frame.module(),
                             idx,
                             type_actual_tags,
+                            type_actuals,
                         )
                         .or_else(|err| Err(self.maybe_core_dump(err, &current_frame)))?;
                     if let Some(frame) = opt_frame {
@@ -392,7 +407,7 @@ impl<'txn> Interpreter<'txn> {
                         };
                         gas!(const_instr: context, self, opcode)?;
                         let field_offset = frame.module().get_field_offset(*fd_idx)?;
-                        let reference = self.operand_stack.pop_as::<ReferenceValue>()?;
+                        let reference = self.operand_stack.pop_as::<StructRef>()?;
                         let field_ref = reference.borrow_field(field_offset as usize)?;
                         self.operand_stack.push(field_ref)?;
                     }
@@ -402,10 +417,11 @@ impl<'txn> Interpreter<'txn> {
                         let args = self.operand_stack.popn(field_count)?;
                         let size = args.iter().fold(
                             AbstractMemorySize::new(GasCarrier::from(field_count)),
-                            |acc, arg| acc.add(arg.size()),
+                            |acc, v| acc.add(v.size()),
                         );
                         gas!(instr: context, self, Opcodes::PACK, size)?;
-                        self.operand_stack.push(Value::struct_(Struct::new(args)))?;
+                        self.operand_stack
+                            .push(Value::struct_(Struct::pack(args)))?;
                     }
                     Bytecode::Unpack(sd_idx, _) => {
                         let struct_def = frame.module().struct_def_at(*sd_idx);
@@ -420,23 +436,22 @@ impl<'txn> Interpreter<'txn> {
                         // TODO: Whether or not we want this gas metering in the loop is
                         // questionable.  However, if we don't have it in the loop we could wind up
                         // doing a fair bit of work before charging for it.
-                        for idx in 0..field_count {
-                            let value = struct_.get_field_value(idx as usize)?;
+                        for value in struct_.unpack()? {
                             gas!(instr: context, self, Opcodes::UNPACK, value.size())?;
                             self.operand_stack.push(value)?;
                         }
                     }
                     Bytecode::ReadRef => {
-                        let reference = self.operand_stack.pop_as::<ReferenceValue>()?;
+                        let reference = self.operand_stack.pop_as::<Reference>()?;
                         let value = reference.read_ref()?;
                         gas!(instr: context, self, Opcodes::READ_REF, value.size())?;
                         self.operand_stack.push(value)?;
                     }
                     Bytecode::WriteRef => {
-                        let reference = self.operand_stack.pop_as::<ReferenceValue>()?;
+                        let reference = self.operand_stack.pop_as::<Reference>()?;
                         let value = self.operand_stack.pop()?;
                         gas!(instr: context, self, Opcodes::WRITE_REF, value.size())?;
-                        reference.write_ref(value);
+                        reference.write_ref(value)?;
                     }
                     Bytecode::CastU8 => {
                         gas!(const_instr: context, self, Opcodes::CAST_U8)?;
@@ -549,60 +564,64 @@ impl<'txn> Interpreter<'txn> {
                             Opcodes::NEQ,
                             lhs.size().add(rhs.size())
                         )?;
-                        self.operand_stack
-                            .push(Value::bool(lhs.not_equals(&rhs)?))?;
+                        self.operand_stack.push(Value::bool(!lhs.equals(&rhs)?))?;
                     }
                     Bytecode::GetTxnSenderAddress => {
                         gas!(const_instr: context, self, Opcodes::GET_TXN_SENDER)?;
                         self.operand_stack
                             .push(Value::address(self.txn_data.sender()))?;
                     }
-                    Bytecode::MutBorrowGlobal(idx, _) | Bytecode::ImmBorrowGlobal(idx, _) => {
+                    Bytecode::MutBorrowGlobal(idx, type_actuals_idx)
+                    | Bytecode::ImmBorrowGlobal(idx, type_actuals_idx) => {
                         let addr = self.operand_stack.pop_as::<AccountAddress>()?;
                         let size = self.global_data_op(
                             runtime,
                             context,
                             addr,
                             *idx,
-                            frame.module(),
+                            *type_actuals_idx,
+                            frame,
                             Self::borrow_global,
                         )?;
                         gas!(instr: context, self, Opcodes::MUT_BORROW_GLOBAL, size)?;
                     }
-                    Bytecode::Exists(idx, _) => {
+                    Bytecode::Exists(idx, type_actuals_idx) => {
                         let addr = self.operand_stack.pop_as::<AccountAddress>()?;
                         let size = self.global_data_op(
                             runtime,
                             context,
                             addr,
                             *idx,
-                            frame.module(),
+                            *type_actuals_idx,
+                            frame,
                             Self::exists,
                         )?;
                         gas!(instr: context, self, Opcodes::EXISTS, size)?;
                     }
-                    Bytecode::MoveFrom(idx, _) => {
+                    Bytecode::MoveFrom(idx, type_actuals_idx) => {
                         let addr = self.operand_stack.pop_as::<AccountAddress>()?;
                         let size = self.global_data_op(
                             runtime,
                             context,
                             addr,
                             *idx,
-                            frame.module(),
+                            *type_actuals_idx,
+                            frame,
                             Self::move_from,
                         )?;
                         // TODO: Have this calculate before pulling in the data based upon
                         // the size of the data that we are about to read in.
                         gas!(instr: context, self, Opcodes::MOVE_FROM, size)?;
                     }
-                    Bytecode::MoveToSender(idx, _) => {
+                    Bytecode::MoveToSender(idx, type_actuals_idx) => {
                         let addr = self.txn_data.sender();
                         let size = self.global_data_op(
                             runtime,
                             context,
                             addr,
                             *idx,
-                            frame.module(),
+                            *type_actuals_idx,
+                            frame,
                             Self::move_to_sender,
                         )?;
                         gas!(instr: context, self, Opcodes::MOVE_TO, size)?;
@@ -656,10 +675,11 @@ impl<'txn> Interpreter<'txn> {
         module: &LoadedModule,
         idx: FunctionHandleIndex,
         type_actual_tags: Vec<TypeTag>,
+        type_actuals: Vec<Type>,
     ) -> VMResult<Option<Frame<'txn, FunctionRef<'txn>>>> {
         let func = runtime.resolve_function_ref(module, idx, context)?;
         if func.is_native() {
-            self.call_native(runtime, context, func, type_actual_tags)?;
+            self.call_native(runtime, context, func, type_actual_tags, type_actuals)?;
             Ok(None)
         } else {
             let mut locals = Locals::new(func.local_count());
@@ -667,7 +687,12 @@ impl<'txn> Interpreter<'txn> {
             for i in 0..arg_count {
                 locals.store_loc(arg_count - i - 1, self.operand_stack.pop()?)?;
             }
-            Ok(Some(Frame::new(func, type_actual_tags, locals)))
+            Ok(Some(Frame::new(
+                func,
+                type_actual_tags,
+                type_actuals,
+                locals,
+            )))
         }
     }
 
@@ -678,6 +703,7 @@ impl<'txn> Interpreter<'txn> {
         context: &mut dyn InterpreterContext,
         function: FunctionRef<'txn>,
         type_actual_tags: Vec<TypeTag>,
+        type_actuals: Vec<Type>,
     ) -> VMResult<()> {
         let module = function.module();
         let module_id = module.self_id();
@@ -685,7 +711,7 @@ impl<'txn> Interpreter<'txn> {
         let native_function = resolve_native_function(&module_id, function_name)
             .ok_or_else(|| VMStatus::new(StatusCode::LINKER_ERROR))?;
         if module_id == *ACCOUNT_MODULE && function_name == EMIT_EVENT_NAME.as_ident_str() {
-            self.call_emit_event(context, type_actual_tags)
+            self.call_emit_event(context, type_actual_tags, type_actuals)
         } else if module_id == *ACCOUNT_MODULE && function_name == SAVE_ACCOUNT_NAME.as_ident_str()
         {
             self.call_save_account(runtime, context)
@@ -703,7 +729,8 @@ impl<'txn> Interpreter<'txn> {
             for _ in 0..expected_args {
                 arguments.push_front(self.operand_stack.pop()?);
             }
-            let result = (native_function.dispatch)(arguments, self.gas_schedule)?;
+            let result =
+                (native_function.dispatch)(type_actual_tags, arguments, self.gas_schedule)?;
             gas!(consume: context, result.cost)?;
             result.result.and_then(|values| {
                 for value in values {
@@ -719,6 +746,7 @@ impl<'txn> Interpreter<'txn> {
         &mut self,
         context: &mut dyn InterpreterContext,
         mut type_actual_tags: Vec<TypeTag>,
+        mut type_actuals: Vec<Type>,
     ) -> VMResult<()> {
         if type_actual_tags.len() != 1 {
             return Err(
@@ -728,12 +756,23 @@ impl<'txn> Interpreter<'txn> {
                 )),
             );
         }
+
+        if type_actuals.len() != 1 {
+            return Err(
+                VMStatus::new(StatusCode::VERIFIER_INVARIANT_VIOLATION).with_message(format!(
+                    "write_to_event_storage expects 1 argument got {}.",
+                    type_actuals.len()
+                )),
+            );
+        }
+
         let type_tag = type_actual_tags.pop().unwrap();
+        let layout = type_actuals.pop().unwrap();
 
         let msg = self
             .operand_stack
             .pop()?
-            .simple_serialize()
+            .simple_serialize(&layout)
             .ok_or_else(|| VMStatus::new(StatusCode::DATA_FORMAT_ERROR))?;
         let count = self.operand_stack.pop_as::<u64>()?;
         let key = self.operand_stack.pop_as::<ByteArray>()?;
@@ -752,13 +791,16 @@ impl<'txn> Interpreter<'txn> {
         let account_module = runtime.get_loaded_module(&ACCOUNT_MODULE, context)?;
         let account_resource = self.operand_stack.pop_as::<Struct>()?;
         let address = self.operand_stack.pop_as::<AccountAddress>()?;
+        if address == core_code_address() {
+            return Err(VMStatus::new(StatusCode::CREATE_NULL_ACCOUNT));
+        }
         self.save_account(runtime, context, account_module, address, account_resource)
     }
 
     /// Perform a binary operation to two values at the top of the stack.
     fn binop<F, T>(&mut self, f: F) -> VMResult<()>
     where
-        VMResult<T>: From<Value>,
+        Value: VMValueCast<T>,
         F: FnOnce(T, T) -> VMResult<Value>,
     {
         let rhs = self.operand_stack.pop_as::<T>()?;
@@ -784,7 +826,7 @@ impl<'txn> Interpreter<'txn> {
     /// Perform a binary operation for boolean values.
     fn binop_bool<F, T>(&mut self, f: F) -> VMResult<()>
     where
-        VMResult<T>: From<Value>,
+        Value: VMValueCast<T>,
         F: FnOnce(T, T) -> VMResult<bool>,
     {
         self.binop(|lhs, rhs| Ok(Value::bool(f(lhs, rhs)?)))
@@ -800,7 +842,8 @@ impl<'txn> Interpreter<'txn> {
         context: &mut dyn InterpreterContext,
         address: AccountAddress,
         idx: StructDefinitionIndex,
-        module: &LoadedModule,
+        type_actuals_idx: LocalsSignatureIndex,
+        frame: &Frame<'txn, FunctionRef<'txn>>,
         op: F,
     ) -> VMResult<AbstractMemorySize<GasCarrier>>
     where
@@ -811,8 +854,20 @@ impl<'txn> Interpreter<'txn> {
             StructDef,
         ) -> VMResult<AbstractMemorySize<GasCarrier>>,
     {
-        let ap = Self::make_access_path(module, idx, address);
-        let struct_def = runtime.resolve_struct_def(module, idx, context)?;
+        let module = frame.module();
+        let type_actuals_sig = &frame.module().locals_signature_at(type_actuals_idx).0;
+        let type_actual_tags = type_actuals_sig
+            .iter()
+            .map(|ty| derive_type_tag(frame.module(), frame.type_actual_tags(), ty))
+            .collect::<VMResult<Vec<_>>>()?;
+        let type_context = TypeContext::new(frame.type_actuals().to_vec());
+        let type_actuals = type_actuals_sig
+            .iter()
+            .map(|ty| runtime.resolve_signature_token(frame.module(), ty, &type_context, context))
+            .collect::<VMResult<Vec<_>>>()?;
+
+        let ap = Self::make_access_path(module, idx, type_actual_tags, address);
+        let struct_def = runtime.resolve_struct_def(module, idx, type_actuals, context)?;
         op(self, context, ap, struct_def)
     }
 
@@ -823,9 +878,9 @@ impl<'txn> Interpreter<'txn> {
         ap: AccessPath,
         struct_def: StructDef,
     ) -> VMResult<AbstractMemorySize<GasCarrier>> {
-        let global_ref = context.borrow_global(&ap, struct_def)?;
-        let size = global_ref.size();
-        self.operand_stack.push(Value::global_ref(global_ref))?;
+        let g = context.borrow_global(&ap, struct_def)?;
+        let size = g.size();
+        self.operand_stack.push(g.borrow_global()?)?;
         Ok(size)
     }
 
@@ -871,9 +926,10 @@ impl<'txn> Interpreter<'txn> {
     fn make_access_path(
         module: &impl ModuleAccess,
         idx: StructDefinitionIndex,
+        type_actual_tags: Vec<TypeTag>,
         address: AccountAddress,
     ) -> AccessPath {
-        let struct_tag = resource_storage_key(module, idx);
+        let struct_tag = resource_storage_key(module, idx, type_actual_tags);
         create_access_path(&address, struct_tag)
     }
 
@@ -896,10 +952,10 @@ impl<'txn> Interpreter<'txn> {
             .get(&*ACCOUNT_STRUCT_NAME)
             .ok_or_else(|| VMStatus::new(StatusCode::LINKER_ERROR))?;
         let account_struct_def =
-            runtime.resolve_struct_def(account_module, *account_struct_id, context)?;
+            runtime.resolve_struct_def(account_module, *account_struct_id, vec![], context)?;
 
         // TODO: Adding the freshly created account's expiration date to the TransactionOutput here.
-        let account_path = Self::make_access_path(account_module, *account_struct_id, addr);
+        let account_path = Self::make_access_path(account_module, *account_struct_id, vec![], addr);
         context.move_resource_to(&account_path, account_struct_def, account_resource)
     }
 
@@ -910,14 +966,22 @@ impl<'txn> Interpreter<'txn> {
     /// Given an `VMStatus` generate a core dump if the error is an `InvariantViolation`.
     fn maybe_core_dump(
         &self,
-        err: VMStatus,
+        mut err: VMStatus,
         current_frame: &Frame<'txn, FunctionRef<'txn>>,
     ) -> VMStatus {
+        // a verification error cannot happen at runtime so change it into an invariant violation.
+        if err.status_type() == StatusType::Verification {
+            crit!("Verification error during runtime: {:?}", err);
+            let mut new_err = VMStatus::new(StatusCode::VERIFICATION_ERROR);
+            new_err.message = err.message;
+            err = new_err;
+        }
         if err.is(StatusType::InvariantViolation) {
+            let state = self.get_internal_state(current_frame);
             crit!(
                 "Error: {:?}\nCORE DUMP: >>>>>>>>>>>>\n{}\n<<<<<<<<<<<<\n",
                 err,
-                self.get_internal_state(current_frame),
+                state,
             );
         }
         err
@@ -961,11 +1025,10 @@ impl<'txn> Interpreter<'txn> {
             }
             internal_state.push_str(format!("{}* {:?}\n", i, code[pc]).as_str());
         }
-        internal_state
-            .push_str(format!("Locals:\n{}", current_frame.locals.pretty_string()).as_str());
+        internal_state.push_str(format!("Locals:\n{}", current_frame.locals).as_str());
         internal_state.push_str("Operand Stack:\n");
         for value in &self.operand_stack.0 {
-            internal_state.push_str(format!("{}\n", value.pretty_string()).as_str());
+            internal_state.push_str(format!("{}\n", value).as_str());
         }
         internal_state
     }
@@ -1012,7 +1075,7 @@ impl Stack {
     /// type or if the stack is empty.
     fn pop_as<T>(&mut self) -> VMResult<T>
     where
-        VMResult<T>: From<Value>,
+        Value: VMValueCast<T>,
     {
         self.pop()?.value_as()
     }
@@ -1066,6 +1129,7 @@ struct Frame<'txn, F: 'txn> {
     locals: Locals,
     function: F,
     type_actual_tags: Vec<TypeTag>,
+    type_actuals: Vec<Type>,
     phantom: PhantomData<&'txn F>,
 }
 
@@ -1085,12 +1149,18 @@ where
     /// Create a new `Frame` given a `FunctionReference` and the function `Locals`.
     ///
     /// The locals must be loaded before calling this.
-    fn new(function: F, type_actual_tags: Vec<TypeTag>, locals: Locals) -> Self {
+    fn new(
+        function: F,
+        type_actual_tags: Vec<TypeTag>,
+        type_actuals: Vec<Type>,
+        locals: Locals,
+    ) -> Self {
         Frame {
             pc: 0,
             locals,
             function,
             type_actual_tags,
+            type_actuals,
             phantom: PhantomData,
         }
     }
@@ -1132,6 +1202,10 @@ where
     fn type_actual_tags(&self) -> &[TypeTag] {
         &self.type_actual_tags
     }
+
+    fn type_actuals(&self) -> &[Type] {
+        &self.type_actuals
+    }
 }
 
 //
@@ -1168,11 +1242,21 @@ impl<'txn> InterpreterForCostSynthesis<'txn> {
             .expect("call stack must not be empty");
     }
 
-    pub fn push_frame(&mut self, func: FunctionRef<'txn>, type_actual_tags: Vec<TypeTag>) {
+    pub fn push_frame(
+        &mut self,
+        func: FunctionRef<'txn>,
+        type_actual_tags: Vec<TypeTag>,
+        type_actuals: Vec<Type>,
+    ) {
         let count = func.local_count();
         self.interpreter
             .call_stack
-            .push(Frame::new(func, type_actual_tags, Locals::new(count)))
+            .push(Frame::new(
+                func,
+                type_actual_tags,
+                type_actuals,
+                Locals::new(count),
+            ))
             .expect("Call stack limit reached");
     }
 

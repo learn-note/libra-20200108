@@ -8,6 +8,7 @@ use futures::stream::BoxStream;
 use libra_crypto::{ed25519::*, HashValue};
 use libra_types::{
     account_address::{AccountAddress, ADDRESS_LENGTH},
+    account_state::AccountState,
     account_state_blob::AccountStateBlob,
     crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof},
     event::EventHandle,
@@ -28,9 +29,12 @@ use rand::{
     rngs::{OsRng, StdRng},
     Rng, SeedableRng,
 };
-use std::{collections::BTreeMap, convert::TryFrom};
+use std::convert::TryFrom;
 use storage_client::StorageRead;
-use storage_proto::{BackupAccountStateResponse, StartupInfo};
+use storage_proto::{
+    BackupAccountStateResponse, BackupTransactionInfoResponse, BackupTransactionResponse,
+    StartupInfo,
+};
 
 /// This is a mock of the storage read client used in tests.
 ///
@@ -41,7 +45,7 @@ pub struct MockStorageReadClient;
 
 #[async_trait::async_trait]
 impl StorageRead for MockStorageReadClient {
-    async fn update_to_latest_ledger_async(
+    async fn update_to_latest_ledger(
         &self,
         client_known_version: Version,
         request_items: Vec<RequestItem>,
@@ -69,7 +73,7 @@ impl StorageRead for MockStorageReadClient {
         Ok(ret)
     }
 
-    async fn get_transactions_async(
+    async fn get_transactions(
         &self,
         _start_version: Version,
         _batch_size: u64,
@@ -79,18 +83,18 @@ impl StorageRead for MockStorageReadClient {
         unimplemented!()
     }
 
-    async fn get_latest_state_root_async(&self) -> Result<(Version, HashValue)> {
+    async fn get_latest_state_root(&self) -> Result<(Version, HashValue)> {
         unimplemented!()
     }
 
-    async fn get_latest_account_state_async(
+    async fn get_latest_account_state(
         &self,
         _address: AccountAddress,
     ) -> Result<Option<AccountStateBlob>> {
         Ok(Some(get_mock_account_state_blob()))
     }
 
-    async fn get_account_state_with_proof_by_version_async(
+    async fn get_account_state_with_proof_by_version(
         &self,
         _address: AccountAddress,
         _version: Version,
@@ -98,11 +102,11 @@ impl StorageRead for MockStorageReadClient {
         unimplemented!();
     }
 
-    async fn get_startup_info_async(&self) -> Result<Option<StartupInfo>> {
+    async fn get_startup_info(&self) -> Result<Option<StartupInfo>> {
         unimplemented!()
     }
 
-    async fn get_epoch_change_ledger_infos_async(
+    async fn get_epoch_change_ledger_infos(
         &self,
         _start_epoch: u64,
         _end_epoch: u64,
@@ -122,6 +126,22 @@ impl StorageRead for MockStorageReadClient {
         _rightmost_key: HashValue,
         _version: Version,
     ) -> Result<SparseMerkleRangeProof> {
+        unimplemented!()
+    }
+
+    async fn backup_transaction(
+        &self,
+        _start_version: Version,
+        _num_transactions: u64,
+    ) -> Result<BoxStream<'_, Result<BackupTransactionResponse, Error>>> {
+        unimplemented!()
+    }
+
+    async fn backup_transaction_info(
+        &self,
+        _start_version: Version,
+        _num_transaction_infos: u64,
+    ) -> Result<BoxStream<'_, Result<BackupTransactionInfoResponse, Error>>> {
         unimplemented!()
     }
 }
@@ -214,13 +234,13 @@ fn get_mock_account_state_blob() -> AccountStateBlob {
         0,
     );
 
-    let mut version_data = BTreeMap::new();
-    version_data.insert(
-        libra_types::account_config::account_resource_path(),
+    let mut account_state = AccountState::default();
+    account_state.insert(
+        libra_types::account_config::ACCOUNT_RESOURCE_PATH.to_vec(),
         lcs::to_bytes(&account_resource).unwrap(),
     );
 
-    AccountStateBlob::from(lcs::to_bytes(&version_data).unwrap())
+    AccountStateBlob::try_from(&account_state).unwrap()
 }
 
 fn get_mock_txn_data(
@@ -237,7 +257,7 @@ fn get_mock_txn_data(
         let txn = Transaction::UserTransaction(get_test_signed_txn(
             address,
             i,
-            priv_key.clone(),
+            &priv_key,
             pub_key.clone(),
             None,
         ));

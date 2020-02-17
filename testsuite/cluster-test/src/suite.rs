@@ -5,7 +5,7 @@
 use std::cmp::min;
 use std::env;
 
-use crate::experiments::ExperimentParam;
+use crate::experiments::{CpuFlamegraphParams, ExperimentParam};
 use crate::{
     cluster::Cluster,
     experiments::{
@@ -37,21 +37,16 @@ impl ExperimentSuite {
             experiments.push(b);
         }
         experiments.push(Box::new(
-            PerformanceBenchmarkNodesDownParams {
-                num_nodes_down: 0,
-                is_fullnode: false,
-            }
-            .build(cluster),
+            PerformanceBenchmarkNodesDownParams::new_nodes_down(0).build(cluster),
         ));
         experiments.push(Box::new(
-            PerformanceBenchmarkNodesDownParams {
-                num_nodes_down: 10,
-                is_fullnode: false,
-            }
-            .build(cluster),
+            PerformanceBenchmarkNodesDownParams::new_nodes_down(10).build(cluster),
         ));
         experiments.push(Box::new(
             PerformanceBenchmarkThreeRegionSimulationParams {}.build(cluster),
+        ));
+        experiments.push(Box::new(
+            CpuFlamegraphParams { duration_secs: 60 }.build(cluster),
         ));
         Self { experiments }
     }
@@ -59,18 +54,10 @@ impl ExperimentSuite {
     pub fn new_perf_suite(cluster: &Cluster) -> Self {
         let mut experiments: Vec<Box<dyn Experiment>> = vec![];
         experiments.push(Box::new(
-            PerformanceBenchmarkNodesDownParams {
-                num_nodes_down: 0,
-                is_fullnode: false,
-            }
-            .build(cluster),
+            PerformanceBenchmarkNodesDownParams::new_nodes_down(0).build(cluster),
         ));
         experiments.push(Box::new(
-            PerformanceBenchmarkNodesDownParams {
-                num_nodes_down: 10,
-                is_fullnode: false,
-            }
-            .build(cluster),
+            PerformanceBenchmarkNodesDownParams::new_nodes_down(10).build(cluster),
         ));
         experiments.push(Box::new(
             PerformanceBenchmarkThreeRegionSimulationParams {}.build(cluster),

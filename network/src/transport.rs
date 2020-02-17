@@ -108,25 +108,25 @@ pub fn build_memory_noise_transport(
                 }
             }
         })
+        .and_then(move |(peer_id, socket), origin| {
+            async move {
+                let (identity, socket) = exchange_identity(&own_identity, socket, origin).await?;
+                match_peer_id(identity, peer_id)
+                    .and_then(|identity| check_role(&own_identity, identity))
+                    .and_then(|identity| Ok((identity, socket)))
+            }
+        })
         .and_then(|(peer_id, socket), origin| {
             async move {
                 let muxer = Yamux::upgrade_connection(socket, origin).await?;
                 Ok((peer_id, muxer))
             }
         })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
-        })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
 }
 
-pub fn build_permissionless_memory_noise_transport(
+pub fn build_unauthenticated_memory_noise_transport(
     own_identity: Identity,
     identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
 ) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
@@ -140,26 +140,26 @@ pub fn build_permissionless_memory_noise_transport(
                 // Generate PeerId from X25519StaticPublicKey.
                 // Note: This is inconsistent with current types because AccountAddress is derived
                 // from consensus key which is of type Ed25519PublicKey. Since AccountAddress does
-                // not mean anything in the permissionless setting, we use the network public key
-                // to generate a peer_id for the peer. The only reason this works is that both are
-                // 32 bytes in size. If/when this condition no longer holds, we will receive an
-                // error.
+                // not mean anything in a setting without remote authentication, we use the network
+                // public key to generate a peer_id for the peer. The only reason this works is
+                // that both are 32 bytes in size. If/when this condition no longer holds, we will
+                // receive an error.
                 let peer_id = PeerId::try_from(remote_static_key).unwrap();
                 Ok((peer_id, socket))
+            }
+        })
+        .and_then(move |(peer_id, socket), origin| {
+            async move {
+                let (identity, socket) = exchange_identity(&own_identity, socket, origin).await?;
+                match_peer_id(identity, peer_id)
+                    .and_then(|identity| check_role(&own_identity, identity))
+                    .and_then(|identity| Ok((identity, socket)))
             }
         })
         .and_then(|(peer_id, socket), origin| {
             async move {
                 let muxer = Yamux::upgrade_connection(socket, origin).await?;
                 Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
             }
         })
         .with_timeout(TRANSPORT_TIMEOUT)
@@ -170,18 +170,17 @@ pub fn build_memory_transport(
     own_identity: Identity,
 ) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
     let memory_transport = memory::MemoryTransport::default();
-
     memory_transport
-        .and_then(|socket, origin| {
+        .and_then(move |socket, origin| {
             async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok(muxer)
+                let (identity, socket) = exchange_identity(&own_identity, socket, origin).await?;
+                check_role(&own_identity, identity).and_then(|identity| Ok((identity, socket)))
             }
         })
-        .and_then(move |muxer, origin| {
+        .and_then(|(identity, socket), origin| {
             async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                check_role(&own_identity, identity).and_then(|identity| Ok((identity, muxer)))
+                let muxer = Yamux::upgrade_connection(socket, origin).await?;
+                Ok((identity, muxer))
             }
         })
         .with_timeout(TRANSPORT_TIMEOUT)
@@ -213,26 +212,27 @@ pub fn build_tcp_noise_transport(
                 }
             }
         })
+        .and_then(move |(peer_id, socket), origin| {
+            async move {
+                let (identity, socket) = exchange_identity(&own_identity, socket, origin).await?;
+                match_peer_id(identity, peer_id)
+                    .and_then(|identity| check_role(&own_identity, identity))
+                    .and_then(|identity| Ok((identity, socket)))
+            }
+        })
         .and_then(|(peer_id, socket), origin| {
             async move {
                 let muxer = Yamux::upgrade_connection(socket, origin).await?;
                 Ok((peer_id, muxer))
             }
         })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
-        })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
 }
 
-// Transport based on TCP + Noise, but permissionless -- i.e., any node is allowed to connect.
-pub fn build_permissionless_tcp_noise_transport(
+// Transport based on TCP + Noise, but without remote authentication (i.e., any
+// node is allowed to connect).
+pub fn build_unauthenticated_tcp_noise_transport(
     own_identity: Identity,
     identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
 ) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
@@ -245,26 +245,26 @@ pub fn build_permissionless_tcp_noise_transport(
                 // Generate PeerId from X25519StaticPublicKey.
                 // Note: This is inconsistent with current types because AccountAddress is derived
                 // from consensus key which is of type Ed25519PublicKey. Since AccountAddress does
-                // not mean anything in the permissionless setting, we use the network public key
-                // to generate a peer_id for the peer. The only reason this works is that both are
-                // 32 bytes in size. If/when this condition no longer holds, we will receive an
-                // error.
+                // not mean anything in a setting without remote authentication, we use the network
+                // public key to generate a peer_id for the peer. The only reason this works is that
+                // both are 32 bytes in size. If/when this condition no longer holds, we will receive
+                // an error.
                 let peer_id = PeerId::try_from(remote_static_key).unwrap();
                 Ok((peer_id, socket))
+            }
+        })
+        .and_then(move |(peer_id, socket), origin| {
+            async move {
+                let (identity, socket) = exchange_identity(&own_identity, socket, origin).await?;
+                match_peer_id(identity, peer_id)
+                    .and_then(|identity| check_role(&own_identity, identity))
+                    .and_then(|identity| Ok((identity, socket)))
             }
         })
         .and_then(|(peer_id, socket), origin| {
             async move {
                 let muxer = Yamux::upgrade_connection(socket, origin).await?;
                 Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
             }
         })
         .with_timeout(TRANSPORT_TIMEOUT)
@@ -275,16 +275,16 @@ pub fn build_tcp_transport(
     own_identity: Identity,
 ) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
     LIBRA_TCP_TRANSPORT
-        .and_then(|socket, origin| {
+        .and_then(move |socket, origin| {
             async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok(muxer)
+                let (identity, socket) = exchange_identity(&own_identity, socket, origin).await?;
+                check_role(&own_identity, identity).and_then(|identity| Ok((identity, socket)))
             }
         })
-        .and_then(move |muxer, origin| {
+        .and_then(|(identity, socket), origin| {
             async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                check_role(&own_identity, identity).and_then(|identity| Ok((identity, muxer)))
+                let muxer = Yamux::upgrade_connection(socket, origin).await?;
+                Ok((identity, muxer))
             }
         })
         .with_timeout(TRANSPORT_TIMEOUT)

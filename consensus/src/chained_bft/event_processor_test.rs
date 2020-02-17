@@ -12,9 +12,9 @@ use crate::{
             proposer_election::ProposerElection,
             rotating_proposer_election::RotatingProposer,
         },
-        network::NetworkSender,
+        network::{ConsensusTypes, NetworkSender},
         network_tests::NetworkPlayground,
-        persistent_storage::RecoveryData,
+        persistent_liveness_storage::RecoveryData,
         test_utils::{
             self, consensus_runtime, MockStateComputer, MockStorage, MockTransactionManager,
             TestPayload, TreeInserter,
@@ -22,18 +22,16 @@ use crate::{
     },
     util::time_service::{ClockTimeService, TimeService},
 };
-use channel;
+use channel::{self, libra_channel, message_queues::QueueStyle};
 use consensus_types::block::block_test_utils::gen_test_certificate;
-use consensus_types::block_retrieval::{
-    BlockRetrievalRequest, BlockRetrievalResponse, BlockRetrievalStatus,
-};
+use consensus_types::block_retrieval::{BlockRetrievalRequest, BlockRetrievalStatus};
 use consensus_types::{
     block::{
         block_test_utils::{certificate_for_genesis, placeholder_ledger_info},
         Block,
     },
     common::Author,
-    proposal_msg::{ProposalMsg, ProposalUncheckedSignatures},
+    proposal_msg::ProposalMsg,
     sync_info::SyncInfo,
     timeout::Timeout,
     timeout_certificate::TimeoutCertificate,
@@ -51,14 +49,15 @@ use libra_types::crypto_proxies::{
     random_validator_verifier, EpochInfo, LedgerInfoWithSignatures, ValidatorSigner,
     ValidatorVerifier,
 };
+use network::peer_manager::conn_status_channel;
 use network::{
-    proto::{ConsensusMsg, ConsensusMsg_oneof},
+    proto::ConsensusMsg,
     validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender},
 };
 use prost::Message as _;
-use safety_rules::{ConsensusState, InMemoryStorage, SafetyRulesManager};
+use safety_rules::{ConsensusState, PersistentSafetyStorage as SafetyStorage, SafetyRulesManager};
 use std::sync::RwLock;
-use std::{collections::HashMap, convert::TryFrom, sync::Arc, time::Duration};
+use std::{collections::HashMap, convert::TryFrom, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 
 /// Auxiliary struct that is setting up node environment for the test.
@@ -98,8 +97,10 @@ impl NodeSetup {
             let (initial_data, storage) =
                 MockStorage::<TestPayload>::start_for_testing((&validators).into());
 
-            let safety_rules_manager =
-                SafetyRulesManager::new_local(Box::new(InMemoryStorage::default()), signer.clone());
+            let safety_rules_manager = SafetyRulesManager::new_local(
+                signer.author(),
+                SafetyStorage::in_memory(signer.private_key().clone()),
+            );
 
             nodes.push(Self::new(
                 playground,
@@ -124,13 +125,17 @@ impl NodeSetup {
         safety_rules_manager: SafetyRulesManager<TestPayload>,
     ) -> Self {
         let validators = initial_data.validators();
-        let (network_reqs_tx, network_reqs_rx) = channel::new_test(8);
-        let (consensus_tx, consensus_rx) = channel::new_test(8);
-        let network_sender = ConsensusNetworkSender::new(network_reqs_tx);
-        let network_events = ConsensusNetworkEvents::new(consensus_rx);
+        let (network_reqs_tx, network_reqs_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (consensus_tx, consensus_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(8);
+        let (_, conn_status_rx) = conn_status_channel::new();
+        let network_sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
+        let network_events = ConsensusNetworkEvents::new(consensus_rx, conn_status_rx);
         let author = signer.author();
 
-        playground.add_node(author, consensus_tx, network_reqs_rx);
+        playground.add_node(author, consensus_tx, network_reqs_rx, conn_mgr_reqs_rx);
 
         let (self_sender, self_receiver) = channel::new_test(8);
         let network = NetworkSender::new(
@@ -152,7 +157,9 @@ impl NodeSetup {
         executor.spawn(task.start());
         let last_vote_sent = initial_data.last_vote();
         let (commit_cb_sender, _commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
+        let (state_sync_client, _state_sync) = mpsc::unbounded();
         let state_computer = Arc::new(MockStateComputer::new(
+            state_sync_client,
             commit_cb_sender,
             Arc::clone(&storage),
             None,
@@ -170,7 +177,7 @@ impl NodeSetup {
         let proposal_generator = ProposalGenerator::new(
             author,
             block_store.clone(),
-            Box::new(MockTransactionManager::new().0),
+            Box::new(MockTransactionManager::new(None)),
             time_service.clone(),
             1,
         );
@@ -186,8 +193,8 @@ impl NodeSetup {
             proposer_election,
             proposal_generator,
             safety_rules_manager.client(),
-            Box::new(MockTransactionManager::new().0),
             network,
+            Box::new(MockTransactionManager::new(None)),
             storage.clone(),
             time_service,
             validators.clone(),
@@ -245,17 +252,13 @@ fn basic_new_rank_event_test() {
             .await;
         let pending_proposals: Vec<ProposalMsg<TestPayload>> = pending_messages
             .into_iter()
-            .filter_map(|m| match m.1.message {
-                Some(ConsensusMsg_oneof::Proposal(proposal)) => Some(
-                    ProposalUncheckedSignatures::<TestPayload>::try_from(proposal)
-                        .unwrap()
-                        .into(),
-                ),
+            .filter_map(|m| match ConsensusTypes::try_from(&m.1) {
+                Ok(ConsensusTypes::ProposalMsg(proposal)) => Some(*proposal),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(pending_proposals.len(), 1);
-        assert_eq!(pending_proposals[0].proposal().round(), new_round,);
+        assert_eq!(pending_proposals[0].proposal().round(), new_round);
         assert_eq!(
             pending_proposals[0]
                 .proposal()
@@ -312,12 +315,8 @@ fn basic_new_rank_event_test() {
             .await;
         let pending_proposals: Vec<ProposalMsg<TestPayload>> = pending_messages
             .into_iter()
-            .filter_map(|m| match m.1.message {
-                Some(ConsensusMsg_oneof::Proposal(proposal)) => Some(
-                    ProposalUncheckedSignatures::<TestPayload>::try_from(proposal)
-                        .unwrap()
-                        .into(),
-                ),
+            .filter_map(|m| match ConsensusTypes::<TestPayload>::try_from(&m.1) {
+                Ok(ConsensusTypes::ProposalMsg(proposal)) => Some(*proposal),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -360,10 +359,8 @@ fn process_successful_proposal_test() {
                     return None;
                 }
 
-                match m.1.message {
-                    Some(ConsensusMsg_oneof::VoteMsg(vote_msg)) => {
-                        Some(VoteMsg::try_from(vote_msg).unwrap())
-                    }
+                match ConsensusTypes::<TestPayload>::try_from(&m.1) {
+                    Ok(ConsensusTypes::VoteMsg(vote_msg)) => Some(*vote_msg),
                     _ => None,
                 }
             })
@@ -412,10 +409,8 @@ fn process_old_proposal_test() {
                     return None;
                 }
 
-                match m.1.message {
-                    Some(ConsensusMsg_oneof::VoteMsg(vote_msg)) => {
-                        Some(VoteMsg::try_from(vote_msg).unwrap())
-                    }
+                match ConsensusTypes::<TestPayload>::try_from(&m.1) {
+                    Ok(ConsensusTypes::VoteMsg(vote_msg)) => Some(*vote_msg),
                     _ => None,
                 }
             })
@@ -724,14 +719,11 @@ fn process_block_retrieval() {
             .await;
         match rx1.await {
             Ok(Ok(bytes)) => {
-                let msg = ConsensusMsg::decode(bytes.as_ref()).unwrap();
-                let response = match msg.message {
-                    Some(ConsensusMsg_oneof::RespondBlock(proto)) => {
-                        BlockRetrievalResponse::<TestPayload>::try_from(proto)
-                    }
+                let response = ConsensusMsg::decode(bytes).unwrap();
+                let response = match ConsensusTypes::<TestPayload>::try_from(&response) {
+                    Ok(ConsensusTypes::<TestPayload>::BlockRetrievalResponse(resp)) => *resp,
                     _ => panic!("block retrieval failure"),
-                }
-                .unwrap();
+                };
                 assert_eq!(response.status(), BlockRetrievalStatus::Succeeded);
                 assert_eq!(response.blocks().get(0).unwrap().id(), block_id);
             }
@@ -750,14 +742,11 @@ fn process_block_retrieval() {
             .await;
         match rx2.await {
             Ok(Ok(bytes)) => {
-                let msg = ConsensusMsg::decode(bytes.as_ref()).unwrap();
-                let response = match msg.message {
-                    Some(ConsensusMsg_oneof::RespondBlock(proto)) => {
-                        BlockRetrievalResponse::<TestPayload>::try_from(proto)
-                    }
+                let response = ConsensusMsg::decode(bytes).unwrap();
+                let response = match ConsensusTypes::<TestPayload>::try_from(&response) {
+                    Ok(ConsensusTypes::<TestPayload>::BlockRetrievalResponse(resp)) => *resp,
                     _ => panic!("block retrieval failure"),
-                }
-                .unwrap();
+                };
                 assert_eq!(response.status(), BlockRetrievalStatus::IdNotFound);
                 assert!(response.blocks().is_empty());
             }
@@ -775,14 +764,11 @@ fn process_block_retrieval() {
             .await;
         match rx3.await {
             Ok(Ok(bytes)) => {
-                let msg = ConsensusMsg::decode(bytes.as_ref()).unwrap();
-                let response = match msg.message {
-                    Some(ConsensusMsg_oneof::RespondBlock(proto)) => {
-                        BlockRetrievalResponse::<TestPayload>::try_from(proto)
-                    }
+                let response = ConsensusMsg::decode(bytes).unwrap();
+                let response = match ConsensusTypes::<TestPayload>::try_from(&response) {
+                    Ok(ConsensusTypes::<TestPayload>::BlockRetrievalResponse(resp)) => *resp,
                     _ => panic!("block retrieval failure"),
-                }
-                .unwrap();
+                };
                 assert_eq!(response.status(), BlockRetrievalStatus::NotEnoughBlocks);
                 assert_eq!(block_id, response.blocks().get(0).unwrap().id());
                 assert_eq!(
@@ -853,14 +839,13 @@ fn nil_vote_on_timeout() {
         // Process the outgoing vote message and verify that it contains a round signature
         // and that the vote extends genesis.
         node.event_processor.process_local_timeout(1).await;
-        let vote_msg = VoteMsg::try_from(
-            playground
-                .wait_for_messages(1, NetworkPlayground::timeout_votes_only)
-                .await[0]
-                .1
-                .clone(),
-        )
-        .unwrap();
+        let msg = &playground
+            .wait_for_messages(1, NetworkPlayground::timeout_votes_only)
+            .await[0];
+        let vote_msg = match ConsensusTypes::<TestPayload>::try_from(&msg.1) {
+            Ok(ConsensusTypes::VoteMsg(vote_msg)) => *vote_msg,
+            _ => panic!("Failed to retrieve VoteMsg"),
+        };
 
         let vote = vote_msg.vote();
 

@@ -26,39 +26,41 @@ use libra_types::{
     transaction::{TransactionListWithProof, TransactionToCommit, Version},
 };
 use std::convert::TryFrom;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use storage_proto::{
     proto::storage::{
         storage_client::StorageClient, GetLatestStateRootRequest, GetStartupInfoRequest,
     },
-    BackupAccountStateRequest, BackupAccountStateResponse, GetAccountStateRangeProofRequest,
-    GetAccountStateRangeProofResponse, GetAccountStateWithProofByVersionRequest,
-    GetAccountStateWithProofByVersionResponse, GetEpochChangeLedgerInfosRequest,
-    GetLatestAccountStateRequest, GetLatestAccountStateResponse, GetLatestStateRootResponse,
-    GetStartupInfoResponse, GetTransactionsRequest, GetTransactionsResponse,
-    SaveTransactionsRequest, StartupInfo,
+    BackupAccountStateRequest, BackupAccountStateResponse, BackupTransactionInfoRequest,
+    BackupTransactionInfoResponse, BackupTransactionRequest, BackupTransactionResponse,
+    GetAccountStateRangeProofRequest, GetAccountStateRangeProofResponse,
+    GetAccountStateWithProofByVersionRequest, GetAccountStateWithProofByVersionResponse,
+    GetEpochChangeLedgerInfosRequest, GetLatestAccountStateRequest, GetLatestAccountStateResponse,
+    GetLatestStateRootResponse, GetStartupInfoResponse, GetTransactionsRequest,
+    GetTransactionsResponse, SaveTransactionsRequest, StartupInfo,
 };
 
 /// This provides storage read interfaces backed by real storage service.
 pub struct StorageReadServiceClient {
-    addr: String,
+    http_addr: String,
     client: Mutex<Option<StorageClient<tonic::transport::Channel>>>,
 }
 
 impl StorageReadServiceClient {
-    /// Constructs a `StorageReadServiceClient` with given host and port.
-    pub fn new(host: &str, port: u16) -> Self {
-        let addr = format!("http://{}:{}", host, port);
+    /// Constructs a `StorageReadServiceClient` with given SocketAddr.
+    pub fn new(address: &SocketAddr) -> Self {
+        let http_addr = format!("http://{}", address.to_string());
 
         Self {
             client: Mutex::new(None),
-            addr,
+            http_addr,
         }
     }
 
     async fn client(&self) -> Result<StorageClient<tonic::transport::Channel>, tonic::Status> {
         if self.client.lock().unwrap().is_none() {
-            let client = StorageClient::connect(self.addr.clone())
+            let client = StorageClient::connect(self.http_addr.clone())
                 .await
                 .map_err(|e| tonic::Status::new(tonic::Code::Unavailable, e.to_string()))?;
             *self.client.lock().unwrap() = Some(client);
@@ -71,7 +73,7 @@ impl StorageReadServiceClient {
 
 #[async_trait::async_trait]
 impl StorageRead for StorageReadServiceClient {
-    async fn update_to_latest_ledger_async(
+    async fn update_to_latest_ledger(
         &self,
         client_known_version: Version,
         requested_items: Vec<RequestItem>,
@@ -102,7 +104,7 @@ impl StorageRead for StorageReadServiceClient {
         ))
     }
 
-    async fn get_transactions_async(
+    async fn get_transactions(
         &self,
         start_version: Version,
         batch_size: u64,
@@ -122,7 +124,7 @@ impl StorageRead for StorageReadServiceClient {
         Ok(rust_resp.txn_list_with_proof)
     }
 
-    async fn get_latest_state_root_async(&self) -> Result<(Version, HashValue)> {
+    async fn get_latest_state_root(&self) -> Result<(Version, HashValue)> {
         let req = GetLatestStateRootRequest::default();
         let resp = self
             .client()
@@ -134,7 +136,7 @@ impl StorageRead for StorageReadServiceClient {
         Ok(rust_resp.into())
     }
 
-    async fn get_latest_account_state_async(
+    async fn get_latest_account_state(
         &self,
         address: AccountAddress,
     ) -> Result<Option<AccountStateBlob>> {
@@ -150,7 +152,7 @@ impl StorageRead for StorageReadServiceClient {
         Ok(rust_resp.account_state_blob)
     }
 
-    async fn get_account_state_with_proof_by_version_async(
+    async fn get_account_state_with_proof_by_version(
         &self,
         address: AccountAddress,
         version: Version,
@@ -167,7 +169,7 @@ impl StorageRead for StorageReadServiceClient {
         Ok(resp.into())
     }
 
-    async fn get_startup_info_async(&self) -> Result<Option<StartupInfo>> {
+    async fn get_startup_info(&self) -> Result<Option<StartupInfo>> {
         let proto_req = GetStartupInfoRequest::default();
         let resp = self
             .client()
@@ -179,7 +181,7 @@ impl StorageRead for StorageReadServiceClient {
         Ok(resp.info)
     }
 
-    async fn get_epoch_change_ledger_infos_async(
+    async fn get_epoch_change_ledger_infos(
         &self,
         start_epoch: u64,
         end_epoch: u64,
@@ -232,28 +234,70 @@ impl StorageRead for StorageReadServiceClient {
 
         Ok(GetAccountStateRangeProofResponse::try_from(resp)?.into())
     }
+
+    async fn backup_transaction(
+        &self,
+        start_version: Version,
+        num_transactions: u64,
+    ) -> Result<BoxStream<'_, Result<BackupTransactionResponse, Error>>> {
+        let proto_req: storage_proto::proto::storage::BackupTransactionRequest =
+            BackupTransactionRequest::new(start_version, num_transactions).into();
+        let stream = self
+            .client()
+            .await?
+            .backup_transaction(proto_req)
+            .await?
+            .into_inner()
+            .map(|resp| {
+                let resp = BackupTransactionResponse::try_from(resp?)?;
+                Ok(resp)
+            })
+            .boxed();
+        Ok(stream)
+    }
+
+    async fn backup_transaction_info(
+        &self,
+        start_version: Version,
+        num_transactions: u64,
+    ) -> Result<BoxStream<'_, Result<BackupTransactionInfoResponse, Error>>> {
+        let proto_req: storage_proto::proto::storage::BackupTransactionInfoRequest =
+            BackupTransactionInfoRequest::new(start_version, num_transactions).into();
+        let stream = self
+            .client()
+            .await?
+            .backup_transaction_info(proto_req)
+            .await?
+            .into_inner()
+            .map(|resp| {
+                let resp = BackupTransactionInfoResponse::try_from(resp?)?;
+                Ok(resp)
+            })
+            .boxed();
+        Ok(stream)
+    }
 }
 
 /// This provides storage write interfaces backed by real storage service.
 pub struct StorageWriteServiceClient {
-    addr: String,
+    http_addr: String,
     client: Mutex<Option<StorageClient<tonic::transport::Channel>>>,
 }
 
 impl StorageWriteServiceClient {
-    /// Constructs a `StorageWriteServiceClient` with given host and port.
-    pub fn new(host: &str, port: u16) -> Self {
-        let addr = format!("http://{}:{}", host, port);
+    /// Constructs a `StorageWriteServiceClient` with given SocketAddr.
+    pub fn new(address: &SocketAddr) -> Self {
+        let http_addr = format!("http://{}", address.to_string());
 
         Self {
             client: Mutex::new(None),
-            addr,
+            http_addr,
         }
     }
 
     async fn client(&self) -> Result<StorageClient<tonic::transport::Channel>, tonic::Status> {
         if self.client.lock().unwrap().is_none() {
-            let client = StorageClient::connect(self.addr.clone())
+            let client = StorageClient::connect(self.http_addr.clone())
                 .await
                 .map_err(|e| tonic::Status::new(tonic::Code::Unavailable, e.to_string()))?;
             *self.client.lock().unwrap() = Some(client);
@@ -266,7 +310,7 @@ impl StorageWriteServiceClient {
 
 #[async_trait::async_trait]
 impl StorageWrite for StorageWriteServiceClient {
-    async fn save_transactions_async(
+    async fn save_transactions(
         &self,
         txns_to_commit: Vec<TransactionToCommit>,
         first_version: Version,
@@ -291,7 +335,7 @@ pub trait StorageRead: Send + Sync {
     ///
     /// [`LibraDB::update_to_latest_ledger`]:../libradb/struct.LibraDB.html#method.
     /// update_to_latest_ledger
-    async fn update_to_latest_ledger_async(
+    async fn update_to_latest_ledger(
         &self,
         client_known_version: Version,
         request_items: Vec<RequestItem>,
@@ -305,7 +349,7 @@ pub trait StorageRead: Send + Sync {
     /// See [`LibraDB::get_transactions`].
     ///
     /// [`LibraDB::get_transactions`]: ../libradb/struct.LibraDB.html#method.get_transactions
-    async fn get_transactions_async(
+    async fn get_transactions(
         &self,
         start_version: Version,
         batch_size: u64,
@@ -317,13 +361,13 @@ pub trait StorageRead: Send + Sync {
     ///
     /// [`LibraDB::get_latest_state_root`]:
     /// ../libradb/struct.LibraDB.html#method.get_latest_state_root
-    async fn get_latest_state_root_async(&self) -> Result<(Version, HashValue)>;
+    async fn get_latest_state_root(&self) -> Result<(Version, HashValue)>;
 
     /// See [`LibraDB::get_latest_account_state`].
     ///
     /// [`LibraDB::get_latest_account_state`]:
     /// ../libradb/struct.LibraDB.html#method.get_latest_account_state
-    async fn get_latest_account_state_async(
+    async fn get_latest_account_state(
         &self,
         address: AccountAddress,
     ) -> Result<Option<AccountStateBlob>>;
@@ -332,7 +376,7 @@ pub trait StorageRead: Send + Sync {
     ///
     /// [`LibraDB::get_account_state_with_proof_by_version`]:
     /// ../libradb/struct.LibraDB.html#method.get_account_state_with_proof_by_version
-    async fn get_account_state_with_proof_by_version_async(
+    async fn get_account_state_with_proof_by_version(
         &self,
         address: AccountAddress,
         version: Version,
@@ -342,13 +386,13 @@ pub trait StorageRead: Send + Sync {
     ///
     /// [`LibraDB::get_startup_info`]:
     /// ../libradb/struct.LibraDB.html#method.get_startup_info
-    async fn get_startup_info_async(&self) -> Result<Option<StartupInfo>>;
+    async fn get_startup_info(&self) -> Result<Option<StartupInfo>>;
 
     /// See [`LibraDB::get_epoch_change_ledger_infos`].
     ///
     /// [`LibraDB::get_epoch_change_ledger_infos`]:
     /// ../libradb/struct.LibraDB.html#method.get_epoch_change_ledger_infos
-    async fn get_epoch_change_ledger_infos_async(
+    async fn get_epoch_change_ledger_infos(
         &self,
         start_epoch: u64,
         end_epoch: u64,
@@ -372,6 +416,20 @@ pub trait StorageRead: Send + Sync {
         rightmost_key: HashValue,
         version: Version,
     ) -> Result<SparseMerkleRangeProof>;
+
+    /// Gets a stream of transactions (for backup purpose).
+    async fn backup_transaction(
+        &self,
+        start_version: Version,
+        num_transactions: u64,
+    ) -> Result<BoxStream<'_, Result<BackupTransactionResponse, Error>>>;
+
+    /// Gets a stream of transaction infos (for backup purpose).
+    async fn backup_transaction_info(
+        &self,
+        start_version: Version,
+        num_transaction_infos: u64,
+    ) -> Result<BoxStream<'_, Result<BackupTransactionInfoResponse, Error>>>;
 }
 
 /// This trait defines interfaces to be implemented by a storage write client.
@@ -384,7 +442,7 @@ pub trait StorageWrite: Send + Sync {
     /// See [`LibraDB::save_transactions`].
     ///
     /// [`LibraDB::save_transactions`]: ../libradb/struct.LibraDB.html#method.save_transactions
-    async fn save_transactions_async(
+    async fn save_transactions(
         &self,
         txns_to_commit: Vec<TransactionToCommit>,
         first_version: Version,

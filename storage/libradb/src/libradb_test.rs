@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::test_helper::arb_blocks_to_commit;
+use crate::test_helper::{arb_blocks_to_commit, arb_mock_genesis};
 use libra_crypto::hash::CryptoHash;
-use libra_tools::tempdir::TempPath;
-use libra_types::{contract_event::ContractEvent, ledger_info::LedgerInfo};
+use libra_temppath::TempPath;
+use libra_types::{
+    account_config::AccountResource, contract_event::ContractEvent,
+    discovery_set::DISCOVERY_SET_CHANGE_EVENT_PATH, ledger_info::LedgerInfo,
+};
 use proptest::prelude::*;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -37,7 +40,7 @@ fn test_save_blocks_impl(input: Vec<(Vec<TransactionToCommit>, LedgerInfoWithSig
         db.save_transactions(
             &txns_to_commit,
             cur_ver, /* first_version */
-            &Some(ledger_info_with_sigs.clone()),
+            Some(ledger_info_with_sigs),
         )
         .unwrap();
 
@@ -92,14 +95,14 @@ fn test_sync_transactions_impl(input: Vec<(Vec<TransactionToCommit>, LedgerInfoW
             db.save_transactions(
                 &txns_to_commit[0..batch1_len],
                 cur_ver, /* first_version */
-                &None,
+                None,
             )
             .unwrap();
         }
         db.save_transactions(
             &txns_to_commit[batch1_len..],
             cur_ver + batch1_len as u64, /* first_version */
-            &Some(ledger_info_with_sigs.clone()),
+            Some(&ledger_info_with_sigs),
         )
         .unwrap();
 
@@ -144,13 +147,9 @@ fn get_events_by_query_path(
             ledger_info.version(),
         )?;
 
-        let expected_event_key_opt = proof_of_latest_event.blob.clone().map(|blob| {
-            let account_resource = AccountResource::try_from(&blob).unwrap();
-            let event_handle = account_resource
-                .get_event_handle_by_query_path(&query_path.path)
-                .unwrap();
-            *event_handle.key()
-        });
+        let (expected_event_key_opt, _count) = proof_of_latest_event
+            .get_event_key_and_count_by_query_path(&query_path.path)
+            .unwrap();
 
         let num_events = events_with_proof.len() as u64;
         proof_of_latest_event.verify(ledger_info, ledger_info.version(), query_path.address)?;
@@ -270,11 +269,7 @@ fn group_events_by_query_path(
     let mut event_key_to_query_path = HashMap::new();
     for txn in txns_to_commit {
         for (address, account_blob) in txn.account_states().iter() {
-            let account_btree = account_blob
-                .try_into()
-                .expect("The stored account blob can't be parsed as BTreeMap");
-            let account =
-                AccountResource::make_from(&account_btree).expect("AccountResource is not found");
+            let account = AccountResource::try_from(account_blob).unwrap();
             event_key_to_query_path.insert(
                 account.sent_events().key().clone(),
                 AccessPath::new_for_sent_event(*address),
@@ -426,4 +421,72 @@ fn test_too_many_requested() {
             0
         )
         .is_err());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1))]
+
+    #[test]
+    fn test_get_events_from_non_existent_account(
+        (genesis_txn_to_commit, ledger_info_with_sigs) in arb_mock_genesis(),
+        non_existent_address in any::<AccountAddress>(),
+    ) {
+        let tmp_dir = TempPath::new();
+        let db = LibraDB::new(&tmp_dir);
+
+        db.save_transactions(&[genesis_txn_to_commit], 0, Some(&ledger_info_with_sigs)).unwrap();
+        prop_assume!(
+            db.get_account_state_with_proof(non_existent_address, 0, 0).unwrap().blob.is_none()
+        );
+
+        let (events, account_state_with_proof) = db
+            .get_events_by_query_path(
+                &AccessPath::new_for_sent_event(non_existent_address),
+                0,
+                true,
+                100,
+                0,
+            )
+            .unwrap();
+
+        account_state_with_proof
+            .verify(ledger_info_with_sigs.ledger_info(), 0, non_existent_address)
+            .unwrap();
+        assert!(account_state_with_proof.blob.is_none());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_get_from_non_existent_event_stream(
+        (genesis_txn_to_commit, ledger_info_with_sigs) in arb_mock_genesis(),
+    ) {
+        let tmp_dir = TempPath::new();
+        let db = LibraDB::new(&tmp_dir);
+
+        let account = genesis_txn_to_commit
+            .transaction()
+            .as_signed_user_txn()
+            .unwrap()
+            .sender();
+
+        db.save_transactions(&[genesis_txn_to_commit], 0, Some(&ledger_info_with_sigs)).unwrap();
+
+        // The mock genesis txn is really just an ordinary user account, there is no
+        // DiscoverySetResource under it.
+        let (events, account_state_with_proof) = db
+            .get_events_by_query_path(
+                &AccessPath::new(account, DISCOVERY_SET_CHANGE_EVENT_PATH.to_vec()),
+                0,
+                true,
+                100,
+                0,
+            )
+            .unwrap();
+
+        account_state_with_proof
+            .verify(ledger_info_with_sigs.ledger_info(), 0, account)
+            .unwrap();
+        assert!(account_state_with_proof.blob.is_some());
+        assert!(events.is_empty());
+    }
 }

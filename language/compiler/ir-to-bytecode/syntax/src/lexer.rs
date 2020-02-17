@@ -29,6 +29,7 @@ pub enum Tok {
     Period,
     Slash,
     Colon,
+    ColonEqual,
     Semicolon,
     Less,
     LessEqual,
@@ -72,6 +73,8 @@ pub enum Tok {
     ToU128,
     If,
     Import,
+    /// For spec language
+    Invariant,
     Let,
     Loop,
     Main,
@@ -92,6 +95,7 @@ pub enum Tok {
     Script,
     Struct,
     SucceedsIf,
+    Synthetic,
     True,
     /// Transaction sender in the specification language
     TxnSender,
@@ -104,6 +108,9 @@ pub enum Tok {
     Pipe,
     PipePipe,
     RBrace,
+    LSquare,
+    RSquare,
+    PeriodPeriod,
 }
 
 impl Tok {
@@ -315,13 +322,27 @@ fn find_token(
         '+' => (Tok::Plus, 1),
         ',' => (Tok::Comma, 1),
         '-' => (Tok::Minus, 1),
-        '.' => (Tok::Period, 1),
+        '.' => {
+            if text.starts_with("..") {
+                (Tok::PeriodPeriod, 2) // range, for specs
+            } else {
+                (Tok::Period, 1)
+            }
+        }
         '/' => (Tok::Slash, 1),
-        ':' => (Tok::Colon, 1),
+        ':' => {
+            if text.starts_with(":=") {
+                (Tok::ColonEqual, 2) // spec update
+            } else {
+                (Tok::Colon, 1)
+            }
+        }
         ';' => (Tok::Semicolon, 1),
         '^' => (Tok::Caret, 1),
         '{' => (Tok::LBrace, 1),
         '}' => (Tok::RBrace, 1),
+        '[' => (Tok::LSquare, 1), // for vector specs
+        ']' => (Tok::RSquare, 1), // for vector specs
         _ => {
             return Err(ParseError::InvalidToken {
                 location: start_offset,
@@ -417,6 +438,7 @@ fn get_name_token(name: &str) -> Tok {
         "main" => Tok::Main,
         "module" => Tok::Module,
         "native" => Tok::Native,
+        "invariant" => Tok::Invariant,
         "old" => Tok::Old,
         "public" => Tok::Public,
         "requires" => Tok::Requires,
@@ -425,6 +447,7 @@ fn get_name_token(name: &str) -> Tok {
         "return" => Tok::Return,
         "struct" => Tok::Struct,
         "succeeds_if" => Tok::SucceedsIf,
+        "synthetic" => Tok::Synthetic,
         "true" => Tok::True,
         "txn_sender" => Tok::TxnSender,
         "u8" => Tok::U8,

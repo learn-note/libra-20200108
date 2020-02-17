@@ -5,7 +5,7 @@ use super::*;
 use crate::{pruner, LibraDB};
 use jellyfish_merkle::restore::JellyfishMerkleRestore;
 use libra_crypto::hash::CryptoHash;
-use libra_tools::tempdir::TempPath;
+use libra_temppath::TempPath;
 use libra_types::{
     account_address::{AccountAddress, ADDRESS_LENGTH},
     account_state_blob::AccountStateBlob,
@@ -246,7 +246,9 @@ proptest! {
 
         // Test iterator at each version.
         for i in 0..kvs.len() {
-            let actual_values = db.get_account_iter(i as Version)
+            let actual_values = db
+                .get_backup_handler()
+                .get_account_iter(i as Version)
                 .unwrap()
                 .collect::<Result<Vec<_>>>()
                 .unwrap();

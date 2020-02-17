@@ -79,23 +79,23 @@ error:
 
 error: 
 
-    ┌── tests/move_check/locals/unused_resource_explicit_return.move:33:17 ───
+    ┌── tests/move_check/locals/unused_resource_explicit_return.move:33:18 ───
     │
  34 │         return ()
     │         ^^^^^^^^^ Invalid return
     ·
  33 │         let x = &R{};
-    │                 ---- The resource is created but not used. The resource must be consumed before the function returns
+    │                  --- The resource is created but not used. The resource must be consumed before the function returns
     │
 
 error: 
 
-    ┌── tests/move_check/locals/unused_resource_explicit_return.move:37:11 ───
+    ┌── tests/move_check/locals/unused_resource_explicit_return.move:37:15 ───
     │
  38 │         return ()
     │         ^^^^^^^^^ Invalid return
     ·
- 37 │     t6<T>(x: T) {
-    │           - The local 'x' might still contain a resource value due to this assignment. The resource must be consumed before the function returns
+ 37 │     fun t6<T>(x: T) {
+    │               - The local 'x' might still contain a resource value due to this assignment. The resource must be consumed before the function returns
     │
 

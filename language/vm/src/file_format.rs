@@ -38,6 +38,7 @@ use libra_types::{
     vm_error::{StatusCode, VMStatus},
 };
 use mirai_annotations::*;
+use num_variants::NumVariants;
 use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest::{collection::vec, prelude::*, strategy::BoxedStrategy};
@@ -194,7 +195,7 @@ pub const NO_TYPE_ACTUALS: LocalsSignatureIndex = LocalsSignatureIndex(0);
 // HANDLES:
 // Handles are structs that accompany opcodes that need references: a type reference,
 // or a function reference (a field reference being available only within the module that
-// defrines the field can be a definition).
+// defines the field can be a definition).
 // Handles refer to both internal and external "entities" and are embedded as indexes
 // in the instruction stream.
 // Handles define resolution. Resolution is assumed to be by (name, signature)
@@ -801,9 +802,10 @@ impl CodeUnit {
 ///
 /// Bytecodes operate on a stack machine and each bytecode has side effect on the stack and the
 /// instruction stream.
-#[derive(Clone, Hash, Eq, PartialEq)]
+#[derive(Clone, Hash, Eq, NumVariants, PartialEq)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
+#[num_variants = "NUM_INSTRUCTIONS"]
 pub enum Bytecode {
     /// Pop and discard the value at the top of the stack.
     /// The value on the stack must be an unrestricted type.
@@ -1221,11 +1223,6 @@ pub enum Bytecode {
     /// ```..., u64_value(1), u64_value(2) -> ..., u64_value```
     Shr,
 }
-
-/// The number of bytecode instructions.
-/// This is necessary for checking that all instructions are covered since Rust
-/// does not provide a way of determining the number of variants of an enum.
-pub const NUMBER_OF_BYTECODE_INSTRUCTIONS: usize = 59;
 
 pub const NUMBER_OF_NATIVE_FUNCTIONS: usize = 17;
 
@@ -1831,4 +1828,51 @@ pub fn dummy_procedure_module(code: Vec<Bytecode>) -> CompiledModule {
     module.function_handles.push(fun_handle);
     module.function_defs.push(fun_def);
     module.freeze().unwrap()
+}
+
+/// Return a simple script that contains only a return in the main()
+pub fn empty_script() -> CompiledScriptMut {
+    let default_address = AccountAddress::new([3u8; 32]);
+    let self_module_name = self_module_name().to_owned();
+    let main_name = Identifier::new("main").unwrap();
+    let void_void_sig = FunctionSignature {
+        arg_types: vec![],
+        return_types: vec![],
+        type_formals: vec![],
+    };
+    let no_args_no_locals = LocalsSignature(vec![]);
+    let self_module_handle = ModuleHandle {
+        address: AddressPoolIndex(0),
+        name: IdentifierIndex(0),
+    };
+    let main = FunctionHandle {
+        module: ModuleHandleIndex(0),
+        name: IdentifierIndex(1),
+        signature: FunctionSignatureIndex(0),
+    };
+    let code = CodeUnit {
+        max_stack_size: 1,
+        locals: LocalsSignatureIndex(0),
+        code: vec![Bytecode::Ret],
+    };
+    let main_def = FunctionDefinition {
+        function: FunctionHandleIndex(0),
+        flags: CodeUnit::PUBLIC,
+        acquires_global_resources: vec![],
+        code,
+    };
+    CompiledScriptMut {
+        module_handles: vec![self_module_handle],
+        struct_handles: vec![],
+        function_handles: vec![main],
+
+        type_signatures: vec![],
+        function_signatures: vec![void_void_sig],
+        locals_signatures: vec![no_args_no_locals],
+
+        identifiers: vec![self_module_name, main_name],
+        byte_array_pool: vec![],
+        address_pool: vec![default_address],
+        main: main_def,
+    }
 }

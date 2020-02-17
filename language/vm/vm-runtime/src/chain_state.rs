@@ -18,7 +18,7 @@ use vm::{
     errors::VMResult,
     gas_schedule::{GasAlgebra, GasCarrier, GasUnits},
 };
-use vm_runtime_types::{loaded_data::struct_def::StructDef, value::GlobalRef};
+use vm_runtime_types::{loaded_data::struct_def::StructDef, values::GlobalValue};
 
 /// Trait that describes what Move bytecode runtime expects from the Libra blockchain.
 pub trait ChainState {
@@ -32,7 +32,11 @@ pub trait ChainState {
     // However this is not implementable due to the current implementation of MoveVM: data are
     // organized as a tree of GlobalRefs.
     /// Get a mutable reference to a resource stored on chain.
-    fn load_data(&mut self, ap: &AccessPath, def: StructDef) -> VMResult<&mut GlobalRef>;
+    fn load_data(
+        &mut self,
+        ap: &AccessPath,
+        def: StructDef,
+    ) -> VMResult<&mut Option<(StructDef, GlobalValue)>>;
 
     /// Get the serialized format of a `CompiledModule` from chain given a `ModuleId`.
     fn load_module(&self, module: &ModuleId) -> VMResult<Vec<u8>>;
@@ -41,7 +45,7 @@ pub trait ChainState {
     fn publish_module(&mut self, module_id: ModuleId, module: Vec<u8>) -> VMResult<()>;
 
     /// Publish a resource to be stored on chain.
-    fn publish_resource(&mut self, ap: &AccessPath, root: GlobalRef) -> VMResult<()>;
+    fn publish_resource(&mut self, ap: &AccessPath, g: (StructDef, GlobalValue)) -> VMResult<()>;
 
     /// Check if this module exists on chain.
     // TODO: Can we get rid of this api with the loader refactor?
@@ -97,7 +101,7 @@ impl<'txn> TransactionExecutionContext<'txn> {
     pub fn get_transaction_output(
         &mut self,
         txn_data: &TransactionMetadata,
-        result: VMResult<()>,
+        status: VMStatus,
     ) -> VMResult<TransactionOutput> {
         let gas_used: u64 = txn_data
             .max_gas_amount()
@@ -106,15 +110,11 @@ impl<'txn> TransactionExecutionContext<'txn> {
             .get();
         let write_set = self.make_write_set()?;
         record_stats!(observe | TXN_TOTAL_GAS_USAGE | gas_used);
-
         Ok(TransactionOutput::new(
             write_set,
             self.events().to_vec(),
             gas_used,
-            match result {
-                Ok(()) => TransactionStatus::from(VMStatus::new(StatusCode::EXECUTED)),
-                Err(err) => TransactionStatus::from(err),
-            },
+            TransactionStatus::Keep(status),
         ))
     }
 }
@@ -138,7 +138,11 @@ impl<'txn> ChainState for TransactionExecutionContext<'txn> {
         self.gas_left
     }
 
-    fn load_data(&mut self, ap: &AccessPath, def: StructDef) -> VMResult<&mut GlobalRef> {
+    fn load_data(
+        &mut self,
+        ap: &AccessPath,
+        def: StructDef,
+    ) -> VMResult<&mut Option<(StructDef, GlobalValue)>> {
         self.data_view.load_data(ap, def)
     }
 
@@ -150,8 +154,8 @@ impl<'txn> ChainState for TransactionExecutionContext<'txn> {
         self.data_view.publish_module(module_id, module)
     }
 
-    fn publish_resource(&mut self, ap: &AccessPath, root: GlobalRef) -> VMResult<()> {
-        self.data_view.publish_resource(ap, root)
+    fn publish_resource(&mut self, ap: &AccessPath, g: (StructDef, GlobalValue)) -> VMResult<()> {
+        self.data_view.publish_resource(ap, g)
     }
 
     fn exists_module(&self, key: &ModuleId) -> bool {
@@ -188,9 +192,9 @@ impl<'txn> SystemExecutionContext<'txn> {
     pub fn get_transaction_output(
         &mut self,
         txn_data: &TransactionMetadata,
-        result: VMResult<()>,
+        status: VMStatus,
     ) -> VMResult<TransactionOutput> {
-        self.0.get_transaction_output(txn_data, result)
+        self.0.get_transaction_output(txn_data, status)
     }
 }
 
@@ -199,15 +203,19 @@ impl<'txn> ChainState for SystemExecutionContext<'txn> {
         Ok(())
     }
 
-    fn publish_resource(&mut self, ap: &AccessPath, root: GlobalRef) -> VMResult<()> {
-        self.0.publish_resource(ap, root)
+    fn publish_resource(&mut self, ap: &AccessPath, g: (StructDef, GlobalValue)) -> VMResult<()> {
+        self.0.publish_resource(ap, g)
     }
 
     fn remaining_gas(&self) -> GasUnits<GasCarrier> {
         self.0.gas_left()
     }
 
-    fn load_data(&mut self, ap: &AccessPath, def: StructDef) -> VMResult<&mut GlobalRef> {
+    fn load_data(
+        &mut self,
+        ap: &AccessPath,
+        def: StructDef,
+    ) -> VMResult<&mut Option<(StructDef, GlobalValue)>> {
         self.0.load_data(ap, def)
     }
 

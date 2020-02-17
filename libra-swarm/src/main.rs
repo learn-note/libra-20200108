@@ -3,9 +3,9 @@
 
 #![forbid(unsafe_code)]
 
-use libra_config::config::{NodeConfig, RoleType};
+use libra_config::config::{NodeConfig, RoleType, VMPublishingOption};
 use libra_swarm::{client, swarm::LibraSwarm};
-use libra_tools::tempdir::TempPath;
+use libra_temppath::TempPath;
 use std::path::Path;
 use structopt::StructOpt;
 
@@ -36,6 +36,8 @@ fn main() {
     let args = Args::from_args();
     let num_nodes = args.num_nodes;
     let num_full_nodes = args.num_full_nodes;
+    let mut dev_config = NodeConfig::default();
+    dev_config.vm_config.publishing_options = VMPublishingOption::Open;
 
     libra_logger::init_for_e2e_testing();
 
@@ -43,8 +45,8 @@ fn main() {
         num_nodes,
         RoleType::Validator,
         args.config_dir.clone(),
-        None, /* template_path */
-        None, /* upstream_config_dir */
+        Some(dev_config.clone()), /* template config */
+        None,                     /* upstream_config_dir */
     )
     .expect("Failed to configure validator swarm");
 
@@ -53,8 +55,8 @@ fn main() {
             LibraSwarm::configure_swarm(
                 num_full_nodes,
                 RoleType::FullNode,
-                None, /* config dir */
-                None, /* template_path */
+                None,             /* config dir */
+                Some(dev_config), /* template config */
                 Some(String::from(
                     validator_swarm
                         .dir
@@ -82,10 +84,8 @@ fn main() {
     let validator_config = NodeConfig::load(&validator_swarm.config.config_files[0]).unwrap();
     println!("To run the Libra CLI client in a separate process and connect to the validator nodes you just spawned, use this command:");
     println!(
-        "\tcargo run --bin client -- -a localhost -p {} -m {:?}",
-        validator_config
-            .admission_control
-            .admission_control_service_port,
+        "\tcargo run --bin cli -- -a localhost -p {} -m {:?}",
+        validator_config.admission_control.address.port(),
         faucet_key_file_path,
     );
     let node_address_list = validator_swarm
@@ -96,7 +96,8 @@ fn main() {
             let port = NodeConfig::load(config)
                 .unwrap()
                 .admission_control
-                .admission_control_service_port;
+                .address
+                .port();
             format!("localhost:{}", port)
         })
         .collect::<Vec<String>>()
@@ -110,10 +111,8 @@ fn main() {
         let full_node_config = NodeConfig::load(&swarm.config.config_files[0]).unwrap();
         println!("To connect to the full nodes you just spawned, use this command:");
         println!(
-            "\tcargo run --bin client -- -a localhost -p {} -m {:?}",
-            full_node_config
-                .admission_control
-                .admission_control_service_port,
+            "\tcargo run --bin cli -- -a localhost -p {} -m {:?}",
+            full_node_config.admission_control.address.port(),
             faucet_key_file_path,
         );
     }

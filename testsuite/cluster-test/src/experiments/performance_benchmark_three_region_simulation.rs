@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::experiments::ExperimentParam;
+use crate::tx_emitter::EmitJobRequest;
 use crate::{
     cluster::Cluster,
     effects::{three_region_simulation_effects, Effect},
@@ -10,7 +11,8 @@ use crate::{
     stats,
     util::unix_timestamp_now,
 };
-use futures::future::{join_all, BoxFuture, FutureExt};
+use async_trait::async_trait;
+use futures::future::join_all;
 use std::{
     fmt::{Display, Error, Formatter},
     time::Duration,
@@ -33,45 +35,57 @@ impl ExperimentParam for PerformanceBenchmarkThreeRegionSimulationParams {
     }
 }
 
+#[async_trait]
 impl Experiment for PerformanceBenchmarkThreeRegionSimulation {
-    fn run<'a>(
-        &'a mut self,
-        context: &'a mut Context,
-    ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
-        async move {
-            let (us, euro) = self.cluster.split_n_validators_random(80);
-            let (us_west, us_east) = us.split_n_validators_random(40);
-            let network_effects = three_region_simulation_effects(
-                (
-                    us_west.validator_instances().clone(),
-                    us_east.validator_instances().clone(),
-                    euro.validator_instances().clone(),
-                ),
-                (
-                    Duration::from_millis(60), // us_east<->eu one way delay
-                    Duration::from_millis(95), // us_west<->eu one way delay
-                    Duration::from_millis(40), // us_west<->us_east one way delay
-                ),
-            );
-            join_all(network_effects.iter().map(|e| e.activate())).await;
-            let window = Duration::from_secs(180);
-            context
-                .tx_emitter
-                .emit_txn_for(
-                    window + Duration::from_secs(60),
-                    self.cluster.validator_instances().clone(),
-                )
-                .await?;
-            let end = unix_timestamp_now();
-            let start = end - window;
-            let (avg_tps, avg_latency) = stats::txn_stats(&context.prometheus, start, end)?;
-            join_all(network_effects.iter().map(|e| e.deactivate())).await;
-            Ok(Some(format!(
-                "{} : {:.0} TPS, {:.1} ms latency",
-                self, avg_tps, avg_latency
-            )))
-        }
-        .boxed()
+    async fn run(&mut self, context: &mut Context<'_>) -> anyhow::Result<()> {
+        let num_nodes = self.cluster.validator_instances().len();
+        let split_country_num = ((num_nodes as f64) * 0.8) as usize;
+        let split_region_num = split_country_num / 2;
+        let (us, euro) = self.cluster.split_n_validators_random(split_country_num);
+        let (us_west, us_east) = us.split_n_validators_random(split_region_num);
+        let network_effects = three_region_simulation_effects(
+            (
+                us_west.validator_instances().to_vec(),
+                us_east.validator_instances().to_vec(),
+                euro.validator_instances().to_vec(),
+            ),
+            (
+                Duration::from_millis(60), // us_east<->eu one way delay
+                Duration::from_millis(95), // us_west<->eu one way delay
+                Duration::from_millis(40), // us_west<->us_east one way delay
+            ),
+        );
+        join_all(network_effects.iter().map(|e| e.activate())).await;
+        let window = Duration::from_secs(240);
+        let emit_job_request = if context.emit_to_validator {
+            EmitJobRequest::for_instances(
+                context.cluster.validator_instances().to_vec(),
+                context.global_emit_job_request,
+            )
+        } else {
+            EmitJobRequest::for_instances(
+                context.cluster.fullnode_instances().to_vec(),
+                context.global_emit_job_request,
+            )
+        };
+        context
+            .tx_emitter
+            .emit_txn_for(window, emit_job_request)
+            .await?;
+        let buffer = Duration::from_secs(30);
+        let end = unix_timestamp_now() - buffer;
+        let start = end - window + 2 * buffer;
+        let (avg_tps, avg_latency) = stats::txn_stats(&context.prometheus, start, end)?;
+        join_all(network_effects.iter().map(|e| e.deactivate())).await;
+        context.report.report_metric(&self, "avg_tps", avg_tps);
+        context
+            .report
+            .report_metric(&self, "avg_latency", avg_latency);
+        context.report.report_text(format!(
+            "{} : {:.0} TPS, {:.1} ms latency",
+            self, avg_tps, avg_latency
+        ));
+        Ok(())
     }
 
     fn deadline(&self) -> Duration {

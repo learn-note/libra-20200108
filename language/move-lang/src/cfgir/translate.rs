@@ -125,8 +125,8 @@ fn module(
 fn function(context: &mut Context, _name: FunctionName, f: H::Function) -> G::Function {
     let visibility = f.visibility;
     let signature = function_signature(context, f.signature);
-    let acquires = base_types(context, f.acquires);
-    let body = function_body(context, &signature, f.body);
+    let acquires = f.acquires;
+    let body = function_body(context, &signature, &acquires, f.body);
     G::Function {
         visibility,
         signature,
@@ -153,6 +153,7 @@ fn function_signature(context: &mut Context, sig: H::FunctionSignature) -> G::Fu
 fn function_body(
     context: &mut Context,
     signature: &G::FunctionSignature,
+    acquires: &BTreeSet<StructName>,
     sp!(loc, tb_): H::FunctionBody,
 ) -> G::FunctionBody {
     use G::FunctionBody_ as GB;
@@ -175,14 +176,15 @@ fn function_body(
                 context.error(e);
             }
 
-            cfgir::refine(
+            cfgir::refine_inference_and_verify(
                 &mut context.errors,
                 signature,
+                acquires,
                 &locals,
                 &mut cfg,
                 &infinite_loop_starts,
             );
-            cfgir::verify(&mut context.errors, signature, &locals, &mut cfg);
+            cfgir::optimize(signature, &locals, &mut cfg);
 
             GB::Defined {
                 locals,
@@ -237,7 +239,7 @@ fn base_type(context: &Context, sp!(loc, nb_): H::BaseType) -> G::BaseType {
     let b_ = match nb_ {
         HB::Apply(k, n, nbs) => GB::Apply(k, n, base_types(context, nbs)),
         HB::Param(tp) => GB::Param(tp),
-        HB::UnresolvedError => panic!("ICE UnresolvedError should only have appeared on ret/abort"),
+        HB::UnresolvedError => GB::UnresolvedError,
     };
     sp(loc, b_)
 }
@@ -279,12 +281,35 @@ fn function_block(context: &mut Context, blocks: H::Block) {
 
 fn block(context: &mut Context, mut cur_label: Label, blocks: H::Block) {
     use G::Command_ as C;
+
+    assert!(!blocks.is_empty());
+    let loc = blocks.back().unwrap().loc;
+    let mut basic_block = block_(context, &mut cur_label, blocks);
+
+    // return if we ended with did not end with a command
+    if basic_block.is_empty() {
+        return;
+    }
+
+    match context.next_label {
+        Some(next) if !basic_block.back().unwrap().value.is_terminal() => {
+            basic_block.push_back(sp(loc, C::Jump(next)));
+        }
+        _ => (),
+    }
+    context.blocks.insert(cur_label, basic_block);
+}
+
+fn block_(context: &mut Context, cur_label: &mut Label, blocks: H::Block) -> BasicBlock {
+    use G::Command_ as C;
     use H::Statement_ as S;
+
+    assert!(!blocks.is_empty());
     let mut basic_block = BasicBlock::new();
 
     macro_rules! finish_block {
         (next_label: $next_label:expr) => {{
-            let lbl = mem::replace(&mut cur_label, $next_label);
+            let lbl = mem::replace(cur_label, $next_label);
             let bb = mem::replace(&mut basic_block, BasicBlock::new());
             context.blocks.insert(lbl, bb);
         }};
@@ -303,10 +328,16 @@ fn block(context: &mut Context, mut cur_label: Label, blocks: H::Block) {
         }};
     }
 
-    let loc = blocks.back().unwrap().loc;
     for sp!(loc, stmt_) in blocks {
         match stmt_ {
-            S::Command(c) => basic_block.push_back(command(context, c)),
+            S::Command(c) => {
+                let cmd = command(context, c);
+                let is_terminal = cmd.value.is_terminal();
+                basic_block.push_back(cmd);
+                if is_terminal {
+                    finish_block!(next_label: context.new_label());
+                }
+            }
             S::IfElse {
                 cond: hcond,
                 if_block,
@@ -333,7 +364,7 @@ fn block(context: &mut Context, mut cur_label: Label, blocks: H::Block) {
                 context.next_label = old_next;
             }
             S::While {
-                cond: hcond,
+                cond: (hcond_block, hcond_exp),
                 block: loop_block,
             } => {
                 let loop_cond = context.new_label();
@@ -345,7 +376,11 @@ fn block(context: &mut Context, mut cur_label: Label, blocks: H::Block) {
                 finish_block!(next_label: loop_cond);
 
                 // Loop condition and case to jump into loop or end
-                let cond = exp_(context, *hcond);
+                if !hcond_block.is_empty() {
+                    assert!(basic_block.is_empty());
+                    basic_block = block_(context, cur_label, hcond_block);
+                }
+                let cond = exp_(context, *hcond_exp);
                 let jump_if = C::JumpIf {
                     cond,
                     if_true: loop_body,
@@ -382,18 +417,7 @@ fn block(context: &mut Context, mut cur_label: Label, blocks: H::Block) {
         }
     }
 
-    // return if we ended with did not end with a command
-    if basic_block.is_empty() {
-        return;
-    }
-
-    match context.next_label {
-        Some(next) if !basic_block.back().unwrap().value.is_terminal() => {
-            basic_block.push_back(sp(loc, C::Jump(next)));
-        }
-        _ => (),
-    }
-    context.blocks.insert(cur_label, basic_block);
+    basic_block
 }
 
 fn command(context: &Context, sp!(loc, hc_): H::Command) -> G::Command {
@@ -457,7 +481,7 @@ fn exp_(context: &Context, he: H::Exp) -> G::Exp {
             let name = hcall.name;
             let type_arguments = base_types(context, hcall.type_arguments);
             let arguments = exp(context, hcall.arguments);
-            let acquires = base_types(context, hcall.acquires);
+            let acquires = hcall.acquires;
             let mcall = G::ModuleCall {
                 module,
                 name,
@@ -479,13 +503,17 @@ fn exp_(context: &Context, he: H::Exp) -> G::Exp {
                 .collect();
             E::Pack(s, base_types(context, bs), fields)
         }
-        HE::ExpList(es) => E::ExpList(exp_list(context, es)),
+        HE::ExpList(es) => {
+            assert!(!es.is_empty());
+            E::ExpList(exp_list(context, es))
+        }
         HE::Borrow(mut_, e, f) => E::Borrow(mut_, exp(context, e), f),
         HE::BorrowLocal(mut_, v) => E::BorrowLocal(mut_, v),
         HE::UnresolvedError => {
             assert!(context.has_errors());
             E::UnresolvedError
         }
+        HE::Unreachable => E::Unreachable,
     };
     G::exp(ty, sp(loc, e_))
 }

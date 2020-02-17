@@ -62,14 +62,18 @@ impl StateComputer for ExecutionProxy {
         committed_trees: &ExecutedTrees,
     ) -> Result<ProcessedVMOutput> {
         let pre_execution_instant = Instant::now();
+        debug!(
+            "Executing block {:x}. Parent: {:x}.",
+            block.id(),
+            block.parent_id(),
+        );
+
         // TODO: figure out error handling for the prologue txn
         self.executor
             .execute_block(
                 Self::transactions_from_block(block),
                 parent_executed_trees,
                 committed_trees,
-                block.parent_id(),
-                block.id(),
             )
             .and_then(|output| {
                 let execution_duration = pre_execution_instant.elapsed();
@@ -110,10 +114,11 @@ impl StateComputer for ExecutionProxy {
             })
             .collect();
 
-        self.executor
-            .commit_blocks(committable_blocks, finality_proof, committed_trees)?;
+        let committed_txns =
+            self.executor
+                .commit_blocks(committable_blocks, finality_proof, committed_trees)?;
         counters::BLOCK_COMMIT_DURATION_S.observe_duration(pre_commit_instant.elapsed());
-        if let Err(e) = self.synchronizer.commit().await {
+        if let Err(e) = self.synchronizer.commit(committed_txns).await {
             error!("failed to notify state synchronizer: {:?}", e);
         }
         Ok(())

@@ -15,6 +15,7 @@ extern crate prometheus;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod test_helper;
 
+pub mod backup;
 pub mod errors;
 pub mod schema;
 
@@ -31,6 +32,7 @@ mod transaction_store;
 mod libradb_test;
 
 use crate::{
+    backup::BackupHandler,
     change_set::{ChangeSet, SealedChangeSet},
     errors::LibraDbError,
     event_store::EventStore,
@@ -42,16 +44,15 @@ use crate::{
     system_store::SystemStore,
     transaction_store::TransactionStore,
 };
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 use itertools::{izip, zip_eq};
-use jellyfish_merkle::{iterator::JellyfishMerkleIterator, restore::JellyfishMerkleRestore};
+use jellyfish_merkle::restore::JellyfishMerkleRestore;
 use libra_crypto::hash::{CryptoHash, HashValue};
 use libra_logger::prelude::*;
 use libra_metrics::OpMetrics;
 use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config::AccountResource,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::EventWithProof,
     crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof},
@@ -68,7 +69,7 @@ use libra_types::{
 use once_cell::sync::Lazy;
 use prometheus::{IntCounter, IntGauge, IntGaugeVec};
 use schemadb::{ColumnFamilyOptions, ColumnFamilyOptionsMap, DB, DEFAULT_CF_NAME};
-use std::{convert::TryInto, iter::Iterator, path::Path, sync::Arc, time::Instant};
+use std::{iter::Iterator, path::Path, sync::Arc, time::Instant};
 use storage_proto::StartupInfo;
 use storage_proto::TreeState;
 
@@ -121,8 +122,8 @@ fn error_if_too_many_requested(num_requested: u64, max_allowed: u64) -> Result<(
 /// access to the core Libra data structures.
 pub struct LibraDB {
     db: Arc<DB>,
-    ledger_store: LedgerStore,
-    transaction_store: TransactionStore,
+    ledger_store: Arc<LedgerStore>,
+    transaction_store: Arc<TransactionStore>,
     state_store: Arc<StateStore>,
     event_store: EventStore,
     system_store: SystemStore,
@@ -178,9 +179,9 @@ impl LibraDB {
         LibraDB {
             db: Arc::clone(&db),
             event_store: EventStore::new(Arc::clone(&db)),
-            ledger_store: LedgerStore::new(Arc::clone(&db)),
+            ledger_store: Arc::new(LedgerStore::new(Arc::clone(&db))),
             state_store: Arc::new(StateStore::new(Arc::clone(&db))),
-            transaction_store: TransactionStore::new(Arc::clone(&db)),
+            transaction_store: Arc::new(TransactionStore::new(Arc::clone(&db))),
             system_store: SystemStore::new(Arc::clone(&db)),
             pruner: Pruner::new(Arc::clone(&db), Self::NUM_HISTORICAL_VERSIONS_TO_KEEP),
         }
@@ -237,21 +238,23 @@ impl LibraDB {
         error_if_too_many_requested(limit, MAX_LIMIT)?;
 
         let get_latest = !ascending && start_seq_num == u64::max_value();
-        let account_state =
+        let account_state_with_proof =
             self.get_account_state_with_proof(query_path.address, ledger_version, ledger_version)?;
-        let account_resource = if let Some(account_blob) = &account_state.blob {
-            AccountResource::make_from(&(&account_blob.try_into()?))?
-        } else {
-            bail!("Nothing stored under address: {}", query_path.address);
+
+        let event_key = {
+            let (event_key_opt, _count) =
+                account_state_with_proof.get_event_key_and_count_by_query_path(&query_path.path)?;
+            if let Some(event_key) = event_key_opt {
+                event_key
+            } else {
+                return Ok((Vec::new(), account_state_with_proof));
+            }
         };
-        let event_key = account_resource
-            .get_event_handle_by_query_path(&query_path.path)?
-            .key();
         let cursor = if get_latest {
             // Caller wants the latest, figure out the latest seq_num.
             // In the case of no events on that path, use 0 and expect empty result below.
             self.event_store
-                .get_latest_sequence_number(ledger_version, event_key)?
+                .get_latest_sequence_number(ledger_version, &event_key)?
                 .unwrap_or(0)
         } else {
             start_seq_num
@@ -307,7 +310,7 @@ impl LibraDB {
 
         // We always need to return the account blob to prove that this is indeed the event that was
         // being queried.
-        Ok((events_with_proof, account_state))
+        Ok((events_with_proof, account_state_with_proof))
     }
 
     /// Returns a transaction that is the `seq_num`-th one associated with the given account. If
@@ -362,7 +365,7 @@ impl LibraDB {
         &self,
         txns_to_commit: &[TransactionToCommit],
         first_version: Version,
-        ledger_info_with_sigs: &Option<LedgerInfoWithSignatures>,
+        ledger_info_with_sigs: Option<&LedgerInfoWithSignatures>,
     ) -> Result<()> {
         let num_txns = txns_to_commit.len() as u64;
         // ledger_info_with_sigs could be None if we are doing state synchronization. In this case
@@ -766,27 +769,14 @@ impl LibraDB {
     }
 
     // ================================== Backup APIs ===================================
-    /// Gets an iterator which can yield all accounts in the state tree.
-    pub fn get_account_iter(
-        &self,
-        version: Version,
-    ) -> Result<Box<dyn Iterator<Item = Result<(HashValue, AccountStateBlob)>> + Send>> {
-        let iterator = JellyfishMerkleIterator::new(
-            Arc::clone(&self.state_store),
-            version,
-            HashValue::zero(),
-        )?;
-        Ok(Box::new(iterator))
-    }
 
-    /// Gets the proof that proves a range of accounts.
-    pub fn get_account_state_range_proof(
-        &self,
-        rightmost_key: HashValue,
-        version: Version,
-    ) -> Result<SparseMerkleRangeProof> {
-        self.state_store
-            .get_account_state_range_proof(rightmost_key, version)
+    /// Gets an instance of `BackupHandler` for data backup purpose.
+    pub fn get_backup_handler(&self) -> BackupHandler {
+        BackupHandler::new(
+            Arc::clone(&self.ledger_store),
+            Arc::clone(&self.transaction_store),
+            Arc::clone(&self.state_store),
+        )
     }
 
     pub fn restore_account_state(

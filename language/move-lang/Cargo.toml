@@ -8,17 +8,22 @@ edition = "2018"
 [dependencies]
 codespan = "0.5.0"
 codespan-reporting = "0.5.0"
-hex = "0.3.2"
+hex = "0.4.1"
 regex = "1.1.6"
 structopt = "0.3.3"
-text-diff = "0.4.0"
-petgraph = "0.4.13"
+difference = "2.0"
+petgraph = "0.5.0"
 datatest-stable = { path = "../../common/datatest-stable", version = "0.1.0" }
 
 move-vm = { path = "../vm", package = "vm" }
 move-bytecode-verifier = { path = "../bytecode-verifier", package = "bytecode-verifier" }
 libra-types = { path = "../../types" }
 borrow-graph = { path = "../borrow-graph" }
+
+[dev-dependencies]
+anyhow = "1.0"
+functional-tests = { path = "../functional-tests", version = "0.1.0" }
+tempfile = "3.1.0"
 
 [[test]]
 name = "move_check_testsuite"
@@ -27,3 +32,11 @@ harness = false
 [[test]]
 name = "stdlib_sanity_check"
 harness = false
+
+[[test]]
+name = "functional_testsuite"
+harness = false
+
+[[test]]
+name = "ir_test_coverage"
+harness = true

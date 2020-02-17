@@ -5,6 +5,16 @@ mod driver;
 use driver::*;
 
 #[test]
+fn verify_addition() {
+    test(VERIFY, &["test_mvir/verify-addition.mvir"]);
+}
+
+#[test]
+fn verify_cast() {
+    test(VERIFY, &["test_mvir/verify-cast.mvir"]);
+}
+
+#[test]
 fn verify_create_resource() {
     test(VERIFY, &["test_mvir/verify-create-resource.mvir"]);
 }
@@ -20,8 +30,29 @@ fn verify_local_ref() {
 }
 
 #[test]
+fn verify_multiplication() {
+    test(VERIFY, &["test_mvir/verify-multiplication.mvir"]);
+}
+
+#[test]
 fn verify_ref_param() {
     test(VERIFY, &["test_mvir/verify-ref-param.mvir"]);
+}
+
+#[test]
+fn test_aborts_if() {
+    test(VERIFY, &["test_mvir/test-aborts-if.mvir"]);
+}
+
+#[test]
+fn verify_vector() {
+    test(
+        VERIFY,
+        &[
+            "test_mvir/verify-stdlib/vector.mvir",
+            "test_mvir/verify-vector.mvir",
+        ],
+    );
 }
 
 #[test]
@@ -42,4 +73,14 @@ fn verify_libra_account() {
             verified_std_mvir("libra_account").as_str(),
         ],
     )
+}
+
+#[test]
+fn verify_invariants() {
+    test(VERIFY, &["test_mvir/verify-invariants.mvir"]);
+}
+
+#[test]
+fn verify_synthetics() {
+    test(VERIFY, &["test_mvir/verify-synthetics.mvir"]);
 }

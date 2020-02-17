@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cpu_flamegraph;
 mod multi_region_network_simulation;
 mod packet_loss_random_validators;
 mod performance_benchmark_nodes_down;
@@ -28,19 +29,20 @@ pub use recovery_time::{RecoveryTime, RecoveryTimeParams};
 
 use crate::cluster::Cluster;
 use crate::prometheus::Prometheus;
-use crate::tx_emitter::TxEmitter;
-use futures::future::BoxFuture;
+use crate::report::SuiteReport;
+use crate::tx_emitter::{EmitJobRequest, TxEmitter};
+
+use async_trait::async_trait;
+pub use cpu_flamegraph::{CpuFlamegraph, CpuFlamegraphParams};
 use std::collections::HashMap;
 use structopt::{clap::AppSettings, StructOpt};
 
+#[async_trait]
 pub trait Experiment: Display + Send {
     fn affected_validators(&self) -> HashSet<String> {
         HashSet::new()
     }
-    fn run<'a>(
-        &'a mut self,
-        context: &'a mut Context,
-    ) -> BoxFuture<'a, anyhow::Result<Option<String>>>;
+    async fn run(&mut self, context: &mut Context<'_>) -> anyhow::Result<()>;
     fn deadline(&self) -> Duration;
 }
 
@@ -49,18 +51,31 @@ pub trait ExperimentParam {
     fn build(self, cluster: &Cluster) -> Self::E;
 }
 
-pub struct Context {
-    tx_emitter: TxEmitter,
-    prometheus: Prometheus,
-    cluster: Cluster,
+pub struct Context<'a> {
+    tx_emitter: &'a mut TxEmitter,
+    prometheus: &'a Prometheus,
+    cluster: &'a Cluster,
+    report: &'a mut SuiteReport,
+    global_emit_job_request: &'a mut Option<EmitJobRequest>,
+    emit_to_validator: bool,
 }
 
-impl Context {
-    pub fn new(tx_emitter: TxEmitter, prometheus: Prometheus, cluster: Cluster) -> Self {
+impl<'a> Context<'a> {
+    pub fn new(
+        tx_emitter: &'a mut TxEmitter,
+        prometheus: &'a Prometheus,
+        cluster: &'a Cluster,
+        report: &'a mut SuiteReport,
+        emit_job_request: &'a mut Option<EmitJobRequest>,
+        emit_to_validator: bool,
+    ) -> Self {
         Context {
             tx_emitter,
             prometheus,
             cluster,
+            report,
+            global_emit_job_request: emit_job_request,
+            emit_to_validator,
         }
     }
 }
@@ -96,18 +111,16 @@ pub fn get_experiment(name: &str, args: &[String], cluster: &Cluster) -> Box<dyn
         "packet_loss_random_validators",
         f::<PacketLossRandomValidatorsParams>(),
     );
+    known_experiments.insert("bench", f::<PerformanceBenchmarkNodesDownParams>());
     known_experiments.insert(
-        "performance_benchmark_nodes_down",
-        f::<PerformanceBenchmarkNodesDownParams>(),
-    );
-    known_experiments.insert(
-        "performance_benchmark_three_region_simulation",
+        "bench_three_region",
         f::<PerformanceBenchmarkThreeRegionSimulationParams>(),
     );
     known_experiments.insert(
         "reboot_random_validators",
         f::<RebootRandomValidatorsParams>(),
     );
+    known_experiments.insert("generate_cpu_flamegraph", f::<CpuFlamegraphParams>());
 
     let builder = known_experiments.get(name).expect("Experiment not found");
     builder(args, cluster)

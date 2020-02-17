@@ -5,8 +5,10 @@ use crate::{
     chained_bft::{
         block_storage::{BlockReader, BlockStore},
         network::NetworkSender,
+        persistent_liveness_storage::{PersistentLivenessStorage, RecoveryData},
     },
     counters,
+    state_replication::StateComputer,
 };
 use anyhow::{bail, format_err};
 use consensus_types::block_retrieval::{BlockRetrievalRequest, BlockRetrievalStatus};
@@ -23,6 +25,7 @@ use mirai_annotations::checked_precondition;
 use rand::{prelude::*, Rng};
 use std::{
     clone::Clone,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use termion::color::*;
@@ -76,7 +79,7 @@ impl<T: Payload> BlockStore<T> {
     pub async fn sync_to(
         &self,
         sync_info: &SyncInfo,
-        mut retriever: BlockRetriever,
+        mut retriever: BlockRetriever<T>,
     ) -> anyhow::Result<()> {
         self.process_highest_commit_cert(sync_info.highest_commit_cert().clone(), &mut retriever)
             .await?;
@@ -101,7 +104,7 @@ impl<T: Payload> BlockStore<T> {
     async fn fetch_quorum_cert(
         &self,
         qc: QuorumCert,
-        mut retriever: BlockRetriever,
+        mut retriever: BlockRetriever<T>,
     ) -> anyhow::Result<()> {
         let mut pending = vec![];
         let mut retrieve_qc = qc.clone();
@@ -135,38 +138,19 @@ impl<T: Payload> BlockStore<T> {
     async fn process_highest_commit_cert(
         &self,
         highest_commit_cert: QuorumCert,
-        retriever: &mut BlockRetriever,
+        retriever: &mut BlockRetriever<T>,
     ) -> anyhow::Result<()> {
         if !self.need_sync_for_quorum_cert(&highest_commit_cert) {
             return Ok(());
         }
-        debug!(
-            "Start state sync with peer: {}, to block: {} from {}",
-            retriever.preferred_peer.short_str(),
-            highest_commit_cert.commit_info(),
-            self.root()
-        );
-        let blocks = retriever
-            .retrieve_block_for_qc(&highest_commit_cert, 3)
-            .await?;
-        assert_eq!(
-            blocks.last().expect("should have 3-chain").id(),
-            highest_commit_cert.commit_info().id(),
-        );
-        let mut quorum_certs = vec![];
-        quorum_certs.push(highest_commit_cert.clone());
-        quorum_certs.push(blocks[0].quorum_cert().clone());
-        quorum_certs.push(blocks[1].quorum_cert().clone());
-        // If a node restarts in the middle of state synchronization, it is going to try to catch up
-        // to the stored quorum certs as the new root.
-        self.storage
-            .save_tree(blocks.clone(), quorum_certs.clone())?;
-        let pre_sync_instance = Instant::now();
-        self.state_computer
-            .sync_to(highest_commit_cert.ledger_info().clone())
-            .await?;
-        counters::STATE_SYNC_DURATION_S.observe_duration(pre_sync_instance.elapsed());
-        let (root, root_executed_trees, blocks, quorum_certs) = self.storage.start().await.take();
+        let (root, root_executed_trees, blocks, quorum_certs) = Self::fast_forward_sync(
+            &highest_commit_cert,
+            retriever,
+            self.storage.clone(),
+            self.state_computer.clone(),
+        )
+        .await?
+        .take();
         debug!("{}Sync to{} {}", Fg(Blue), Fg(Reset), root.0);
         self.rebuild(root, root_executed_trees, blocks, quorum_certs)
             .await;
@@ -182,17 +166,56 @@ impl<T: Payload> BlockStore<T> {
         }
         Ok(())
     }
+
+    pub async fn fast_forward_sync<'a>(
+        highest_commit_cert: &'a QuorumCert,
+        retriever: &'a mut BlockRetriever<T>,
+        storage: Arc<dyn PersistentLivenessStorage<T>>,
+        state_computer: Arc<dyn StateComputer<Payload = T>>,
+    ) -> anyhow::Result<RecoveryData<T>> {
+        debug!(
+            "Start state sync with peer: {}, to block: {}",
+            retriever.preferred_peer.short_str(),
+            highest_commit_cert.commit_info(),
+        );
+
+        let blocks = retriever
+            .retrieve_block_for_qc(&highest_commit_cert, 3)
+            .await?;
+        assert_eq!(
+            blocks.last().expect("should have 3-chain").id(),
+            highest_commit_cert.commit_info().id(),
+        );
+        let mut quorum_certs = vec![];
+        quorum_certs.push(highest_commit_cert.clone());
+        quorum_certs.extend(blocks.iter().map(|block| block.quorum_cert().clone()));
+
+        // If a node restarts in the middle of state synchronization, it is going to try to catch up
+        // to the stored quorum certs as the new root.
+        storage.save_tree(blocks.clone(), quorum_certs.clone())?;
+        let pre_sync_instance = Instant::now();
+        state_computer
+            .sync_to(highest_commit_cert.ledger_info().clone())
+            .await?;
+        counters::STATE_SYNC_DURATION_S.observe_duration(pre_sync_instance.elapsed());
+        let recovery_data = storage
+            .start()
+            .await
+            .expect_recovery_data("Failed to construct recovery data after fast forward sync");
+
+        Ok(recovery_data)
+    }
 }
 
 /// BlockRetriever is used internally to retrieve blocks
-pub struct BlockRetriever {
-    network: NetworkSender,
+pub struct BlockRetriever<T> {
+    network: NetworkSender<T>,
     deadline: Instant,
     preferred_peer: Author,
 }
 
-impl BlockRetriever {
-    pub fn new(network: NetworkSender, deadline: Instant, preferred_peer: Author) -> Self {
+impl<T: Payload> BlockRetriever<T> {
+    pub fn new(network: NetworkSender<T>, deadline: Instant, preferred_peer: Author) -> Self {
         Self {
             network,
             deadline,
@@ -211,14 +234,11 @@ impl BlockRetriever {
     /// leader to drive quorum certificate creation The other peers from the quorum certificate
     /// will be randomly tried next.  If all members of the quorum certificate are exhausted, an
     /// error is returned
-    async fn retrieve_block_for_qc<'a, T>(
+    async fn retrieve_block_for_qc<'a>(
         &'a mut self,
         qc: &'a QuorumCert,
         num_blocks: u64,
-    ) -> anyhow::Result<Vec<Block<T>>>
-    where
-        T: Payload,
-    {
+    ) -> anyhow::Result<Vec<Block<T>>> {
         let block_id = qc.certified_block().id();
         let mut peers: Vec<&AccountAddress> = qc.ledger_info().signatures().keys().collect();
         let mut attempt = 0_u32;

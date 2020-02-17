@@ -54,23 +54,29 @@ impl AccountAddress {
     }
 
     pub fn from_hex_literal(literal: &str) -> Result<Self> {
-        let mut hex_string = String::from(&literal[2..]);
-        if hex_string.len() % 2 != 0 {
-            hex_string.insert(0, '0');
-        }
+        ensure!(literal.starts_with("0x"), "literal must start with 0x.");
 
-        let mut result = hex::decode(hex_string.as_str())?;
+        let hex_len = literal.len() - 2;
+        let mut result = if hex_len % 2 != 0 {
+            let mut hex_str = String::with_capacity(hex_len + 1);
+            hex_str.push('0');
+            hex_str.push_str(&literal[2..]);
+            hex::decode(&hex_str)?
+        } else {
+            hex::decode(&literal[2..])?
+        };
+
         let len = result.len();
-        if len < 32 {
-            result.reverse();
-            for _ in len..32 {
-                result.push(0);
-            }
-            result.reverse();
-        }
+        let padded_result = if len < ADDRESS_LENGTH {
+            let mut padded = Vec::with_capacity(ADDRESS_LENGTH);
+            padded.resize(ADDRESS_LENGTH - len, 0u8);
+            padded.append(&mut result);
+            padded
+        } else {
+            result
+        };
 
-        assert!(result.len() >= 32);
-        AccountAddress::try_from(result)
+        AccountAddress::try_from(padded_result)
     }
 }
 

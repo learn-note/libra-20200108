@@ -73,6 +73,28 @@ pub static COMMITTED_TXNS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
 });
 
 /// Histogram of idle time of spent in event processing loop
+pub static STARTUP_SYNC_LOOP_IDLE_DURATION_S: Lazy<DurationHistogram> = Lazy::new(|| {
+    DurationHistogram::new(
+        register_histogram!(
+            "libra_consensus_startup_sync_loop_idle_duration_s",
+            "Histogram of idle time of spent in startup sync loop"
+        )
+        .unwrap(),
+    )
+});
+
+/// Histogram of idle time of spent in event processing loop
+pub static STARTUP_SYNC_LOOP_BUSY_DURATION_S: Lazy<DurationHistogram> = Lazy::new(|| {
+    DurationHistogram::new(
+        register_histogram!(
+            "libra_consensus_startup_sync_loop_busy_duration_s",
+            "Histogram of busy time of spent in startup sync loop"
+        )
+        .unwrap(),
+    )
+});
+
+/// Histogram of idle time of spent in event processing loop
 pub static EVENT_PROCESSING_LOOP_IDLE_DURATION_S: Lazy<DurationHistogram> = Lazy::new(|| {
     DurationHistogram::new(
         register_histogram!(
@@ -316,6 +338,14 @@ pub static BLOCK_EXECUTION_DURATION_S: Lazy<DurationHistogram> = Lazy::new(|| {
         )
         .unwrap(),
     )
+});
+
+pub static UNWRAPPED_PROPOSAL_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "libra_consensus_unwrapped_proposal_size_bytes",
+        "Histogram of proposal size after LCS but before wrapping with GRPC and libra net."
+    )
+    .unwrap()
 });
 
 /// Histogram of duration of a commit procedure (the time it takes for the execution / storage to
