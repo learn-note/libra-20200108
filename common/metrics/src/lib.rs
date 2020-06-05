@@ -4,9 +4,6 @@
 #![forbid(unsafe_code)]
 #![recursion_limit = "128"]
 
-#[macro_use]
-extern crate prometheus;
-
 pub mod counters;
 mod json_encoder;
 mod json_metrics;
@@ -20,19 +17,18 @@ pub use op_counters::{DurationHistogram, OpMetrics};
 mod unit_tests;
 
 // Re-export counter types from prometheus crate
-pub use prometheus::{Histogram, IntCounter, IntCounterVec, IntGauge, IntGaugeVec};
+pub use prometheus::{
+    register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, register_int_gauge_vec, Histogram, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec,
+};
 
 use anyhow::Result;
 use libra_logger::prelude::*;
-use prometheus::{
-    core::{Collector, Metric},
-    proto::MetricType,
-    Encoder, TextEncoder,
-};
+use prometheus::{proto::MetricType, Encoder, TextEncoder};
 use std::{
     collections::HashMap,
     fs::{create_dir_all, File, OpenOptions},
-    hash::BuildHasher,
     io::Write,
     path::Path,
     thread, time,
@@ -120,23 +116,4 @@ pub fn dump_all_metrics_to_file_periodically<P: AsRef<Path>>(
         }
         thread::sleep(time::Duration::from_millis(interval));
     });
-}
-
-pub fn export_counter<M, S>(col: &mut HashMap<String, String, S>, counter: &M)
-where
-    M: Metric,
-    S: BuildHasher,
-{
-    let c = counter.metric();
-    col.insert(
-        c.get_label()[0].get_name().to_string(),
-        c.get_counter().get_value().to_string(),
-    );
-}
-
-pub fn get_metric_name<M>(metric: &M) -> String
-where
-    M: Collector,
-{
-    metric.collect()[0].get_name().to_string()
 }

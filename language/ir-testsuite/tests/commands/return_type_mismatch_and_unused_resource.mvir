@@ -1,15 +1,18 @@
 module M {
-    import 0x0.LibraCoin;
+    resource R { flag: bool }
 
-    // Currently, checking that stack frame can be torn down safely
-    // is done before type checking of return values
-
+    // Type checking is done before memory safety checks
     t1(): bool {
-        let c: LibraCoin.T;
-        c = LibraCoin.zero();
+        let c: Self.R;
+        c = R { flag: false };
         return 0;
     }
+}
+// check: RET_TYPE_MISMATCH_ERROR
 
+//! new-transaction
+module M2 {
+    // Type checking is done before memory safety checks
     t2(): bool {
         let u: u64;
         let r: &u64;
@@ -18,6 +21,28 @@ module M {
         return move(r);
     }
 }
+// check: RET_TYPE_MISMATCH_ERROR
 
-// check: RET_UNSAFE_TO_DESTROY_ERROR
-// check: RET_UNSAFE_TO_DESTROY_ERROR
+//! new-transaction
+module M {
+    resource R { flag: bool }
+
+    t1(): u64 {
+        let c: Self.R;
+        c = R { flag: false };
+        return 0;
+    }
+}
+// check: UNSAFE_RET_UNUSED_RESOURCES
+
+//! new-transaction
+module M2 {
+    t2(): &u64 {
+        let u: u64;
+        let r: &u64;
+        u = 0;
+        r = &u;
+        return move(r);
+    }
+}
+// check: UNSAFE_RET_LOCAL_OR_RESOURCE_STILL_BORROWED

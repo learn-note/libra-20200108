@@ -81,7 +81,7 @@ mod test_helper;
 mod tree_cache;
 
 use anyhow::{bail, ensure, format_err, Result};
-use libra_crypto::{hash::CryptoHash, HashValue};
+use libra_crypto::HashValue;
 use libra_types::{
     account_state_blob::AccountStateBlob,
     proof::{SparseMerkleProof, SparseMerkleRangeProof},
@@ -227,7 +227,7 @@ where
         blob_sets: Vec<Vec<(HashValue, AccountStateBlob)>>,
         first_version: Version,
     ) -> Result<(Vec<HashValue>, TreeUpdateBatch)> {
-        let mut tree_cache = TreeCache::new(self.reader, first_version);
+        let mut tree_cache = TreeCache::new(self.reader, first_version)?;
         for (idx, blob_set) in blob_sets.into_iter().enumerate() {
             assert!(
                 !blob_set.is_empty(),
@@ -422,7 +422,7 @@ where
         }
 
         // 2.2. both are unfinished(They have keys with same length so it's impossible to have one
-        // finished and ther other not). This means the incoming key forks at some point between the
+        // finished and the other not). This means the incoming key forks at some point between the
         // position where step 1 ends and the last nibble, inclusive. Then create a seris of
         // internal nodes the number of which equals to the length of the extra part of the
         // common prefix in step 2, a new leaf node for the incoming key, and update the
@@ -541,13 +541,10 @@ where
                         } else {
                             None
                         },
-                        SparseMerkleProof::new(
-                            Some((leaf_node.account_key(), leaf_node.blob_hash())),
-                            {
-                                siblings.reverse();
-                                siblings
-                            },
-                        ),
+                        SparseMerkleProof::new(Some(leaf_node.into()), {
+                            siblings.reverse();
+                            siblings
+                        }),
                     ));
                 }
                 Node::Null => {
@@ -599,8 +596,15 @@ where
 
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn get_root_hash(&self, version: Version) -> Result<HashValue> {
+        self.get_root_hash_option(version)?
+            .ok_or_else(|| format_err!("Root node not found for version {}.", version))
+    }
+
+    pub fn get_root_hash_option(&self, version: Version) -> Result<Option<HashValue>> {
         let root_node_key = NodeKey::new_empty_path(version);
-        let root_node = self.reader.get_node(&root_node_key)?;
-        Ok(root_node.hash())
+        Ok(self
+            .reader
+            .get_node_option(&root_node_key)?
+            .map(|root_node| root_node.hash()))
     }
 }

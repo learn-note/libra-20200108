@@ -1,27 +1,27 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::block_info::BlockInfo;
 use crate::{
-    account_address::AccountAddress,
+    account_config::LBR_NAME,
     account_state_blob::AccountStateBlob,
+    block_info::BlockInfo,
     ledger_info::LedgerInfo,
     proof::{
-        definition::MAX_ACCUMULATOR_PROOF_DEPTH, AccountStateProof, EventAccumulatorInternalNode,
-        EventAccumulatorProof, EventProof, SparseMerkleInternalNode, SparseMerkleLeafNode,
-        SparseMerkleProof, TestAccumulatorInternalNode, TestAccumulatorProof,
-        TransactionAccumulatorInternalNode, TransactionAccumulatorProof, TransactionProof,
+        definition::MAX_ACCUMULATOR_PROOF_DEPTH, AccountStateProof, AccumulatorExtensionProof,
+        EventAccumulatorInternalNode, EventAccumulatorProof, EventProof, SparseMerkleInternalNode,
+        SparseMerkleLeafNode, SparseMerkleProof, TestAccumulatorInternalNode, TestAccumulatorProof,
+        TransactionAccumulatorInternalNode, TransactionAccumulatorProof, TransactionInfoWithProof,
     },
     transaction::{RawTransaction, Script, Transaction, TransactionInfo},
     vm_error::StatusCode,
 };
 use libra_crypto::{
-    ed25519::*,
+    ed25519::Ed25519PrivateKey,
     hash::{
-        CryptoHash, TestOnlyHash, ACCUMULATOR_PLACEHOLDER_HASH, GENESIS_BLOCK_ID,
+        CryptoHash, TestOnlyHash, TestOnlyHasher, ACCUMULATOR_PLACEHOLDER_HASH, GENESIS_BLOCK_ID,
         SPARSE_MERKLE_PLACEHOLDER_HASH,
     },
-    HashValue,
+    HashValue, PrivateKey, Uniform,
 };
 
 #[test]
@@ -150,8 +150,9 @@ fn test_verify_single_element_sparse_merkle() {
     let blob: AccountStateBlob = b"world".to_vec().into();
     let blob_hash = blob.hash();
     let non_existing_blob = b"world?".to_vec().into();
-    let root_hash = SparseMerkleLeafNode::new(key, blob_hash).hash();
-    let proof = SparseMerkleProof::new(Some((key, blob_hash)), vec![]);
+    let root_node = SparseMerkleLeafNode::new(key, blob_hash);
+    let root_hash = root_node.hash();
+    let proof = SparseMerkleProof::new(Some(root_node), vec![]);
 
     // Trying to show this exact key exists with its value.
     assert!(proof.verify(root_hash, key, Some(&blob)).is_ok());
@@ -192,7 +193,8 @@ fn test_verify_three_element_sparse_merkle() {
     let blob2 = AccountStateBlob::from(b"2".to_vec());
     let blob3 = AccountStateBlob::from(b"3".to_vec());
 
-    let leaf1_hash = SparseMerkleLeafNode::new(key1, blob1.hash()).hash();
+    let leaf1 = SparseMerkleLeafNode::new(key1, blob1.hash());
+    let leaf1_hash = leaf1.hash();
     let leaf2_hash = SparseMerkleLeafNode::new(key2, blob2.hash()).hash();
     let leaf3_hash = SparseMerkleLeafNode::new(key3, blob3.hash()).hash();
     let internal_b_hash = SparseMerkleInternalNode::new(leaf2_hash, leaf3_hash).hash();
@@ -208,7 +210,7 @@ fn test_verify_three_element_sparse_merkle() {
     {
         // Construct a proof of key1.
         let proof = SparseMerkleProof::new(
-            Some((key1, blob1.hash())),
+            Some(leaf1),
             vec![internal_b_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH],
         );
 
@@ -279,16 +281,23 @@ fn test_verify_transaction() {
 
     let ledger_info_to_transaction_info_proof =
         TransactionAccumulatorProof::new(vec![txn_info0_hash, internal_b_hash]);
-    let proof = TransactionProof::new(ledger_info_to_transaction_info_proof, txn_info1);
+    let proof =
+        TransactionInfoWithProof::new(ledger_info_to_transaction_info_proof.clone(), txn_info1);
 
     // The proof can be used to verify txn1.
-    assert!(proof.verify(&ledger_info, txn1_hash, None, 1).is_ok());
-    // Replacing txn1 with some other txn should cause the verification to fail.
-    assert!(proof
-        .verify(&ledger_info, HashValue::random(), None, 1)
-        .is_err());
+    assert!(proof.verify(&ledger_info, 1).is_ok());
     // Trying to show that txn1 is at version 2.
-    assert!(proof.verify(&ledger_info, txn1_hash, None, 2).is_err());
+    assert!(proof.verify(&ledger_info, 2).is_err());
+    // Replacing txn1 with some other txn should cause the verification to fail.
+    let fake_txn_info = TransactionInfo::new(
+        HashValue::random(),
+        state_root1_hash,
+        event_root1_hash,
+        /* gas_used = */ 0,
+        /* major_status = */ StatusCode::EXECUTED,
+    );
+    let proof = TransactionInfoWithProof::new(ledger_info_to_transaction_info_proof, fake_txn_info);
+    assert!(proof.verify(&ledger_info, 1).is_err());
 }
 
 #[test]
@@ -325,7 +334,8 @@ fn test_verify_account_state_and_event() {
     let blob3 = AccountStateBlob::from(b"value3".to_vec());
 
     let leaf1_hash = SparseMerkleLeafNode::new(key1, blob1.hash()).hash();
-    let leaf2_hash = SparseMerkleLeafNode::new(key2, blob2.hash()).hash();
+    let leaf2 = SparseMerkleLeafNode::new(key2, blob2.hash());
+    let leaf2_hash = leaf2.hash();
     let leaf3_hash = SparseMerkleLeafNode::new(key3, blob3.hash()).hash();
     let internal_d_hash = SparseMerkleInternalNode::new(leaf2_hash, leaf3_hash).hash();
     let internal_c_hash = SparseMerkleInternalNode::new(leaf1_hash, internal_d_hash).hash();
@@ -335,14 +345,16 @@ fn test_verify_account_state_and_event() {
     let txn_info0_hash = b"hellohello".test_only_hash();
     let txn_info1_hash = b"worldworld".test_only_hash();
 
-    let (privkey, pubkey) = compat::generate_keypair(None);
+    let privkey = Ed25519PrivateKey::generate_for_testing();
+    let pubkey = privkey.public_key();
     let txn2_hash = Transaction::UserTransaction(
         RawTransaction::new_script(
-            AccountAddress::from_public_key(&pubkey),
+            crate::account_address::from_public_key(&pubkey),
             /* sequence_number = */ 0,
-            Script::new(vec![], vec![]),
+            Script::new(vec![], vec![], vec![]),
             /* max_gas_amount = */ 0,
             /* gas_unit_price = */ 0,
+            /* gas_currency_code = */ LBR_NAME.to_owned(),
             /* expiration_time = */ std::time::Duration::new(0, 0),
         )
         .sign(&privkey, pubkey)
@@ -382,12 +394,14 @@ fn test_verify_account_state_and_event() {
     let ledger_info_to_transaction_info_proof =
         TransactionAccumulatorProof::new(vec![*ACCUMULATOR_PLACEHOLDER_HASH, internal_a_hash]);
     let transaction_info_to_account_proof = SparseMerkleProof::new(
-        Some((key2, blob2.hash())),
+        Some(leaf2),
         vec![leaf3_hash, leaf1_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH],
     );
     let account_state_proof = AccountStateProof::new(
-        ledger_info_to_transaction_info_proof.clone(),
-        txn_info2.clone(),
+        TransactionInfoWithProof::new(
+            ledger_info_to_transaction_info_proof.clone(),
+            txn_info2.clone(),
+        ),
         transaction_info_to_account_proof,
     );
 
@@ -422,8 +436,7 @@ fn test_verify_account_state_and_event() {
 
     let transaction_info_to_event_proof = EventAccumulatorProof::new(vec![event1_hash]);
     let event_proof = EventProof::new(
-        ledger_info_to_transaction_info_proof,
-        txn_info2,
+        TransactionInfoWithProof::new(ledger_info_to_transaction_info_proof, txn_info2),
         transaction_info_to_event_proof,
     );
 
@@ -446,4 +459,44 @@ fn test_verify_account_state_and_event() {
             /* event_version_within_transaction = */ 0,
         )
         .is_err());
+}
+
+// This test does the following:
+// 1) Test that empty has a well defined definition
+// 2) Test a single value
+// 3) Test multiple values
+// 4) Random nonsense returns an error
+#[test]
+fn test_accumulator_extension_proof() {
+    // Test empty
+    let empty = AccumulatorExtensionProof::<TestOnlyHasher>::new(vec![], 0, vec![]);
+
+    let derived_tree = empty.verify(*ACCUMULATOR_PLACEHOLDER_HASH).unwrap();
+    assert_eq!(*ACCUMULATOR_PLACEHOLDER_HASH, derived_tree.root_hash());
+    assert_eq!(derived_tree.version(), 0);
+
+    // Test a single value
+    HashValue::zero();
+    let one_tree =
+        AccumulatorExtensionProof::<TestOnlyHasher>::new(vec![], 0, vec![HashValue::zero()]);
+
+    let derived_tree = one_tree.verify(*ACCUMULATOR_PLACEHOLDER_HASH).unwrap();
+    assert_eq!(HashValue::zero(), derived_tree.root_hash());
+    assert_eq!(derived_tree.version(), 0);
+
+    // Test multiple values
+    let two_tree = AccumulatorExtensionProof::<TestOnlyHasher>::new(
+        vec![HashValue::zero()],
+        1,
+        vec![HashValue::zero()],
+    );
+
+    let derived_tree = two_tree.verify(HashValue::zero()).unwrap();
+    let two_hash = TestAccumulatorInternalNode::new(HashValue::zero(), HashValue::zero()).hash();
+    assert_eq!(two_hash, derived_tree.root_hash());
+    assert_eq!(derived_tree.version(), 1);
+
+    // Test nonsense breaks
+    let derived_tree_err = two_tree.verify(*ACCUMULATOR_PLACEHOLDER_HASH);
+    assert!(derived_tree_err.is_err());
 }

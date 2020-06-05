@@ -13,7 +13,7 @@ const KEEP_TMP: &str = "KEEP";
 // Runs all tests under the test/testsuite directory.
 fn sanity_check_testsuite(path: &Path) -> datatest_stable::Result<()> {
     let mut targets = vec![path.to_str().unwrap().to_owned()];
-    targets.append(&mut stdlib_files());
+    targets.append(&mut stdlib_files(STD_LIB_DIR));
     let sender = Some(Address::LIBRA_CORE);
 
     let out_path = path.with_extension(OUT_EXT);
@@ -21,7 +21,7 @@ fn sanity_check_testsuite(path: &Path) -> datatest_stable::Result<()> {
     let (files, units_or_errors) = move_compile_no_report(&targets, &[], sender)?;
     let errors = match units_or_errors {
         Err(errors) => errors,
-        Ok(units) => move_lang::to_bytecode::translate::verify_units(units).1,
+        Ok(units) => move_lang::compiled_unit::verify_units(units).1,
     };
     let has_errors = !errors.is_empty();
     let error_buffer = if has_errors {
@@ -48,6 +48,6 @@ fn sanity_check_testsuite(path: &Path) -> datatest_stable::Result<()> {
 
 datatest_stable::harness!(
     sanity_check_testsuite,
-    "stdlib/transaction_scripts",
+    STD_LIB_TRANSACTION_SCRIPTS_DIR,
     r".*\.move"
 );

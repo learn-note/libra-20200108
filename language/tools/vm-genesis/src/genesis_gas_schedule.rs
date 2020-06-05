@@ -3,31 +3,45 @@
 
 //! This file contains the starting gas schedule published at genesis.
 
-use lcs;
+use move_core_types::gas_schedule::GasCost;
 use once_cell::sync::Lazy;
 use vm::{
     file_format::{
-        AddressPoolIndex, ByteArrayPoolIndex, Bytecode, FieldDefinitionIndex, FunctionHandleIndex,
-        StructDefinitionIndex, NO_TYPE_ACTUALS, NUMBER_OF_NATIVE_FUNCTIONS,
+        Bytecode, ConstantPoolIndex, FieldHandleIndex, FieldInstantiationIndex,
+        FunctionHandleIndex, FunctionInstantiationIndex, StructDefInstantiationIndex,
+        StructDefinitionIndex, NUMBER_OF_NATIVE_FUNCTIONS,
     },
-    gas_schedule::{CostTable, GasCost, GAS_SCHEDULE_NAME, MAXIMUM_NUMBER_OF_GAS_UNITS},
+    file_format_common::instruction_key,
 };
-use vm_runtime::{
-    chain_state::TransactionExecutionContext, data_cache::RemoteCache, move_vm::MoveVM,
-    system_module_names::GAS_SCHEDULE_MODULE,
-};
-use vm_runtime_types::value::Value;
 
-static INITIAL_GAS_SCHEDULE: Lazy<Vec<u8>> = Lazy::new(|| {
+pub(crate) static INITIAL_GAS_SCHEDULE: Lazy<(Vec<u8>, Vec<u8>)> = Lazy::new(|| {
     use Bytecode::*;
-    let instrs = vec![
+    let mut instrs = vec![
         (
-            MoveToSender(StructDefinitionIndex::new(0), NO_TYPE_ACTUALS),
+            MoveToSender(StructDefinitionIndex::new(0)),
             GasCost::new(774, 1),
+        ),
+        (
+            MoveToSenderGeneric(StructDefInstantiationIndex::new(0)),
+            GasCost::new(774, 1),
+        ),
+        (
+            MoveTo(StructDefinitionIndex::new(0)),
+            /* MoveToSender + ReadRef == 774 + 51 == 825 */
+            GasCost::new(825, 1),
+        ),
+        (
+            MoveToGeneric(StructDefInstantiationIndex::new(0)),
+            /* MoveToSender + ReadRef == 774 + 51 == 825 */
+            GasCost::new(825, 1),
         ),
         (GetTxnSenderAddress, GasCost::new(30, 1)),
         (
-            MoveFrom(StructDefinitionIndex::new(0), NO_TYPE_ACTUALS),
+            MoveFrom(StructDefinitionIndex::new(0)),
+            GasCost::new(917, 1),
+        ),
+        (
+            MoveFromGeneric(StructDefInstantiationIndex::new(0)),
             GasCost::new(917, 1),
         ),
         (BrTrue(0), GasCost::new(31, 1)),
@@ -35,17 +49,24 @@ static INITIAL_GAS_SCHEDULE: Lazy<Vec<u8>> = Lazy::new(|| {
         (Mul, GasCost::new(41, 1)),
         (MoveLoc(0), GasCost::new(41, 1)),
         (And, GasCost::new(49, 1)),
-        (GetTxnPublicKey, GasCost::new(41, 1)),
         (Pop, GasCost::new(27, 1)),
         (BitAnd, GasCost::new(44, 1)),
         (ReadRef, GasCost::new(51, 1)),
         (Sub, GasCost::new(44, 1)),
         (
-            MutBorrowField(FieldDefinitionIndex::new(0)),
+            MutBorrowField(FieldHandleIndex::new(0)),
             GasCost::new(58, 1),
         ),
         (
-            ImmBorrowField(FieldDefinitionIndex::new(0)),
+            MutBorrowFieldGeneric(FieldInstantiationIndex::new(0)),
+            GasCost::new(58, 1),
+        ),
+        (
+            ImmBorrowField(FieldHandleIndex::new(0)),
+            GasCost::new(58, 1),
+        ),
+        (
+            ImmBorrowFieldGeneric(FieldInstantiationIndex::new(0)),
             GasCost::new(58, 1),
         ),
         (Add, GasCost::new(45, 1)),
@@ -62,70 +83,74 @@ static INITIAL_GAS_SCHEDULE: Lazy<Vec<u8>> = Lazy::new(|| {
         (Abort, GasCost::new(39, 1)),
         (MutBorrowLoc(0), GasCost::new(45, 1)),
         (ImmBorrowLoc(0), GasCost::new(45, 1)),
-        (LdAddr(AddressPoolIndex::new(0)), GasCost::new(36, 1)),
+        (LdConst(ConstantPoolIndex::new(0)), GasCost::new(36, 1)),
         (Ge, GasCost::new(46, 1)),
         (Xor, GasCost::new(46, 1)),
         (Shl, GasCost::new(46, 1)),
         (Shr, GasCost::new(46, 1)),
         (Neq, GasCost::new(51, 1)),
         (Not, GasCost::new(35, 1)),
+        (Call(FunctionHandleIndex::new(0)), GasCost::new(197, 1)),
         (
-            Call(FunctionHandleIndex::new(0), NO_TYPE_ACTUALS),
+            CallGeneric(FunctionInstantiationIndex::new(0)),
             GasCost::new(197, 1),
         ),
         (Le, GasCost::new(47, 1)),
         (Branch(0), GasCost::new(10, 1)),
+        (Unpack(StructDefinitionIndex::new(0)), GasCost::new(94, 1)),
         (
-            Unpack(StructDefinitionIndex::new(0), NO_TYPE_ACTUALS),
+            UnpackGeneric(StructDefInstantiationIndex::new(0)),
             GasCost::new(94, 1),
         ),
         (Or, GasCost::new(43, 1)),
         (LdFalse, GasCost::new(30, 1)),
         (LdTrue, GasCost::new(29, 1)),
-        (GetTxnGasUnitPrice, GasCost::new(29, 1)),
         (Mod, GasCost::new(42, 1)),
         (BrFalse(0), GasCost::new(29, 1)),
+        (Exists(StructDefinitionIndex::new(0)), GasCost::new(856, 1)),
         (
-            Exists(StructDefinitionIndex::new(0), NO_TYPE_ACTUALS),
+            ExistsGeneric(StructDefInstantiationIndex::new(0)),
             GasCost::new(856, 1),
         ),
-        (GetGasRemaining, GasCost::new(32, 1)),
         (BitOr, GasCost::new(45, 1)),
-        (GetTxnMaxGasUnits, GasCost::new(34, 1)),
-        (GetTxnSequenceNumber, GasCost::new(29, 1)),
         (FreezeRef, GasCost::new(10, 1)),
         (
-            MutBorrowGlobal(StructDefinitionIndex::new(0), NO_TYPE_ACTUALS),
+            MutBorrowGlobal(StructDefinitionIndex::new(0)),
             GasCost::new(929, 1),
         ),
         (
-            ImmBorrowGlobal(StructDefinitionIndex::new(0), NO_TYPE_ACTUALS),
+            MutBorrowGlobalGeneric(StructDefInstantiationIndex::new(0)),
+            GasCost::new(929, 1),
+        ),
+        (
+            ImmBorrowGlobal(StructDefinitionIndex::new(0)),
+            GasCost::new(929, 1),
+        ),
+        (
+            ImmBorrowGlobalGeneric(StructDefInstantiationIndex::new(0)),
             GasCost::new(929, 1),
         ),
         (Div, GasCost::new(41, 1)),
         (Eq, GasCost::new(48, 1)),
-        (LdByteArray(ByteArrayPoolIndex::new(0)), GasCost::new(56, 1)),
         (Gt, GasCost::new(46, 1)),
+        (Pack(StructDefinitionIndex::new(0)), GasCost::new(73, 1)),
         (
-            Pack(StructDefinitionIndex::new(0), NO_TYPE_ACTUALS),
+            PackGeneric(StructDefInstantiationIndex::new(0)),
             GasCost::new(73, 1),
         ),
+        (Nop, GasCost::new(10, 1)),
     ];
+    // Note that the LibraVM is expecting the table sorted by instruction order.
+    instrs.sort_by_key(|cost| instruction_key(&cost.0));
+    let raw_instruction_table = instrs.into_iter().map(|(_, cost)| cost).collect::<Vec<_>>();
     // TODO Zero for now, this is going to be filled in later
     let native_table = (0..NUMBER_OF_NATIVE_FUNCTIONS)
         .map(|_| GasCost::new(0, 0))
         .collect::<Vec<GasCost>>();
-    let cost_table = CostTable::new(instrs, native_table);
-    lcs::to_bytes(&cost_table).expect("Unable to serialize genesis gas schedule for instructions")
+    (
+        lcs::to_bytes(&raw_instruction_table)
+            .expect("Unable to serialize genesis gas schedule for instructions"),
+        lcs::to_bytes(&native_table)
+            .expect("Unable to serialize genesis gas schedule for instructions"),
+    )
 });
-
-pub(crate) fn initial_gas_schedule(move_vm: &MoveVM, data_view: &dyn RemoteCache) -> Value {
-    let struct_def = move_vm
-        .resolve_struct_def_by_name(
-            &GAS_SCHEDULE_MODULE,
-            &GAS_SCHEDULE_NAME,
-            &mut TransactionExecutionContext::new(*MAXIMUM_NUMBER_OF_GAS_UNITS, data_view),
-        )
-        .expect("GasSchedule Module must exist");
-    Value::simple_deserialize(&INITIAL_GAS_SCHEDULE, struct_def).unwrap()
-}

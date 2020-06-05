@@ -5,22 +5,58 @@
 // A config entry starts with "//!", differentiating it from a directive.
 
 use crate::{common::strip, errors::*, genesis_accounts::make_genesis_accounts};
-use language_e2e_tests::account::{Account, AccountData};
+use language_e2e_tests::{
+    account::{Account, AccountData, AccountTypeSpecifier},
+    keygen::KeyGen,
+};
 use libra_config::generator;
 use libra_crypto::PrivateKey;
-use libra_types::crypto_proxies::ValidatorSet;
+use libra_types::account_config;
+use move_core_types::identifier::Identifier;
+use once_cell::sync::Lazy;
 use std::{
     collections::{btree_map, BTreeMap},
     str::FromStr,
 };
 
-// unit: microlibra
-const DEFAULT_BALANCE: u64 = 1_000_000;
+static DEFAULT_BALANCE: Lazy<Balance> = Lazy::new(|| Balance {
+    amount: 1_000_000,
+    currency_code: account_config::from_currency_code_string(account_config::LBR_NAME).unwrap(),
+});
 
 #[derive(Debug)]
 pub enum Role {
     /// Means that the account is a current validator; its address is in the on-chain validator set
     Validator,
+}
+
+#[derive(Debug, Clone)]
+pub struct Balance {
+    pub amount: u64,
+    pub currency_code: Identifier,
+}
+
+impl FromStr for Balance {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        // TODO: Try to get this from the on-chain config?
+        let coin_types = vec!["LBR", "Coin1", "Coin2"];
+        let mut coin_type: Vec<&str> = coin_types.into_iter().filter(|x| s.ends_with(x)).collect();
+        let currency_code = coin_type.pop().unwrap_or("LBR");
+        if !coin_type.is_empty() {
+            return Err(ErrorKind::Other(
+                "Multiple coin types supplied for account. Accounts are single currency"
+                    .to_string(),
+            )
+            .into());
+        }
+        let s = s.trim_end_matches(currency_code);
+        Ok(Balance {
+            amount: s.parse::<u64>()?,
+            currency_code: account_config::from_currency_code_string(currency_code)?,
+        })
+    }
 }
 
 /// Struct that specifies the initial setup of an account.
@@ -29,11 +65,13 @@ pub struct AccountDefinition {
     /// Name of the account. The name is case insensitive.
     pub name: String,
     /// The initial balance of the account.
-    pub balance: Option<u64>,
+    pub balance: Option<Balance>,
     /// The initial sequence number of the account.
     pub sequence_number: Option<u64>,
     /// Special role this account has in the system (if any)
     pub role: Option<Role>,
+    /// Specifier on what type of account this is. Default is VASP.
+    pub account_type_specifier: Option<AccountTypeSpecifier>,
 }
 
 impl FromStr for Role {
@@ -56,13 +94,13 @@ pub enum Entry {
 
 impl Entry {
     pub fn is_validator(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Entry::AccountDefinition(AccountDefinition {
                 role: Some(Role::Validator),
                 ..
-            }) => true,
-            _ => false,
-        }
+            })
+        )
     }
 }
 
@@ -86,14 +124,19 @@ impl FromStr for Entry {
                 )
                 .into());
             }
-            let balance = v.get(1).and_then(|s| s.parse::<u64>().ok());
+            let balance = v.get(1).and_then(|s| s.parse::<Balance>().ok());
             let sequence_number = v.get(2).and_then(|s| s.parse::<u64>().ok());
             let role = v.get(3).and_then(|s| s.parse::<Role>().ok());
+            // These two are mutually exclusive, so we can double-use the third position
+            let account_type_specifier = v
+                .get(3)
+                .and_then(|s| s.parse::<AccountTypeSpecifier>().ok());
             return Ok(Entry::AccountDefinition(AccountDefinition {
                 name: v[0].to_string(),
                 balance,
                 sequence_number,
                 role,
+                account_type_specifier,
             }));
         }
         Err(ErrorKind::Other(format!("failed to parse '{}' as global config entry", s)).into())
@@ -107,51 +150,63 @@ pub struct Config {
     pub accounts: BTreeMap<String, AccountData>,
     pub genesis_accounts: BTreeMap<String, Account>,
     /// The validator set after genesis
-    pub validator_set: ValidatorSet,
+    pub validator_accounts: usize,
 }
 
 impl Config {
     pub fn build(entries: &[Entry]) -> Result<Self> {
         let mut accounts = BTreeMap::new();
         let mut validator_accounts = entries.iter().filter(|entry| entry.is_validator()).count();
+        let total_validator_accounts = validator_accounts;
 
         // generate a validator set with |validator_accounts| validators
-        let (validator_keys, validator_set) = if validator_accounts > 0 {
+        let validator_keys = if validator_accounts > 0 {
             let mut swarm = generator::validator_swarm_for_testing(validator_accounts);
-            let validator_keys: BTreeMap<_, _> = swarm
+            swarm
                 .nodes
                 .iter_mut()
                 .map(|c| {
-                    let peer_id = c.validator_network.as_ref().unwrap().peer_id;
+                    let peer_id = c.validator_network.as_ref().unwrap().peer_id();
                     let account_keypair =
-                        c.test.as_mut().unwrap().account_keypair.as_mut().unwrap();
+                        c.test.as_mut().unwrap().operator_keypair.as_mut().unwrap();
                     let privkey = account_keypair.take_private().unwrap();
                     (peer_id, privkey)
                 })
-                .collect();
-            (validator_keys, swarm.validator_set)
+                .collect::<Vec<_>>()
         } else {
-            (BTreeMap::new(), ValidatorSet::new(vec![]))
+            vec![]
         };
+
+        // key generator with a fixed seed
+        // this is important as it ensures the tests are deterministic
+        let mut keygen = KeyGen::from_seed([0x1f; 32]);
 
         // initialize the keys of validator entries with the validator set
         // enhance type of config to contain a validator set, use it to initialize genesis
         for entry in entries {
             match entry {
                 Entry::AccountDefinition(def) => {
+                    let balance = def.balance.as_ref().unwrap_or(&DEFAULT_BALANCE).clone();
                     let account_data = if entry.is_validator() {
                         validator_accounts -= 1;
-                        let privkey = validator_keys.iter().nth(validator_accounts).unwrap().1;
+                        let privkey = &validator_keys.get(validator_accounts).unwrap().1;
                         AccountData::with_keypair(
                             privkey.clone(),
                             privkey.public_key(),
-                            def.balance.unwrap_or(DEFAULT_BALANCE),
+                            balance.amount,
+                            balance.currency_code,
                             def.sequence_number.unwrap_or(0),
+                            def.account_type_specifier.unwrap_or_default(),
                         )
                     } else {
-                        AccountData::new(
-                            def.balance.unwrap_or(DEFAULT_BALANCE),
+                        let (privkey, pubkey) = keygen.generate_keypair();
+                        AccountData::with_keypair(
+                            privkey,
+                            pubkey,
+                            balance.amount,
+                            balance.currency_code,
                             def.sequence_number.unwrap_or(0),
+                            def.account_type_specifier.unwrap_or_default(),
                         )
                     };
                     let name = def.name.to_ascii_lowercase();
@@ -173,15 +228,21 @@ impl Config {
         }
 
         if let btree_map::Entry::Vacant(entry) = accounts.entry("default".to_string()) {
-            entry.insert(AccountData::new(
-                DEFAULT_BALANCE,
-                /* sequence_number */ 0,
+            let (privkey, pubkey) = keygen.generate_keypair();
+            entry.insert(AccountData::with_keypair(
+                privkey,
+                pubkey,
+                DEFAULT_BALANCE.amount,
+                DEFAULT_BALANCE.currency_code.clone(),
+                /* sequence_number */
+                0,
+                /* is_empty_account_type */ AccountTypeSpecifier::default(),
             ));
         }
         Ok(Config {
             accounts,
             genesis_accounts: make_genesis_accounts(),
-            validator_set,
+            validator_accounts: total_validator_accounts,
         })
     }
 

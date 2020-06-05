@@ -6,10 +6,7 @@ use crate::{pruner, LibraDB};
 use jellyfish_merkle::restore::JellyfishMerkleRestore;
 use libra_crypto::hash::CryptoHash;
 use libra_temppath::TempPath;
-use libra_types::{
-    account_address::{AccountAddress, ADDRESS_LENGTH},
-    account_state_blob::AccountStateBlob,
-};
+use libra_types::{account_address::AccountAddress, account_state_blob::AccountStateBlob};
 use proptest::{collection::hash_map, prelude::*};
 
 fn put_account_state_set(
@@ -82,9 +79,9 @@ fn verify_state_in_store(
 #[test]
 fn test_empty_store() {
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
+    let db = LibraDB::new_for_test(&tmp_dir);
     let store = &db.state_store;
-    let address = AccountAddress::new([1u8; ADDRESS_LENGTH]);
+    let address = AccountAddress::new([1u8; AccountAddress::LENGTH]);
     assert!(store
         .get_account_state_with_proof_by_version(address, 0)
         .is_err());
@@ -93,11 +90,11 @@ fn test_empty_store() {
 #[test]
 fn test_state_store_reader_writer() {
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
+    let db = LibraDB::new_for_test(&tmp_dir);
     let store = &db.state_store;
-    let address1 = AccountAddress::new([1u8; ADDRESS_LENGTH]);
-    let address2 = AccountAddress::new([2u8; ADDRESS_LENGTH]);
-    let address3 = AccountAddress::new([3u8; ADDRESS_LENGTH]);
+    let address1 = AccountAddress::new([1u8; AccountAddress::LENGTH]);
+    let address2 = AccountAddress::new([2u8; AccountAddress::LENGTH]);
+    let address3 = AccountAddress::new([3u8; AccountAddress::LENGTH]);
     let value1 = AccountStateBlob::from(vec![0x01]);
     let value1_update = AccountStateBlob::from(vec![0x00]);
     let value2 = AccountStateBlob::from(vec![0x02]);
@@ -137,9 +134,9 @@ fn test_state_store_reader_writer() {
 
 #[test]
 fn test_retired_records() {
-    let address1 = AccountAddress::new([1u8; ADDRESS_LENGTH]);
-    let address2 = AccountAddress::new([2u8; ADDRESS_LENGTH]);
-    let address3 = AccountAddress::new([3u8; ADDRESS_LENGTH]);
+    let address1 = AccountAddress::new([1u8; AccountAddress::LENGTH]);
+    let address2 = AccountAddress::new([2u8; AccountAddress::LENGTH]);
+    let address3 = AccountAddress::new([3u8; AccountAddress::LENGTH]);
     let value1 = AccountStateBlob::from(vec![0x01]);
     let value2 = AccountStateBlob::from(vec![0x02]);
     let value2_update = AccountStateBlob::from(vec![0x12]);
@@ -147,7 +144,7 @@ fn test_retired_records() {
     let value3_update = AccountStateBlob::from(vec![0x13]);
 
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
+    let db = LibraDB::new_for_test(&tmp_dir);
     let store = &db.state_store;
 
     // Update.
@@ -240,13 +237,15 @@ proptest! {
         let kvs: Vec<_> = input.into_iter().collect();
 
         let tmp_dir = TempPath::new();
-        let db = LibraDB::new(&tmp_dir);
+        let db = LibraDB::new_for_test(&tmp_dir);
         let store = &db.state_store;
         init_store(&store, kvs.clone().into_iter());
 
         // Test iterator at each version.
         for i in 0..kvs.len() {
-            let actual_values = db.get_account_iter(i as Version)
+            let actual_values = db
+                .get_backup_handler()
+                .get_account_iter(i as Version)
                 .unwrap()
                 .collect::<Result<Vec<_>>>()
                 .unwrap();
@@ -268,7 +267,7 @@ proptest! {
             })
     ) {
         let tmp_dir1 = TempPath::new();
-        let db1 = LibraDB::new(&tmp_dir1);
+        let db1 = LibraDB::new_for_test(&tmp_dir1);
         let store1 = &db1.state_store;
         init_store(&store1, input.clone().into_iter());
 
@@ -276,7 +275,7 @@ proptest! {
         let expected_root_hash = store1.get_root_hash(version).unwrap();
 
         let tmp_dir2 = TempPath::new();
-        let db2 = LibraDB::new(&tmp_dir2);
+        let db2 = LibraDB::new_for_test(&tmp_dir2);
         let store2 = &db2.state_store;
 
         let mut restore =
@@ -326,7 +325,7 @@ proptest! {
             })
     ) {
         let tmp_dir1 = TempPath::new();
-        let db1 = LibraDB::new(&tmp_dir1);
+        let db1 = LibraDB::new_for_test(&tmp_dir1);
         let store1 = &db1.state_store;
         init_store(&store1, input.clone().into_iter());
 
@@ -334,7 +333,7 @@ proptest! {
         let expected_root_hash = store1.get_root_hash(version).unwrap();
 
         let tmp_dir2 = TempPath::new();
-        let db2 = LibraDB::new(&tmp_dir2);
+        let db2 = LibraDB::new_for_test(&tmp_dir2);
         let store2 = &db2.state_store;
 
         let mut restore =

@@ -3,7 +3,6 @@
 
 use crate::error::{Error, Result};
 use serde::{ser, Serialize};
-use std::collections::BTreeMap;
 
 /// Serialize the given data structure as a `Vec<u8>` of LCS.
 ///
@@ -41,9 +40,9 @@ use std::collections::BTreeMap;
 ///
 /// let bytes = to_bytes(&service).unwrap();
 /// let expected = vec![
-///     0xc0, 0xa8, 0x01, 0x01, 0x03, 0x00, 0x00, 0x00,
-///     0x41, 0x1f, 0x42, 0x1f, 0x43, 0x1f, 0x01, 0x88,
-///     0x13, 0x00, 0x00, 0x00,
+///     0xc0, 0xa8, 0x01, 0x01, 0x03, 0x41, 0x1f, 0x42,
+///     0x1f, 0x43, 0x1f, 0x01, 0x88, 0x13, 0x00, 0x00,
+///     0x00,
 /// ];
 /// assert_eq!(bytes, expected);
 /// ```
@@ -51,47 +50,101 @@ pub fn to_bytes<T>(value: &T) -> Result<Vec<u8>>
 where
     T: ?Sized + Serialize,
 {
-    let mut serializer = Serializer::new();
-    value.serialize(&mut serializer)?;
-    Ok(serializer.end())
+    let mut output = Vec::new();
+    serialize_into(&mut output, value)?;
+    Ok(output)
+}
+
+/// Same as `to_bytes` but write directly into an `std::io::Write` object.
+pub fn serialize_into<W, T>(write: &mut W, value: &T) -> Result<()>
+where
+    W: std::io::Write,
+    T: ?Sized + Serialize,
+{
+    let serializer = Serializer::new(write);
+    value.serialize(serializer)
+}
+
+struct WriteCounter(usize);
+
+impl std::io::Write for WriteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let len = buf.len();
+        self.0 += len;
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Same as `to_bytes` but only return the size of the serialized bytes.
+pub fn serialized_size<T>(value: &T) -> Result<usize>
+where
+    T: ?Sized + Serialize,
+{
+    let mut counter = WriteCounter(0);
+    serialize_into(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+pub fn is_human_readable() -> bool {
+    let mut output = Vec::new();
+    let serializer = Serializer::new(&mut output);
+    ser::Serializer::is_human_readable(&serializer)
 }
 
 /// Serialization implementation for LCS
-struct Serializer {
-    output: Vec<u8>,
+struct Serializer<'a, W> {
+    output: &'a mut W,
 }
 
-impl Serializer {
+impl<'a, W> Serializer<'a, W>
+where
+    W: std::io::Write,
+{
     /// Creates a new `Serializer` which will emit LCS.
-    fn new() -> Self {
-        Self { output: Vec::new() }
+    fn new(output: &'a mut W) -> Self {
+        Self { output }
     }
 
-    /// The `Serializer::end` method should be called after a type has been
-    /// fully serialized. This will return the buffer containing the LCS
-    /// serialized data.
-    fn end(self) -> Vec<u8> {
-        self.output
+    fn output_u32_as_uleb128(&mut self, mut value: u32) -> Result<()> {
+        while value >= 0x80 {
+            // Write 7 (lowest) bits of data and set the 8th bit to 1.
+            let byte = (value & 0x7f) as u8;
+            self.output.write_all(&[byte | 0x80])?;
+            value >>= 7;
+        }
+        // Write the remaining bits of data and set the highest bit to 0.
+        self.output.write_all(&[value as u8])?;
+        Ok(())
+    }
+
+    fn output_variant_index(&mut self, v: u32) -> Result<()> {
+        self.output_u32_as_uleb128(v)
     }
 
     /// Serialize a sequence length as a u32.
-    fn serialize_seq_len(&mut self, len: usize) -> Result<()> {
-        use serde::ser::Serializer;
+    fn output_seq_len(&mut self, len: usize) -> Result<()> {
         if len > crate::MAX_SEQUENCE_LENGTH {
             return Err(Error::ExceededMaxLen(len));
         }
-        self.serialize_u32(len as u32)
+        self.output_u32_as_uleb128(len as u32)
     }
 }
 
-impl<'a> ser::Serializer for &'a mut Serializer {
+impl<'a, W> ser::Serializer for Serializer<'a, W>
+where
+    W: std::io::Write,
+{
     type Ok = ();
     type Error = Error;
     type SerializeSeq = Self;
     type SerializeTuple = Self;
     type SerializeTupleStruct = Self;
     type SerializeTupleVariant = Self;
-    type SerializeMap = MapSerializer<'a>;
+    type SerializeMap = MapSerializer<'a, W>;
     type SerializeStruct = Self;
     type SerializeStructVariant = Self;
 
@@ -120,27 +173,27 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     }
 
     fn serialize_u8(self, v: u8) -> Result<()> {
-        self.output.push(v);
+        self.output.write_all(&[v])?;
         Ok(())
     }
 
     fn serialize_u16(self, v: u16) -> Result<()> {
-        self.output.extend_from_slice(&v.to_le_bytes());
+        self.output.write_all(&v.to_le_bytes())?;
         Ok(())
     }
 
     fn serialize_u32(self, v: u32) -> Result<()> {
-        self.output.extend_from_slice(&v.to_le_bytes());
+        self.output.write_all(&v.to_le_bytes())?;
         Ok(())
     }
 
     fn serialize_u64(self, v: u64) -> Result<()> {
-        self.output.extend_from_slice(&v.to_le_bytes());
+        self.output.write_all(&v.to_le_bytes())?;
         Ok(())
     }
 
     fn serialize_u128(self, v: u128) -> Result<()> {
-        self.output.extend_from_slice(&v.to_le_bytes());
+        self.output.write_all(&v.to_le_bytes())?;
         Ok(())
     }
 
@@ -162,9 +215,9 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     }
 
     // Serialize a byte array as an array of bytes.
-    fn serialize_bytes(self, v: &[u8]) -> Result<()> {
-        self.serialize_seq_len(v.len())?;
-        self.output.extend_from_slice(v);
+    fn serialize_bytes(mut self, v: &[u8]) -> Result<()> {
+        self.output_seq_len(v.len())?;
+        self.output.write_all(v)?;
         Ok(())
     }
 
@@ -178,7 +231,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     where
         T: ?Sized + Serialize,
     {
-        self.serialize_u8(1)?;
+        self.output.write_all(&[1])?;
         value.serialize(self)
     }
 
@@ -191,12 +244,12 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     }
 
     fn serialize_unit_variant(
-        self,
+        mut self,
         _name: &'static str,
         variant_index: u32,
         _variant: &'static str,
     ) -> Result<()> {
-        self.serialize_u32(variant_index)
+        self.output_variant_index(variant_index)
     }
 
     fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<()>
@@ -207,7 +260,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     }
 
     fn serialize_newtype_variant<T>(
-        self,
+        mut self,
         _name: &'static str,
         variant_index: u32,
         _variant: &'static str,
@@ -216,7 +269,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     where
         T: ?Sized + Serialize,
     {
-        self.serialize_u32(variant_index)?;
+        self.output_variant_index(variant_index)?;
         value.serialize(self)
     }
 
@@ -224,9 +277,9 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     // method calls. This one is responsible only for serializing the start,
     // which for LCS is either nothing for fixed structures or for variable
     // length structures, the length encoded as a u32.
-    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
+    fn serialize_seq(mut self, len: Option<usize>) -> Result<Self::SerializeSeq> {
         if let Some(len) = len {
-            self.serialize_seq_len(len)?;
+            self.output_seq_len(len)?;
             Ok(self)
         } else {
             Err(Error::MissingLen)
@@ -247,13 +300,13 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     }
 
     fn serialize_tuple_variant(
-        self,
+        mut self,
         _name: &'static str,
         variant_index: u32,
         _variant: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeTupleVariant> {
-        self.serialize_u32(variant_index)?;
+        self.output_variant_index(variant_index)?;
         Ok(self)
     }
 
@@ -266,13 +319,13 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     }
 
     fn serialize_struct_variant(
-        self,
+        mut self,
         _name: &'static str,
         variant_index: u32,
         _variant: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeStructVariant> {
-        self.serialize_u32(variant_index)?;
+        self.output_variant_index(variant_index)?;
         Ok(self)
     }
 
@@ -282,7 +335,10 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     }
 }
 
-impl<'a> ser::SerializeSeq for &'a mut Serializer {
+impl<'a, W> ser::SerializeSeq for Serializer<'a, W>
+where
+    W: std::io::Write,
+{
     type Ok = ();
     type Error = Error;
 
@@ -290,7 +346,7 @@ impl<'a> ser::SerializeSeq for &'a mut Serializer {
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(&mut **self)
+        value.serialize(Serializer::new(self.output))
     }
 
     fn end(self) -> Result<()> {
@@ -298,7 +354,10 @@ impl<'a> ser::SerializeSeq for &'a mut Serializer {
     }
 }
 
-impl<'a> ser::SerializeTuple for &'a mut Serializer {
+impl<'a, W> ser::SerializeTuple for Serializer<'a, W>
+where
+    W: std::io::Write,
+{
     type Ok = ();
     type Error = Error;
 
@@ -306,7 +365,7 @@ impl<'a> ser::SerializeTuple for &'a mut Serializer {
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(&mut **self)
+        value.serialize(Serializer::new(self.output))
     }
 
     fn end(self) -> Result<()> {
@@ -314,7 +373,10 @@ impl<'a> ser::SerializeTuple for &'a mut Serializer {
     }
 }
 
-impl<'a> ser::SerializeTupleStruct for &'a mut Serializer {
+impl<'a, W> ser::SerializeTupleStruct for Serializer<'a, W>
+where
+    W: std::io::Write,
+{
     type Ok = ();
     type Error = Error;
 
@@ -322,7 +384,7 @@ impl<'a> ser::SerializeTupleStruct for &'a mut Serializer {
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(&mut **self)
+        value.serialize(Serializer::new(self.output))
     }
 
     fn end(self) -> Result<()> {
@@ -330,7 +392,10 @@ impl<'a> ser::SerializeTupleStruct for &'a mut Serializer {
     }
 }
 
-impl<'a> ser::SerializeTupleVariant for &'a mut Serializer {
+impl<'a, W> ser::SerializeTupleVariant for Serializer<'a, W>
+where
+    W: std::io::Write,
+{
     type Ok = ();
     type Error = Error;
 
@@ -338,7 +403,7 @@ impl<'a> ser::SerializeTupleVariant for &'a mut Serializer {
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(&mut **self)
+        value.serialize(Serializer::new(self.output))
     }
 
     fn end(self) -> Result<()> {
@@ -347,23 +412,26 @@ impl<'a> ser::SerializeTupleVariant for &'a mut Serializer {
 }
 
 #[doc(hidden)]
-struct MapSerializer<'a> {
-    ser: &'a mut Serializer,
-    map: BTreeMap<Vec<u8>, Vec<u8>>,
+struct MapSerializer<'a, W> {
+    serializer: Serializer<'a, W>,
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
     next_key: Option<Vec<u8>>,
 }
 
-impl<'a> MapSerializer<'a> {
-    fn new(ser: &'a mut Serializer) -> Self {
+impl<'a, W> MapSerializer<'a, W> {
+    fn new(serializer: Serializer<'a, W>) -> Self {
         MapSerializer {
-            ser,
-            map: BTreeMap::new(),
+            serializer,
+            entries: Vec::new(),
             next_key: None,
         }
     }
 }
 
-impl<'a> ser::SerializeMap for MapSerializer<'a> {
+impl<'a, W> ser::SerializeMap for MapSerializer<'a, W>
+where
+    W: std::io::Write,
+{
     type Ok = ();
     type Error = Error;
 
@@ -375,9 +443,9 @@ impl<'a> ser::SerializeMap for MapSerializer<'a> {
             return Err(Error::ExpectedMapValue);
         }
 
-        let mut s = Serializer::new();
-        key.serialize(&mut s)?;
-        self.next_key = Some(s.output);
+        let mut output = Vec::new();
+        key.serialize(Serializer::new(&mut output))?;
+        self.next_key = Some(output);
         Ok(())
     }
 
@@ -387,42 +455,38 @@ impl<'a> ser::SerializeMap for MapSerializer<'a> {
     {
         match self.next_key.take() {
             Some(key) => {
-                let mut s = Serializer::new();
-                value.serialize(&mut s)?;
-                self.map.insert(key, s.output);
+                let mut output = Vec::new();
+                value.serialize(Serializer::new(&mut output))?;
+                self.entries.push((key, output));
+                Ok(())
             }
-            None => {
-                return Err(Error::ExpectedMapKey);
-            }
+            None => Err(Error::ExpectedMapKey),
         }
-
-        Ok(())
     }
 
-    fn end(self) -> Result<()> {
-        use serde::ser::Serializer;
-
+    fn end(mut self) -> Result<()> {
         if self.next_key.is_some() {
             return Err(Error::ExpectedMapValue);
         }
+        self.entries.sort_by(|e1, e2| e1.0.cmp(&e2.0));
+        self.entries.dedup_by(|e1, e2| e1.0.eq(&e2.0));
 
-        let len = self.map.len();
-        if len > crate::MAX_SEQUENCE_LENGTH {
-            return Err(Error::ExceededMaxLen(len));
-        }
+        let len = self.entries.len();
+        self.serializer.output_seq_len(len)?;
 
-        self.ser.serialize_u32(len as u32)?;
-
-        for (key, value) in self.map {
-            self.ser.output.extend(key.into_iter());
-            self.ser.output.extend(value.into_iter());
+        for (key, value) in &self.entries {
+            self.serializer.output.write_all(key)?;
+            self.serializer.output.write_all(value)?;
         }
 
         Ok(())
     }
 }
 
-impl<'a> ser::SerializeStruct for &'a mut Serializer {
+impl<'a, W> ser::SerializeStruct for Serializer<'a, W>
+where
+    W: std::io::Write,
+{
     type Ok = ();
     type Error = Error;
 
@@ -430,7 +494,7 @@ impl<'a> ser::SerializeStruct for &'a mut Serializer {
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(&mut **self)
+        value.serialize(Serializer::new(self.output))
     }
 
     fn end(self) -> Result<()> {
@@ -438,7 +502,10 @@ impl<'a> ser::SerializeStruct for &'a mut Serializer {
     }
 }
 
-impl<'a> ser::SerializeStructVariant for &'a mut Serializer {
+impl<'a, W> ser::SerializeStructVariant for Serializer<'a, W>
+where
+    W: std::io::Write,
+{
     type Ok = ();
     type Error = Error;
 
@@ -446,7 +513,7 @@ impl<'a> ser::SerializeStructVariant for &'a mut Serializer {
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(&mut **self)
+        value.serialize(Serializer::new(self.output))
     }
 
     fn end(self) -> Result<()> {

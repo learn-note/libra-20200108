@@ -8,14 +8,16 @@ use std::{collections::HashSet, fmt, time::Duration};
 use structopt::StructOpt;
 use tokio::time;
 
-use crate::cluster::Cluster;
-use crate::effects::{DeleteLibraData, Effect, StopContainer};
-use crate::experiments::{Context, ExperimentParam};
-use crate::instance::Instance;
-use crate::tx_emitter::EmitJobRequest;
-use crate::{effects::Action, experiments::Experiment};
+use crate::{
+    cluster::Cluster,
+    cluster_swarm::ClusterSwarm,
+    experiments::{Context, Experiment, ExperimentParam},
+    instance::Instance,
+    tx_emitter::EmitJobRequest,
+};
+use anyhow::format_err;
 use async_trait::async_trait;
-use slog_scope::info;
+use libra_logger::info;
 use std::time::Instant;
 
 #[derive(StructOpt, Debug)]
@@ -53,23 +55,39 @@ impl Experiment for RecoveryTime {
     }
 
     async fn run(&mut self, context: &mut Context<'_>) -> anyhow::Result<()> {
-        let stop_effect = StopContainer::new(self.instance.clone());
-        let delete_action = DeleteLibraData::new(self.instance.clone());
         context
             .tx_emitter
             .mint_accounts(
-                &EmitJobRequest::for_instances(context.cluster.validator_instances().to_vec()),
+                &EmitJobRequest::for_instances(
+                    context.cluster.validator_instances().to_vec(),
+                    context.global_emit_job_request,
+                ),
                 self.params.num_accounts_to_mint as usize,
             )
             .await?;
         info!("Stopping {}", self.instance);
-        stop_effect.activate().await?;
-        info!("Deleted db for {}", self.instance);
-        delete_action.apply().await?;
-        info!("Starting instance {}", self.instance);
-        stop_effect.deactivate().await?;
+        context
+            .cluster_swarm
+            .delete_node(
+                self.instance
+                    .instance_config()
+                    .ok_or_else(|| format_err!("Failed to find instance_config"))?
+                    .clone(),
+            )
+            .await?;
+        info!("Deleting db and restarting node for {}", self.instance);
+        context
+            .cluster_swarm
+            .upsert_node(
+                self.instance
+                    .instance_config()
+                    .ok_or_else(|| format_err!("Failed to find instance_config"))?
+                    .clone(),
+                true,
+            )
+            .await?;
         info!("Waiting for instance to be up: {}", self.instance);
-        while !self.instance.is_up() {
+        while self.instance.try_json_rpc().await.is_err() {
             time::delay_for(Duration::from_secs(1)).await;
         }
         let start_instant = Instant::now();

@@ -1,3 +1,4 @@
-foo() {
-
+script {
+fun foo() {
+}
 }

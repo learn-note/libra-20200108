@@ -1,45 +1,38 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::tests::mock_storage::MockStorage;
 use crate::{
-    executor_proxy::ExecutorProxyTrait, PeerId, StateSyncClient, StateSynchronizer,
-    SynchronizerState,
+    executor_proxy::ExecutorProxyTrait, tests::mock_storage::MockStorage, PeerId, StateSyncClient,
+    StateSynchronizer, SynchronizerState,
 };
 use anyhow::{bail, Result};
-use config_builder;
-use executor::ExecutedTrees;
+use executor_types::ExecutedTrees;
 use futures::executor::block_on;
-use libra_config::config::RoleType;
-use libra_crypto::x25519::{X25519StaticPrivateKey, X25519StaticPublicKey};
-use libra_crypto::{ed25519::*, test_utils::TEST_SEED, x25519, HashValue};
-use libra_logger::set_simple_logger;
+use libra_config::{
+    config::{PeerNetworkId, RoleType},
+    network_id::NetworkId,
+};
+use libra_crypto::{hash::ACCUMULATOR_PLACEHOLDER_HASH, test_utils::TEST_SEED, x25519, Uniform};
+use libra_mempool::mocks::MockSharedMempool;
+use libra_network_address::{NetworkAddress, RawNetworkAddress};
 use libra_types::{
-    block_info::BlockInfo,
-    crypto_proxies::{
-        random_validator_verifier, LedgerInfoWithSignatures, ValidatorChangeProof,
-        ValidatorPublicKeys, ValidatorSet, ValidatorSigner,
-    },
-    ledger_info::LedgerInfo,
-    proof::TransactionListProof,
-    transaction::TransactionListWithProof,
-    waypoint::Waypoint,
+    contract_event::ContractEvent, ledger_info::LedgerInfoWithSignatures,
+    on_chain_config::ValidatorSet, proof::TransactionListProof,
+    transaction::TransactionListWithProof, validator_config::ValidatorConfig,
+    validator_info::ValidatorInfo, validator_signer::ValidatorSigner,
+    validator_verifier::random_validator_verifier, waypoint::Waypoint,
 };
 use network::{
-    validator_network::{
-        self,
-        network_builder::{NetworkBuilder, TransportType},
-    },
+    validator_network::network_builder::{AuthenticationMode, NetworkBuilder},
     NetworkPublicKeys,
 };
-use parity_multiaddr::Multiaddr;
 use rand::{rngs::StdRng, SeedableRng};
-use std::sync::RwLock;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
+    convert::TryFrom,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, RwLock,
     },
 };
 use tokio::runtime::Runtime;
@@ -59,14 +52,13 @@ impl MockExecutorProxy {
     }
 }
 
-#[async_trait::async_trait]
 impl ExecutorProxyTrait for MockExecutorProxy {
-    async fn get_local_storage_state(&self) -> Result<SynchronizerState> {
+    fn get_local_storage_state(&self) -> Result<SynchronizerState> {
         Ok(self.storage.read().unwrap().get_local_storage_state())
     }
 
-    async fn execute_chunk(
-        &self,
+    fn execute_chunk(
+        &mut self,
         txn_list_with_proof: TransactionListWithProof,
         ledger_info_with_sigs: LedgerInfoWithSignatures,
         intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
@@ -80,7 +72,7 @@ impl ExecutorProxyTrait for MockExecutorProxy {
         Ok(())
     }
 
-    async fn get_chunk(
+    fn get_chunk(
         &self,
         known_version: u64,
         limit: u64,
@@ -101,16 +93,20 @@ impl ExecutorProxyTrait for MockExecutorProxy {
         (self.handler)(txns_with_proof)
     }
 
-    async fn get_epoch_proof(
-        &self,
-        start_epoch: u64,
-        _end_epoch: u64,
-    ) -> Result<ValidatorChangeProof> {
-        Ok(self.storage.read().unwrap().get_epoch_changes(start_epoch))
+    fn get_epoch_proof(&self, epoch: u64) -> Result<LedgerInfoWithSignatures> {
+        Ok(self.storage.read().unwrap().get_epoch_changes(epoch))
     }
 
-    async fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+    fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
         self.storage.read().unwrap().get_ledger_info(version)
+    }
+
+    fn load_on_chain_configs(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn publish_on_chain_config_updates(&mut self, _events: Vec<ContractEvent>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -120,54 +116,42 @@ struct SynchronizerEnv {
     clients: Vec<Arc<StateSyncClient>>,
     storage_proxies: Vec<Arc<RwLock<MockStorage>>>, // to directly modify peers storage
     signers: Vec<ValidatorSigner>,
-    network_signers: Vec<Ed25519PrivateKey>,
-    public_keys: Vec<ValidatorPublicKeys>,
+    network_id: NetworkId,
+    public_keys: Vec<ValidatorInfo>,
     peer_ids: Vec<PeerId>,
-    peer_addresses: Vec<Multiaddr>,
+    peer_addresses: Vec<NetworkAddress>,
+    mempools: Vec<MockSharedMempool>,
 }
 
 impl SynchronizerEnv {
     // Returns the initial peers with their signatures
-    fn initial_setup(
-        count: usize,
-    ) -> (
-        Vec<ValidatorSigner>,
-        Vec<Ed25519PrivateKey>,
-        Vec<ValidatorPublicKeys>,
-    ) {
+    fn initial_setup(count: usize) -> (Vec<ValidatorSigner>, Vec<ValidatorInfo>) {
         let (signers, _verifier) = random_validator_verifier(count, None, true);
 
-        // Setup signing public keys.
-        let mut rng = StdRng::from_seed(TEST_SEED);
-        let signing_keys = (0..count)
-            .map(|_| compat::generate_keypair(&mut rng))
-            .collect::<Vec<(Ed25519PrivateKey, Ed25519PublicKey)>>();
         // Setup identity public keys.
-        let identity_keys = (0..count)
-            .map(|_| x25519::compat::generate_keypair(&mut rng))
-            .collect::<Vec<(X25519StaticPrivateKey, X25519StaticPublicKey)>>();
+        let mut rng = StdRng::from_seed(TEST_SEED);
+        let identity_private_keys: Vec<_> = (0..count)
+            .map(|_| x25519::PrivateKey::generate(&mut rng))
+            .collect();
 
         let mut validators_keys = vec![];
         // The voting power of peer 0 is enough to generate an LI that passes validation.
         for (idx, signer) in signers.iter().enumerate() {
             let voting_power = if idx == 0 { 1000 } else { 1 };
-            let validator_public_keys = ValidatorPublicKeys::new(
-                signer.author(),
+            let addr: NetworkAddress = "/memory/0".parse().unwrap();
+            let validator_config = ValidatorConfig::new(
                 signer.public_key(),
-                voting_power,
-                signing_keys[idx].1.clone(),
-                identity_keys[idx].1.clone(),
+                identity_private_keys[idx].public_key(),
+                RawNetworkAddress::try_from(&addr).unwrap(),
+                identity_private_keys[idx].public_key(),
+                RawNetworkAddress::try_from(&addr).unwrap(),
+                // Vec::<AccountAddress>::new(),
             );
-            validators_keys.push(validator_public_keys);
+            let validator_info =
+                ValidatorInfo::new(signer.author(), voting_power, validator_config);
+            validators_keys.push(validator_info);
         }
-        (
-            signers,
-            signing_keys
-                .iter()
-                .map(|(private_key, _)| private_key.clone())
-                .collect::<Vec<Ed25519PrivateKey>>(),
-            validators_keys,
-        )
+        (signers, validators_keys)
     }
 
     // Moves peer 0 to the next epoch. Note that other peers are not going to be able to discover
@@ -181,15 +165,13 @@ impl SynchronizerEnv {
             .iter()
             .enumerate()
             .map(|(idx, validator_keys)| {
-                ValidatorPublicKeys::new(
+                ValidatorInfo::new(
                     signers[idx].author(),
-                    signers[idx].public_key(),
                     validator_keys.consensus_voting_power(),
-                    validator_keys.network_signing_public_key().clone(),
-                    validator_keys.network_identity_public_key().clone(),
+                    validator_keys.config().clone(),
                 )
             })
-            .collect::<Vec<ValidatorPublicKeys>>();
+            .collect::<Vec<ValidatorInfo>>();
         let validator_set = ValidatorSet::new(new_keys);
         self.storage_proxies[0]
             .write()
@@ -197,28 +179,17 @@ impl SynchronizerEnv {
             .move_to_next_epoch(signers[0].clone(), validator_set);
     }
 
-    fn genesis_li(validators: &[ValidatorPublicKeys]) -> LedgerInfoWithSignatures {
-        LedgerInfoWithSignatures::new(
-            LedgerInfo::new(
-                BlockInfo::new(
-                    0,
-                    0,
-                    HashValue::zero(),
-                    HashValue::zero(),
-                    0,
-                    0,
-                    Some(ValidatorSet::new(validators.to_owned())),
-                ),
-                HashValue::zero(),
-            ),
-            BTreeMap::new(),
+    fn genesis_li(validators: &[ValidatorInfo]) -> LedgerInfoWithSignatures {
+        LedgerInfoWithSignatures::genesis(
+            *ACCUMULATOR_PLACEHOLDER_HASH,
+            ValidatorSet::new(validators.to_vec()),
         )
     }
 
     fn new(num_peers: usize) -> Self {
-        set_simple_logger("state-sync");
+        ::libra_logger::Logger::new().environment_only(true).init();
         let runtime = Runtime::new().unwrap();
-        let (signers, network_signers, public_keys) = Self::initial_setup(num_peers);
+        let (signers, public_keys) = Self::initial_setup(num_peers);
         let peer_ids = signers.iter().map(|s| s.author()).collect::<Vec<PeerId>>();
 
         Self {
@@ -227,10 +198,11 @@ impl SynchronizerEnv {
             clients: vec![],
             storage_proxies: vec![],
             signers,
-            network_signers,
+            network_id: NetworkId::Validator,
             public_keys,
             peer_ids,
             peer_addresses: vec![],
+            mempools: vec![],
         }
     }
 
@@ -240,6 +212,16 @@ impl SynchronizerEnv {
         role: RoleType,
         waypoint: Option<Waypoint>,
     ) {
+        self.setup_next_synchronizer(handler, role, waypoint, 60_000);
+    }
+
+    fn setup_next_synchronizer(
+        &mut self,
+        handler: MockRpcHandler,
+        role: RoleType,
+        waypoint: Option<Waypoint>,
+        timeout_ms: u64,
+    ) {
         let new_peer_idx = self.synchronizers.len();
         let trusted_peers: HashMap<_, _> = self
             .public_keys
@@ -248,15 +230,14 @@ impl SynchronizerEnv {
                 (
                     *public_keys.account_address(),
                     NetworkPublicKeys {
-                        signing_public_key: public_keys.network_signing_public_key().clone(),
-                        identity_public_key: public_keys.network_identity_public_key().clone(),
+                        identity_public_key: public_keys.network_identity_public_key(),
                     },
                 )
             })
             .collect();
 
         // setup network
-        let addr: Multiaddr = "/memory/0".parse().unwrap();
+        let addr: NetworkAddress = "/memory/0".parse().unwrap();
         let mut seed_peers = HashMap::new();
         if new_peer_idx > 0 {
             seed_peers.insert(
@@ -266,41 +247,34 @@ impl SynchronizerEnv {
         }
         let mut network_builder = NetworkBuilder::new(
             self.runtime.handle().clone(),
+            self.network_id.clone(),
             self.peer_ids[new_peer_idx],
-            addr,
             RoleType::Validator,
+            addr,
         );
         network_builder
-            .signing_keys((
-                self.network_signers[new_peer_idx].clone(),
-                self.public_keys[new_peer_idx]
-                    .network_signing_public_key()
-                    .clone(),
-            ))
+            .authentication_mode(AuthenticationMode::Unauthenticated)
             .trusted_peers(trusted_peers)
             .seed_peers(seed_peers)
-            .transport(TransportType::Memory)
-            .add_discovery();
+            .add_connectivity_manager()
+            .add_gossip_discovery();
 
-        let (sender, events) =
-            validator_network::state_synchronizer::add_to_network(&mut network_builder);
+        let (sender, events) = crate::network::add_to_network(&mut network_builder);
         let peer_addr = network_builder.build();
 
         let mut config = config_builder::test_config().0;
+        let network = config.validator_network.unwrap();
+        let network_id = network.peer_id();
         if !role.is_validator() {
-            let mut network = config.validator_network.unwrap();
-            network.peer_id = PeerId::default();
             config.full_node_networks = vec![network];
             config.validator_network = None;
         }
         config.base.role = role;
+        config.state_sync.sync_request_timeout_ms = timeout_ms;
         if new_peer_idx > 0 {
             // set the upstream peer in the config
-            config
-                .state_sync
-                .upstream_peers
-                .upstream_peers
-                .push(self.peer_ids[new_peer_idx - 1]);
+            let upstream_peer = PeerNetworkId(network_id, self.peer_ids[new_peer_idx - 1]);
+            config.upstream.upstream_peers.insert(upstream_peer);
         }
 
         let genesis_li = Self::genesis_li(&self.public_keys);
@@ -308,13 +282,19 @@ impl SynchronizerEnv {
             genesis_li,
             self.signers[new_peer_idx].clone(),
         )));
+        let (mempool_channel, mempool_requests) = futures::channel::mpsc::channel(1_024);
         let synchronizer = StateSynchronizer::bootstrap_with_executor_proxy(
-            vec![(sender, events)],
+            Runtime::new().unwrap(),
+            vec![(network_id, sender, events)],
+            mempool_channel,
             role,
             waypoint,
             &config.state_sync,
+            config.upstream,
             MockExecutorProxy::new(handler, storage_proxy.clone()),
         );
+        self.mempools
+            .push(MockSharedMempool::new(Some(mempool_requests)));
         let client = synchronizer.create_client();
         self.synchronizers.push(synchronizer);
         self.clients.push(client);
@@ -335,8 +315,21 @@ impl SynchronizerEnv {
         let mut storage = self.storage_proxies[peer_id].write().unwrap();
         let num_txns = version - storage.version();
         assert!(num_txns > 0);
-        storage.commit_new_txns(num_txns);
-        block_on(self.clients[peer_id].commit()).unwrap();
+        let (committed_txns, signed_txns) = storage.commit_new_txns(num_txns);
+        drop(storage);
+        // add txns to mempool
+        assert!(self.mempools[peer_id].add_txns(signed_txns.clone()).is_ok());
+
+        // we need to run StateSyncClient::commit on a tokio runtime to support tokio::timeout
+        // in commit()
+        assert!(Runtime::new()
+            .unwrap()
+            .block_on(self.clients[peer_id].commit(committed_txns, vec![]))
+            .is_ok());
+        let mempool_txns = self.mempools[peer_id].read_timeline(0, signed_txns.len());
+        for txn in signed_txns.iter() {
+            assert!(!mempool_txns.contains(txn));
+        }
     }
 
     fn latest_li(&self, peer_id: usize) -> LedgerInfoWithSignatures {
@@ -426,6 +419,23 @@ fn test_flaky_peer_sync() {
     env.commit(0, 20);
     env.sync_to(1, env.latest_li(0));
     assert_eq!(env.latest_li(1).ledger_info().version(), 20);
+}
+
+#[test]
+#[should_panic]
+fn test_request_timeout() {
+    let handler =
+        Box::new(move |_| -> Result<TransactionListWithProof> { bail!("chunk fetch failed") });
+    let mut env = SynchronizerEnv::new(2);
+    env.start_next_synchronizer(handler, RoleType::Validator, None);
+    env.setup_next_synchronizer(
+        SynchronizerEnv::default_handler(),
+        RoleType::Validator,
+        None,
+        100,
+    );
+    env.commit(0, 1);
+    env.sync_to(1, env.latest_li(0));
 }
 
 #[test]
@@ -522,7 +532,7 @@ fn catch_up_with_waypoints() {
 
     // Create a waypoint based on LedgerInfo of peer 0 at version 700 (epoch 7)
     let waypoint_li = env.get_ledger_info(0, 700).unwrap();
-    let waypoint = Waypoint::new(waypoint_li.ledger_info()).unwrap();
+    let waypoint = Waypoint::new_epoch_boundary(waypoint_li.ledger_info()).unwrap();
 
     env.start_next_synchronizer(
         SynchronizerEnv::default_handler(),

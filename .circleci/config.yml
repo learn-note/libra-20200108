@@ -1,14 +1,25 @@
 version: 2.1
 
+orbs:
+  slack: circleci/slack@3.3.0
+
 executors:
   build-executor:
     docker:
       - image: circleci/rust:buster
     resource_class: 2xlarge
-  audit-executor:
+  unittest-executor:
+    docker:
+      - image: circleci/rust:buster
+    resource_class: 2xlarge+
+  test-executor:
     docker:
       - image: circleci/rust:buster
     resource_class: xlarge
+  audit-executor:
+    docker:
+      - image: circleci/rust:buster
+    resource_class: medium
   terraform-executor:
     docker:
       - image: hashicorp/terraform
@@ -46,7 +57,7 @@ commands:
           name: Install Dependencies
           command: |
             sudo apt-get update
-            sudo apt-get install -y cmake curl
+            sudo apt-get install -y cmake curl clang llvm gcc-powerpc-linux-gnu
             rustup component add clippy rustfmt
   install_code_coverage_deps:
     steps:
@@ -61,9 +72,9 @@ commands:
       - run:
           name: install dockerfile linter (hadolint)
           command: |
-             export HADOLINT=${HOME}/hadolint
-             export HADOLINT_VER=v1.17.4
-             curl -sL -o ${HADOLINT} "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VER}/hadolint-$(uname -s)-$(uname -m)" && chmod 700 ${HADOLINT}
+            export HADOLINT=${HOME}/hadolint
+            export HADOLINT_VER=v1.17.4
+            curl -sL -o ${HADOLINT} "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VER}/hadolint-$(uname -s)-$(uname -m)" && chmod 700 ${HADOLINT}
   install_rust_nightly_toolchain:
     steps:
       - run:
@@ -76,9 +87,96 @@ commands:
           command: |
             echo 'export CHANGED_DOCKER_FILES=$(
               for commit in $(git rev-list origin/master..HEAD) ; do
-                git diff-tree --no-commit-id --name-only -r "$commit" -- "*.Dockerfile";
+                git diff-tree --no-commit-id --name-only -r "$commit" -- "*Dockerfile";
               done
             )' >> $BASH_ENV
+  save_cargo_package_cache:
+    description: Save cargo package cache for subsequent jobs
+    steps:
+      - save_cache:
+          name: Save cargo package cache
+          key: cargo-package-cache-{{ checksum "Cargo.lock" }}
+          # paths are relative to /home/circleci/project/
+          paths:
+            - ../../../usr/local/cargo/git
+            - ../../../usr/local/cargo/registry
+            - ../../../usr/local/cargo/.package-cache
+  restore_cargo_package_cache:
+    description: Restore Cargo package cache from prev job
+    steps:
+      - restore_cache:
+          name: Restore cargo package cache
+          key: cargo-package-cache-{{ checksum "Cargo.lock" }}
+      - run:
+          name: Check cargo package cache
+          command: |
+            ls -all /usr/local/cargo
+            du -ssh /usr/local/cargo
+  save_breaking_change_rev:
+    description: Save the breaking change rev since last testnet update.
+    steps:
+      - save_cache:
+          name: Save breaking change rev
+          key: testnet-{{ checksum "testnet_rev" }}
+          # paths are relative to /home/circleci/project/
+          paths:
+            - breaking_change_rev
+          when: on_fail
+  restore_breaking_change_rev:
+    description: Restore the breaking change rev since last testnet update
+    steps:
+      - restore_cache:
+          name: Restore breaking change rev
+          key: testnet-{{ checksum "testnet_rev" }}
+  send_message:
+    description: Send message to the specified webhook, if no webhook is set simply return.
+    parameters:
+      payload_file:
+        description: File containing the message payload
+        type: string
+        default: ""
+      build_url:
+        description: This build's URL in Circle
+        type: string
+        default: "${CIRCLE_BUILD_URL}"
+      webhook:
+        description: Webhook for the message
+        type: string
+        default: ""
+    steps:
+      - run:
+          name: Send job status
+          command: |
+            if [ -e <<parameters.payload_file>> ]; then
+              jq -n \
+                --arg msg "$(cat <<parameters.payload_file>>)" \
+                --arg url "<<parameters.build_url>>" \
+                '{
+                  attachments: [
+                    {
+                      text: $msg,
+                      actions: [
+                        {
+                          "type": "button",
+                          "text": "Visit Job",
+                          "url": $url
+                        }
+                      ],
+                    }
+                  ]
+                }' > /tmp/payload
+              cat /tmp/payload
+              if [ <<parameters.webhook>> ]; then
+                curl -X POST -H 'Content-type: application/json' -d @/tmp/payload \
+                <<parameters.webhook>>
+              else
+                echo "Not sending messages as no webhook url is set."
+                echo "Chances are you are not building on master, or circle is misconfigured."
+                echo "webhook is empty"
+                exit 0
+              fi
+            fi
+          when: always
   build_setup:
     steps:
       - checkout
@@ -93,55 +191,170 @@ commands:
           command: ./scripts/changed-files.sh
 
 jobs:
-  build:
-    executor: build-executor
-    parallelism: 4
+  prefetch-crates:
+    executor: audit-executor
+    description: Prefetch cargo crates for subsequent jobs.
     steps:
       - build_setup
       - run:
           name: Git Hooks and Checks
           command: ./scripts/git-checks.sh
+      - restore_cargo_package_cache
       - run:
-          name: Linting
-          command: |
-            [[ $CIRCLE_NODE_INDEX =~ [123] ]] || cargo x lint
-            [[ $CIRCLE_NODE_INDEX =~ [123] ]] || cargo xclippy --workspace --all-targets
-            [[ $CIRCLE_NODE_INDEX =~ [123] ]] || cargo fmt -- --check
+          name: Fetch workspace dependencies over network
+          command: cargo fetch
+      - save_cargo_package_cache
+  lint:
+    executor: test-executor
+    description: Run Rust linting tools.
+    steps:
+      - build_setup
       - run:
-          name: Build Release
-          command: |
-            [[ $CIRCLE_NODE_INDEX =~ [023] ]] || RUST_BACKTRACE=1 cargo build -j 16 --release
+          name: Git Hooks and Checks
+          command: ./scripts/git-checks.sh
+      - restore_cargo_package_cache
       - run:
-          name: Run Cluster Smoke Test
-          command: |
-            [[ $CIRCLE_NODE_INDEX =~ [023] ]] || scripts/smoke-test-swarm-cluster.sh
+          name: cargo lint
+          command: cargo x lint
       - run:
-          name: Build Dev
-          command: |
-            [[ $CIRCLE_NODE_INDEX =~ [012] ]] || RUST_BACKTRACE=1 cargo build -j 16
-            [[ $CIRCLE_NODE_INDEX =~ [012] ]] || RUST_BACKTRACE=1 cargo build -j 16 -p libra-swarm
-            [[ $CIRCLE_NODE_INDEX =~ [012] ]] || RUST_BACKTRACE=1 cargo build -j 16 -p cluster-test
-            [[ $CIRCLE_NODE_INDEX =~ [012] ]] || RUST_BACKTRACE=1 cargo build -j 16 -p libra-fuzzer
-            [[ $CIRCLE_NODE_INDEX =~ [012] ]] || RUST_BACKTRACE=1 cargo build -j 16 -p language_benchmarks
-            [[ $CIRCLE_NODE_INDEX =~ [012] ]] || RUST_BACKTRACE=1 cargo build -j 16 -p bytecode-to-boogie
-            [[ $CIRCLE_NODE_INDEX =~ [012] ]] || RUST_BACKTRACE=1 cargo build -j 16 -p cost-synthesis
-            [[ $CIRCLE_NODE_INDEX =~ [012] ]] || RUST_BACKTRACE=1 cargo build -j 16 -p test-generation
+          name: cargo clippy
+          command: cargo xclippy --workspace --all-targets
       - run:
-          name: Run All Unit Tests
-          command: |
-            [[ $CIRCLE_NODE_INDEX =~ [013] ]] || RUST_BACKTRACE=1 $CI_TIMEOUT cargo x test --unit
+          name: cargo fmt
+          command: cargo xfmt --check
+  build-dev:
+    executor: build-executor
+    description: Development Build
+    steps:
+      - build_setup
+      - restore_cargo_package_cache
       - run:
-          name: Run Cryptography Unit Tests with the formally verified backend
-          command: |
-            [[ $CIRCLE_NODE_INDEX =~ [013] ]] || ( RUST_BACKTRACE=1 cd crypto/crypto && $CI_TIMEOUT cargo test --features='std fiat_u64_backend fuzzing' --no-default-features )
+          command: RUST_BACKTRACE=1 cargo build -j 16
       - run:
-          name: Run All End to End Tests
+          command: RUST_BACKTRACE=1 cargo build -j 16 -p libra-swarm
+      - run:
+          command: RUST_BACKTRACE=1 cargo build -j 16 -p cluster-test
+      - run:
+          command: RUST_BACKTRACE=1 cargo build -j 16 -p libra-fuzzer
+      - run:
+          command: RUST_BACKTRACE=1 cargo build -j 16 -p language-benchmarks
+      - run:
+          command: RUST_BACKTRACE=1 cargo build -j 16 -p test-generation
+      - run:
           command: |
-            [[ $CIRCLE_NODE_INDEX =~ [012] ]] || RUST_BACKTRACE=1 $CI_TIMEOUT cargo x test --package testsuite -- --test-threads 1
+            rustup target add powerpc-unknown-linux-gnu
+            RUST_BACKTRACE=1 cargo build -j 16 -p transaction-builder -p move-vm-types --target powerpc-unknown-linux-gnu
       - build_teardown
+  build-release:
+    executor: test-executor
+    description: Release Build
+    steps:
+      - build_setup
+      - restore_cargo_package_cache
+      - run:
+          name: Build release
+          command: RUST_BACKTRACE=1 cargo build -j 8 --release
+      - build_teardown
+  run-e2e-test:
+    executor: build-executor
+    parallelism: 2
+    description: Run E2E tests in parallel. Each container runs a subset of
+      test targets.
+    environment:
+      E2E_RETRIES: 3
+      FLAKY_TESTS_FILE: "/tmp/flaky_tests"
+      MESSAGE_PAYLOAD_FILE: "/tmp/message_payload"
+    steps:
+      - build_setup
+      - restore_cargo_package_cache
+      - run:
+          name: Determine test targets for this container.
+          # NOTE Currently the tests are distributed by name order. Once test
+          # metadata is enabled, the tests can be distributed by run time to
+          # speed up this job.
+          command: |
+            RUST_BACKTRACE=1 cargo x test --package testsuite -- --list | \
+              grep "::" | sed 's/: .*$//' > e2e_tests
+            cat e2e_tests
+            echo -e "Found $(wc -l e2e_tests) tests."
+            cat e2e_tests | circleci tests split > /tmp/tests_to_run
+            echo -e "This runner will run these tests\n$(cat /tmp/tests_to_run)"
+      - run:
+          name: Run E2E tests
+          # NOTE
+          # +e to disable exit immediately when test timeout in the retry loop
+          command: |
+            set +e
+            num_fails=0
+            for target in $(cat /tmp/tests_to_run) ; do
+              retry=0
+              status=1
+              failed_tests=
+              while [[ $status != 0 && $retry < ${E2E_RETRIES} ]]; do
+                RUST_BACKTRACE=full timeout --kill-after=370 --preserve-status 360 \
+                  cargo x test --package testsuite -- $target --test-threads 1 --exact --nocapture
+                status=$?
+                retry=$((retry + 1))
+                sleep 10
+              done
+              if [[ $status != 0 ]] ; then
+                num_fails=$((num_fails + 1))
+                failed_tests="$target\n$failed_tests"
+              elif [[ $retry > 1 ]]; then
+                echo "$target passed after $retry tries" >> ${FLAKY_TESTS_FILE}
+              fi
+            done
+            if [ -e ${FLAKY_TESTS_FILE} ]; then
+              msg="Found flaky tests\n$(cat ${FLAKY_TESTS_FILE})"
+              echo -e $msg
+              echo -e $msg > ${MESSAGE_PAYLOAD_FILE}
+            fi
+            if [[ $num_fails != 0 ]]; then
+              echo -e "$num_fails test(s) failed:\n$failed_tests"
+            fi
+            exit $num_fails
+      - send_message:
+          payload_file: "${MESSAGE_PAYLOAD_FILE}"
+          build_url: "${CIRCLE_BUILD_URL}#tests/containers/${CIRCLE_NODE_INDEX}"
+          webhook: "${WEBHOOK_FLAKY_TESTS}"
+  run-unit-test:
+    executor: unittest-executor
+    description: Run all unit tests, excluding E2E and flaky tests that are
+      explicitly ignored.
+    steps:
+      - build_setup
+      - restore_cargo_package_cache
+      - run:
+          name: Run all unit tests
+          command: |
+            RUST_BACKTRACE=1 $CI_TIMEOUT cargo x test --unit
+  run-crypto-unit-test:
+    executor: audit-executor
+    description: Run crypto unit tests without formally verified crypto, to insulate against a curve25519 "default" backend regression
+    steps:
+      - build_setup
+      - restore_cargo_package_cache
+      - run:
+          name: Run crypto unit tests
+          command: |
+            cd crypto/crypto && \
+            RUST_BACKTRACE=1 cargo test \
+              --features='std u64_backend batch' \
+              --no-default-features
+  run-flaky-unit-test:
+    executor: test-executor
+    description: Run a list of known flaky tests.
+    steps:
+      - build_setup
+      - restore_cargo_package_cache
+      - run:
+          name: Run flaky tests
+          command: |
+            RUST_BACKTRACE=1 $CI_TIMEOUT \
+            ./scripts/run_quarantined.sh -c <your package here> -r 3 -f
   validate-cluster-test-dockerfile:
     description: Validate that committed docker files for cluster test are up to date
-    executor: build-executor
+    executor: audit-executor
     steps:
       - build_setup
       - run:
@@ -153,6 +366,7 @@ jobs:
     executor: audit-executor
     steps:
       - build_setup
+      - restore_cargo_package_cache
       - run:
           name: Install Cargo Audit
           command: |
@@ -169,7 +383,9 @@ jobs:
       - build_teardown
   code-coverage:
     description: Run code coverage
-    executor: build-executor
+    executor: test-executor
+    environment:
+      MESSAGE_PAYLOAD_FILE: "/tmp/message_payload"
     steps:
       - build_setup
       - install_code_coverage_deps
@@ -179,10 +395,15 @@ jobs:
           command: echo "export CODECOV_OUTPUT=codecov" >> $BASH_ENV
       - run:
           name: Run code coverage
-          command: ./scripts/coverage_report.sh . $CODECOV_OUTPUT --batch
+          command: |
+            ./scripts/coverage_report.sh . $CODECOV_OUTPUT --batch --failed_crate_file ${MESSAGE_PAYLOAD_FILE}
       - run:
           name: Upload result to codecov.io
           command: bash <(curl -s https://codecov.io/bash) -f $CODECOV_OUTPUT/lcov.info;
+      - send_message:
+          payload_file: "${MESSAGE_PAYLOAD_FILE}"
+          build_url: "${CIRCLE_BUILD_URL}#tests/containers/${CIRCLE_NODE_INDEX}"
+          webhook: "${WEBHOOK_FLAKY_TESTS}"
   terraform:
     executor: terraform-executor
     steps:
@@ -228,14 +449,163 @@ jobs:
                 echo "$docker_file is renamed or removed in pull request."
               fi
             done
+  check-breaking-change:
+    executor: audit-executor
+    description: Detect breaking change in CLI
+    environment:
+      # NOTE The  built-in save_cache and restore_cache cmds dont accept cache
+      # path or cache key defined via env var on the fly. As a result, if you
+      # change BREAKING_CHANGE_REV_FILE or TESTNET_REV_FILE, make sure to change
+      # save_breaking_change_rev and restore_breaking_change_rev accordingly.
+      BREAKING_CHANGE_REV_FILE: "breaking_change_rev"
+      TESTNET_REV_FILE: "testnet_rev"
+    steps:
+      - build_setup
+      - run:
+          name: Prepare cache key for breaking change rev lookup
+          # NOTE save_cache and restore_cache dont take cache key defined via
+          # env var on the fly. So we are going to store the testnet rev in a
+          # file and use its checksum as cache key.
+          command: |
+            echo 'export GIT_REV=$(git rev-parse HEAD)' >> $BASH_ENV
+            git rev-parse origin/testnet > ${TESTNET_REV_FILE}
+      - restore_breaking_change_rev
+      - run:
+          name: Check exiting breaking change rev
+          command: |
+            pwd
+            if [ -f "${BREAKING_CHANGE_REV_FILE}" ]; then
+              echo "master already has breaking change $(cat ${BREAKING_CHANGE_REV_FILE})"
+              echo "Nothing to do. Halting CI..."
+              circleci step halt
+            else
+              echo "No existing breacking change rev. Will continue CI."
+            fi
+      - restore_cargo_package_cache
+      - run:
+          name: Construct CLI cmds
+          command: |
+            echo "
+              a c
+              a m 0 10 LBR false
+              q b 0
+              a c
+              a m 1 11 LBR false
+              q b 1
+              t 0 1 1 LBR
+              q b 0
+              q b 1
+              quit
+            " > /tmp/cli
+      - run:
+          name: Connect to testnet
+          # NOTE +e to disable exit immediately on failure
+          command: |
+            set +e
+            ./scripts/cli/start_cli_testnet.sh < /tmp/cli
+            status=$?
+            if [[ $status != 0 ]] ; then
+              git rev-parse HEAD > ${BREAKING_CHANGE_REV_FILE}
+              echo "Will save breaking change rev $(cat ${BREAKING_CHANGE_REV_FILE})"
+            fi
+            exit $status
+      - save_breaking_change_rev
+      - slack/status:
+          fail_only: true
+          webhook: "${WEBHOOK_BREAKING_CHANGE}"
+          failure_message: ":red_circle: <@channel> breaking change in *${GIT_REV}*"
+  # build-docs and deploy-docs are adapted from
+  # https://circleci.com/blog/deploying-documentation-to-github-pages-with-continuous-integration/.
+  build-docs:
+    executor: build-executor
+    description: Documentation Build
+    steps:
+      - build_setup
+      - run:
+          name: Generate documentation
+          command: |
+            # Use `RUSTC_BOOTSTRAP` in order to use the `--enable-index-page` flag of rustdoc
+            # This is needed in order to generate a landing page `index.html` for workspaces
+            RUSTC_BOOTSTRAP=1 RUSTDOCFLAGS="-Z unstable-options --enable-index-page" cargo doc --no-deps --workspace --lib
+      - persist_to_workspace:
+          root: target
+          paths: doc
+  deploy-docs:
+    docker:
+      - image: node:8.10.0
+    steps:
+      - checkout
+      - attach_workspace:
+          at: target
+      - run:
+          name: Disable jekyll builds
+          command: touch target/doc/.nojekyll
+      - run:
+          name: Install and configure gh-pages
+          command: |
+            npm install -g --silent gh-pages@2.0.1
+            git config user.email "libra-doc-bot@users.noreply.github.com"
+            git config user.name "libra-doc-bot"
+      - add_ssh_keys:
+          fingerprints:
+            - "b4:01:8d:ee:cb:ee:84:c6:e3:25:a4:1e:af:cf:7b:f2"
+      - run:
+          name: Deploy to gh-pages branch
+          command: |
+            gh-pages --dotfiles --message "[skip ci] documentation update" --dist target/doc
 
 workflows:
   commit-workflow:
     jobs:
-      - build
-      - build-docker
-      - validate-cluster-test-dockerfile
-      - terraform
+      - build-docker:
+        filters:
+          branches:
+            ignore: gh-pages
+      - validate-cluster-test-dockerfile:
+        filters:
+          branches:
+            ignore: gh-pages
+      - terraform:
+        filters:
+          branches:
+            ignore: gh-pages
+      - prefetch-crates:
+        filters:
+          branches:
+            ignore: gh-pages
+      - lint:
+          requires:
+            - prefetch-crates
+      - build-dev:
+          requires:
+            - prefetch-crates
+      - build-release:
+          requires:
+            - prefetch-crates
+      - run-e2e-test:
+          requires:
+            - prefetch-crates
+      - run-unit-test:
+          requires:
+            - prefetch-crates
+      - run-crypto-unit-test:
+          requires:
+            - prefetch-crates
+      - build-docs:
+          requires:
+            - lint
+      - deploy-docs:
+          requires:
+            - build-docs
+          filters:
+            branches:
+              only: master
+      - check-breaking-change:
+          requires:
+            - prefetch-crates
+          filters:
+           branches:
+             only: master
 
   scheduled-workflow:
     triggers:

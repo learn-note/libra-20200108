@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::abstract_state::{AbstractValue, BorrowState};
+use libra_logger::debug;
 use rand::{rngs::StdRng, Rng};
-use slog_scope::debug;
 use std::collections::{HashMap, VecDeque};
-use vm::file_format::{Bytecode, FunctionSignature, Kind, SignatureToken};
+use vm::file_format::{Bytecode, Kind, Signature, SignatureToken};
 
 /// This type holds basic block identifiers
 type BlockIDSize = u16;
@@ -14,7 +14,7 @@ type BlockIDSize = u16;
 type BlockLocals = HashMap<usize, (AbstractValue, BorrowState)>;
 
 /// This represents a basic block in a control flow graph
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct BasicBlock {
     /// The starting locals
     locals_in: BlockLocals,
@@ -69,7 +69,7 @@ impl CFG {
     pub fn new(
         rng: &mut StdRng,
         locals: &[SignatureToken],
-        signature: &FunctionSignature,
+        parameters: &Signature,
         target_blocks: BlockIDSize,
     ) -> CFG {
         checked_precondition!(target_blocks > 0, "The CFG must haave at least one block");
@@ -135,7 +135,7 @@ impl CFG {
         };
         // Assign locals to basic blocks
         assume!(target_blocks == 0 || !cfg.basic_blocks.is_empty());
-        CFG::add_locals(&mut cfg, rng, locals, signature.arg_types.len());
+        CFG::add_locals(&mut cfg, rng, locals, parameters.0.len());
         cfg
     }
 
@@ -263,7 +263,7 @@ impl CFG {
                         (
                             i,
                             (
-                                AbstractValue::new_value(token.clone(), Kind::Unrestricted),
+                                AbstractValue::new_value(token.clone(), Kind::Copyable),
                                 borrow_state,
                             ),
                         )

@@ -1,7 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{error::Error, policy::Policy, storage::Storage, value::Value};
+use crate::{CryptoKVStorage, Error, GetResponse, KVStorage, Value};
+use libra_secure_time::{RealTimeService, TimeService};
 use std::collections::HashMap;
 
 /// InMemoryStorage represents a key value store that is purely in memory and intended for single
@@ -10,55 +11,71 @@ use std::collections::HashMap;
 /// Internally, it retains all data, which means that it must make copies of all key material which
 /// violates the Libra code base. It violates it because the anticipation is that data stores would
 /// securely handle key material. This should not be used in production.
-pub struct InMemoryStorage {
-    data: HashMap<String, Value>,
+pub type InMemoryStorage = InMemoryStorageInternal<RealTimeService>;
+
+#[derive(Default)]
+pub struct InMemoryStorageInternal<T> {
+    data: HashMap<String, GetResponse>,
+    time_service: T,
 }
 
-impl InMemoryStorage {
+impl InMemoryStorageInternal<RealTimeService> {
     pub fn new() -> Self {
+        Self::new_with_time_service(RealTimeService::new())
+    }
+}
+
+impl<T: TimeService> InMemoryStorageInternal<T> {
+    pub fn new_with_time_service(time_service: T) -> Self {
         Self {
             data: HashMap::new(),
+            time_service,
         }
     }
 }
 
-impl Storage for InMemoryStorage {
-    fn available(&self) -> bool {
-        true
-    }
-
-    fn create(&mut self, key: &str, value: Value, _policy: &Policy) -> Result<(), Error> {
-        if self.data.contains_key(key) {
-            return Err(Error::KeyAlreadyExists(key.to_string()));
-        }
-        self.data.insert(key.to_string(), value);
+impl<T: Send + Sync + TimeService> KVStorage for InMemoryStorageInternal<T> {
+    fn available(&self) -> Result<(), Error> {
         Ok(())
     }
 
-    fn get(&self, key: &str) -> Result<Value, Error> {
-        let value = self
+    fn get(&self, key: &str) -> Result<GetResponse, Error> {
+        let response = self
             .data
             .get(key)
             .ok_or_else(|| Error::KeyNotSet(key.to_string()))?;
 
-        let value = match value {
+        let value = match &response.value {
             Value::Ed25519PrivateKey(value) => {
                 // Hack because Ed25519PrivateKey does not support clone / copy
-                let bytes = lcs::to_bytes(value)?;
+                let bytes = lcs::to_bytes(&value)?;
                 let key = lcs::from_bytes(&bytes)?;
                 Value::Ed25519PrivateKey(key)
             }
+            Value::Ed25519PublicKey(value) => Value::Ed25519PublicKey(value.clone()),
+            Value::HashValue(value) => Value::HashValue(*value),
+            Value::String(value) => Value::String(value.clone()),
             Value::U64(value) => Value::U64(*value),
+            Value::Transaction(value) => Value::Transaction(value.clone()),
         };
 
-        Ok(value)
+        let last_update = response.last_update;
+        Ok(GetResponse { value, last_update })
     }
 
     fn set(&mut self, key: &str, value: Value) -> Result<(), Error> {
-        if !self.data.contains_key(key) {
-            return Err(Error::KeyNotSet(key.to_string()));
-        }
-        self.data.insert(key.to_string(), value);
+        self.data.insert(
+            key.to_string(),
+            GetResponse::new(value, self.time_service.now()),
+        );
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    fn reset_and_clear(&mut self) -> Result<(), Error> {
+        self.data.clear();
         Ok(())
     }
 }
+
+impl<T: TimeService + Send + Sync> CryptoKVStorage for InMemoryStorageInternal<T> {}

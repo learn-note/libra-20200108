@@ -8,17 +8,36 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
+    net::SocketAddr,
     path::PathBuf,
 };
 
 const GENESIS_DEFAULT: &str = "genesis.blob";
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExecutionConfig {
     #[serde(skip)]
     pub genesis: Option<Transaction>,
     pub genesis_file_location: PathBuf,
+    pub service: ExecutionCorrectnessService,
+}
+
+impl std::fmt::Debug for ExecutionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ExecutionConfig {{ genesis: ")?;
+        if self.genesis.is_some() {
+            write!(f, "Some(...)")?;
+        } else {
+            write!(f, "None")?;
+        }
+        write!(
+            f,
+            ", genesis_file_location: {:?} }}",
+            self.genesis_file_location
+        )?;
+        self.service.fmt(f)
+    }
 }
 
 impl Default for ExecutionConfig {
@@ -26,6 +45,7 @@ impl Default for ExecutionConfig {
         ExecutionConfig {
             genesis: None,
             genesis_file_location: PathBuf::new(),
+            service: ExecutionCorrectnessService::Thread,
         }
     }
 }
@@ -37,7 +57,6 @@ impl ExecutionConfig {
             let mut file = File::open(&path)?;
             let mut buffer = vec![];
             file.read_to_end(&mut buffer)?;
-            // TODO: update to use `Transaction::WriteSet` variant when ready.
             self.genesis = Some(lcs::from_bytes(&buffer)?);
         }
 
@@ -55,6 +74,29 @@ impl ExecutionConfig {
         }
         Ok(())
     }
+}
+
+/// Defines how execution correctness should be run
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExecutionCorrectnessService {
+    /// This runs execution correctness in the same thread as event processor.
+    Local,
+    /// This is the production, separate service approach
+    Process(RemoteExecutionService),
+    /// This runs safety rules in the same thread as event processor but data is passed through the
+    /// light weight RPC (serializer)
+    Serializer,
+    /// This instructs Consensus that this is an test model, where Consensus should take the
+    /// existing config, create a new process, and pass to it the config
+    SpawnedProcess(RemoteExecutionService),
+    /// This creates a separate thread to run execution correctness, it is similar to a fork / exec style
+    Thread,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RemoteExecutionService {
+    pub server_address: SocketAddr,
 }
 
 #[cfg(test)]
@@ -78,7 +120,7 @@ mod test {
 
     #[test]
     fn test_some_and_load_genesis() {
-        let fake_genesis = Transaction::WriteSet(ChangeSet::new(
+        let fake_genesis = Transaction::WaypointWriteSet(ChangeSet::new(
             WriteSetMut::new(vec![]).freeze().unwrap(),
             vec![],
         ));

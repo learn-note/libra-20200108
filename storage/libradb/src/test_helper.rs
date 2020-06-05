@@ -8,8 +8,7 @@ use libra_crypto::hash::CryptoHash;
 use libra_temppath::TempPath;
 use libra_types::{
     block_info::BlockInfo,
-    crypto_proxies::LedgerInfoWithSignatures,
-    ledger_info::LedgerInfo,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     proptest_types::{AccountInfoUniverse, LedgerInfoWithSignaturesGen, TransactionToCommitGen},
 };
 use proptest::{collection::vec, prelude::*};
@@ -20,7 +19,7 @@ fn to_blocks_to_commit(
     // Use temporary LibraDB and STORE LEVEL APIs to calculate hashes on a per transaction basis.
     // Result is used to test the batch PUBLIC API for saving everything, i.e. `save_transactions()`
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
+    let db = LibraDB::new_for_test(&tmp_dir);
 
     let mut cur_ver = 0;
     let mut cur_txn_accu_hash = HashValue::zero();
@@ -67,7 +66,7 @@ fn to_blocks_to_commit(
                 cur_txn_accu_hash,
                 partial_ledger_info.version(),
                 partial_ledger_info.timestamp_usecs(),
-                partial_ledger_info.next_validator_set().cloned(),
+                partial_ledger_info.next_epoch_state().cloned(),
             );
             let ledger_info =
                 LedgerInfo::new(block_info, partial_ledger_info.consensus_data_hash());

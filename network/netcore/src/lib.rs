@@ -8,6 +8,6 @@
 //! socket.
 
 pub mod compat;
-pub mod multiplexing;
+pub mod framing;
 pub mod negotiate;
 pub mod transport;

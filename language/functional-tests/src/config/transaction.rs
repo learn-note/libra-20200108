@@ -3,7 +3,11 @@
 
 use crate::{common::strip, config::global::Config as GlobalConfig, errors::*, evaluator::Stage};
 use language_e2e_tests::account::Account;
-use libra_types::transaction::{parse_as_transaction_argument, TransactionArgument};
+use move_core_types::{
+    language_storage::TypeTag,
+    parser::{parse_transaction_arguments, parse_type_tags},
+    transaction_argument::TransactionArgument,
+};
 use std::{collections::BTreeSet, str::FromStr, time::Duration};
 
 /// A partially parsed transaction argument.
@@ -12,28 +16,16 @@ pub enum Argument {
     AddressOf(String),
     SelfContained(TransactionArgument),
 }
-
-impl FromStr for Argument {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        if let Ok(arg) = parse_as_transaction_argument(s) {
-            return Ok(Argument::SelfContained(arg));
-        }
-        if s.starts_with("{{") && s.ends_with("}}") {
-            return Ok(Argument::AddressOf(s[2..s.len() - 2].to_string()));
-        }
-        Err(ErrorKind::Other(format!("failed to parse '{}' as argument", s)).into())
-    }
-}
-
 /// A raw entry extracted from the input. Used to build a transaction config table.
 #[derive(Debug)]
 pub enum Entry {
     DisableStages(Vec<Stage>),
     Sender(String),
+    TypeArguments(Vec<TypeTag>),
     Arguments(Vec<Argument>),
     MaxGas(u64),
+    GasPrice(u64),
+    GasCurrencyCode(String),
     SequenceNumber(u64),
     ExpirationTime(u64),
 }
@@ -53,14 +45,16 @@ impl FromStr for Entry {
             }
             return Ok(Entry::Sender(s.to_ascii_lowercase()));
         }
+        if let Some(s) = strip(s, "type-args:") {
+            return Ok(Entry::TypeArguments(parse_type_tags(s)?));
+        }
         if let Some(s) = strip(s, "args:") {
-            let res: Result<Vec<_>> = s
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.parse::<Argument>())
-                .collect();
-            return Ok(Entry::Arguments(res?));
+            return Ok(Entry::Arguments(
+                parse_transaction_arguments(s)?
+                    .into_iter()
+                    .map(Argument::SelfContained)
+                    .collect(),
+            ));
         }
         if let Some(s) = strip(s, "no-run:") {
             let res: Result<Vec<_>> = s
@@ -74,12 +68,19 @@ impl FromStr for Entry {
         if let Some(s) = strip(s, "max-gas:") {
             return Ok(Entry::MaxGas(s.parse::<u64>()?));
         }
+        if let Some(s) = strip(s, "gas-price:") {
+            return Ok(Entry::GasPrice(s.parse::<u64>()?));
+        }
+        if let Some(s) = strip(s, "gas-currency:") {
+            return Ok(Entry::GasCurrencyCode(s.to_owned()));
+        }
         if let Some(s) = strip(s, "sequence-number:") {
             return Ok(Entry::SequenceNumber(s.parse::<u64>()?));
         }
         if let Some(s) = strip(s, "expiration-time:") {
             return Ok(Entry::ExpirationTime(s.parse::<u64>()?));
         }
+
         Err(ErrorKind::Other(format!(
             "failed to parse '{}' as transaction config entry",
             s
@@ -113,8 +114,11 @@ impl Entry {
 pub struct Config<'a> {
     pub disabled_stages: BTreeSet<Stage>,
     pub sender: &'a Account,
+    pub ty_args: Vec<TypeTag>,
     pub args: Vec<TransactionArgument>,
     pub max_gas: Option<u64>,
+    pub gas_price: Option<u64>,
+    pub gas_currency_code: Option<String>,
     pub sequence_number: Option<u64>,
     pub expiration_time: Option<Duration>,
 }
@@ -124,8 +128,11 @@ impl<'a> Config<'a> {
     pub fn build(config: &'a GlobalConfig, entries: &[Entry]) -> Result<Self> {
         let mut disabled_stages = BTreeSet::new();
         let mut sender = None;
+        let mut ty_args = None;
         let mut args = None;
         let mut max_gas = None;
+        let mut gas_price = None;
+        let mut gas_currency_code = None;
         let mut sequence_number = None;
         let mut expiration_time = None;
 
@@ -134,6 +141,12 @@ impl<'a> Config<'a> {
                 Entry::Sender(name) => match sender {
                     None => sender = Some(config.get_account_for_name(name)?),
                     _ => return Err(ErrorKind::Other("sender already set".to_string()).into()),
+                },
+                Entry::TypeArguments(ty_args_) => match ty_args {
+                    None => {
+                        ty_args = Some(ty_args_.clone());
+                    }
+                    _ => bail!("transaction type arguments already set"),
                 },
                 Entry::Arguments(raw_args) => match args {
                     None => {
@@ -175,6 +188,18 @@ impl<'a> Config<'a> {
                         )
                     }
                 },
+                Entry::GasPrice(n) => match gas_price {
+                    None => gas_price = Some(*n),
+                    Some(_) => {
+                        return Err(ErrorKind::Other("gas price already set".to_string()).into())
+                    }
+                },
+                Entry::GasCurrencyCode(code) => match gas_currency_code {
+                    None => gas_currency_code = Some(code.to_owned()),
+                    Some(_) => {
+                        return Err(ErrorKind::Other("gas currency already set".to_string()).into())
+                    }
+                },
                 Entry::SequenceNumber(sn) => match sequence_number {
                     None => sequence_number = Some(*sn),
                     Some(_) => {
@@ -197,8 +222,11 @@ impl<'a> Config<'a> {
         Ok(Self {
             disabled_stages,
             sender: sender.unwrap_or_else(|| config.accounts.get("default").unwrap().account()),
-            args: args.unwrap_or_else(|| vec![]),
+            ty_args: ty_args.unwrap_or_else(Vec::new),
+            args: args.unwrap_or_else(Vec::new),
             max_gas,
+            gas_price,
+            gas_currency_code,
             sequence_number,
             expiration_time,
         })

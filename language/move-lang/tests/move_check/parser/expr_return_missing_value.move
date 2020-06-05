@@ -1,6 +1,6 @@
 module M {
-    f(v: u64) {
-        // Returns always require a value
+    fun f(v: u64) {
+        // Check a return without the optional return value
         if (v > 100) return
     }
 }

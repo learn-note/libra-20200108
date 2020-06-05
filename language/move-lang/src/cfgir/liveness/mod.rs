@@ -5,12 +5,16 @@ mod state;
 
 use super::{
     absint::*,
-    ast,
-    ast::*,
     cfg::{BlockCFG, ReverseBlockCFG, CFG},
+    locals,
 };
-use crate::shared::unique_map::UniqueMap;
-use crate::{errors::*, parser::ast::Var, shared::*};
+use crate::{
+    errors::*,
+    hlir::ast::{self as H, *},
+    parser::ast::Var,
+    shared::unique_map::UniqueMap,
+};
+use move_ir_types::location::*;
 use state::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -19,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 //**************************************************************************************************
 
 type PerCommandStates = BTreeMap<Label, VecDeque<LivenessState>>;
-type ForwardIntersections = BTreeMap<Label, LivenessState>;
+type ForwardIntersections = BTreeMap<Label, BTreeSet<Var>>;
 type FinalInvariants = BTreeMap<Label, LivenessState>;
 
 struct Liveness {
@@ -60,31 +64,6 @@ impl TransferFunctions for Liveness {
 
 impl AbstractInterpreter for Liveness {}
 
-pub fn refine_inference_and_verify(
-    errors: &mut Errors,
-    _signature: &FunctionSignature,
-    locals: &UniqueMap<Var, SingleType>,
-    cfg: &mut BlockCFG,
-    infinite_loop_starts: &BTreeSet<Label>,
-) {
-    let (final_invariants, per_command_states) = analyze(cfg, &infinite_loop_starts);
-    last_usage(
-        errors,
-        locals,
-        final_invariants,
-        per_command_states,
-        cfg.blocks_mut(),
-    );
-    let (final_invariants, per_command_states) = analyze(cfg, &infinite_loop_starts);
-    let forward_intersections = build_forward_intersections(cfg, final_invariants);
-    release_dead_refs(
-        locals,
-        forward_intersections,
-        per_command_states,
-        cfg.blocks_mut(),
-    );
-}
-
 //**************************************************************************************************
 // Analysis
 //**************************************************************************************************
@@ -96,7 +75,8 @@ fn analyze(
     let reverse = &mut ReverseBlockCFG::new(cfg, infinite_loop_starts);
     let initial_state = LivenessState::initial();
     let mut liveness = Liveness::new(reverse);
-    let final_invariants = liveness.analyze_function(reverse, initial_state).unwrap();
+    let (final_invariants, errors) = liveness.analyze_function(reverse, initial_state);
+    assert!(errors.is_empty());
     (final_invariants, liveness.states)
 }
 
@@ -116,6 +96,7 @@ fn command(state: &mut LivenessState, sp!(_, cmd_): &Command) {
         }
 
         C::Jump(_) => (),
+        C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
     }
 }
 
@@ -137,18 +118,23 @@ fn lvalue(state: &mut LivenessState, sp!(_, l_): &LValue) {
 fn exp(state: &mut LivenessState, parent_e: &Exp) {
     use UnannotatedExp_ as E;
     match &parent_e.exp.value {
-        E::Unit | E::Value(_) | E::UnresolvedError => (),
+        E::Unit { .. } | E::Value(_) | E::UnresolvedError => (),
 
         E::BorrowLocal(_, var) | E::Copy { var, .. } | E::Move { var, .. } => {
             state.0.insert(var.clone());
         }
+
+        E::Spec(_, used_locals) => used_locals.keys().for_each(|v| {
+            state.0.insert(v.clone());
+        }),
 
         E::ModuleCall(mcall) => exp(state, &mcall.arguments),
         E::Builtin(_, e)
         | E::Freeze(e)
         | E::Dereference(e)
         | E::UnaryExp(_, e)
-        | E::Borrow(_, e, _) => exp(state, e),
+        | E::Borrow(_, e, _)
+        | E::Cast(e, _) => exp(state, e),
 
         E::BinopExp(e1, _, e2) => {
             exp(state, e1);
@@ -158,6 +144,8 @@ fn exp(state: &mut LivenessState, parent_e: &Exp) {
         E::Pack(_, _, fields) => fields.iter().for_each(|(_, _, e)| exp(state, e)),
 
         E::ExpList(es) => es.iter().for_each(|item| exp_list_item(state, item)),
+
+        E::Unreachable => panic!("ICE should not analyze dead code"),
     }
 }
 
@@ -177,25 +165,32 @@ fn exp_list_item(state: &mut LivenessState, item: &ExpListItem) {
 /// - Reports an error if an assignment/let was not used
 ///   Switches it to an `Ignore` if it is not a resource (helps with error messages for borrows)
 
-fn last_usage(
+pub fn last_usage(
     errors: &mut Errors,
     locals: &UniqueMap<Var, SingleType>,
-    final_invariants: FinalInvariants,
-    block_command_states: PerCommandStates,
-    blocks: &mut Blocks,
+    cfg: &mut BlockCFG,
+    infinite_loop_starts: &BTreeSet<Label>,
 ) {
-    for (lbl, block) in blocks {
+    let (final_invariants, per_command_states) = analyze(cfg, &infinite_loop_starts);
+    for (lbl, block) in cfg.blocks_mut() {
         let final_invariant = final_invariants.get(lbl).unwrap();
-        let command_states = block_command_states.get(lbl).unwrap();
+        let command_states = per_command_states.get(lbl).unwrap();
         last_usage::block(errors, locals, final_invariant, command_states, block)
     }
 }
 
 mod last_usage {
-    use crate::cfgir::ast::*;
-    use crate::cfgir::liveness::state::LivenessState;
-    use crate::hlir::translate::{display_var, DisplayVar};
-    use crate::{errors::*, parser::ast::Var, shared::unique_map::*, shared::*};
+    use crate::{
+        cfgir::liveness::state::LivenessState,
+        errors::*,
+        hlir::{
+            ast::*,
+            translate::{display_var, DisplayVar},
+        },
+        parser::ast::Var,
+        shared::{unique_map::*, *},
+    };
+    use move_ir_types::location::*;
     use std::collections::{BTreeSet, VecDeque};
 
     struct Context<'a, 'b> {
@@ -281,6 +276,7 @@ mod last_usage {
             | C::JumpIf { cond: e, .. } => exp(context, e),
 
             C::Jump(_) => (),
+            C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
         }
     }
 
@@ -299,8 +295,8 @@ mod last_usage {
                         DisplayVar::Tmp => (),
                         DisplayVar::Orig(v_str) => {
                             let msg = format!(
-                                "Unused assignment or binding for local '{}'. Consider \
-                                 removing or replacing it with '_'",
+                                "Unused assignment or binding for local '{}'. Consider removing \
+                                 or replacing it with '_'",
                                 v_str
                             );
                             context.error(vec![(l.loc, msg)]);
@@ -318,18 +314,32 @@ mod last_usage {
     fn exp(context: &mut Context, parent_e: &mut Exp) {
         use UnannotatedExp_ as E;
         match &mut parent_e.exp.value {
-            E::Unit | E::Value(_) | E::UnresolvedError => (),
+            E::Unit { .. } | E::Value(_) | E::UnresolvedError => (),
 
             E::BorrowLocal(_, var) | E::Move { var, .. } => {
                 // remove it from context to prevent accidental dropping in previous usages
                 context.dropped_live.remove(var);
             }
 
+            E::Spec(_, used_locals) => {
+                // remove it from context to prevent accidental dropping in previous usages
+                used_locals.keys().for_each(|var| {
+                    context.dropped_live.remove(var);
+                })
+            }
+
             E::Copy { var, from_user } => {
                 // Even if not switched to a move:
                 // remove it from dropped_live to prevent accidental dropping in previous usages
                 let var_is_dead = context.dropped_live.remove(var);
-                if var_is_dead && !*from_user {
+                // Non-references might still be borrowed
+                // Switching such non-locals to a copy is an optimization and not
+                // needed for this refinement
+                let is_reference = matches!(
+                    &parent_e.ty.value,
+                    Type_::Single(sp!(_, SingleType_::Ref(_, _)))
+                );
+                if var_is_dead && is_reference && !*from_user {
                     parent_e.exp.value = E::Move {
                         var: var.clone(),
                         from_user: *from_user,
@@ -342,7 +352,8 @@ mod last_usage {
             | E::Freeze(e)
             | E::Dereference(e)
             | E::UnaryExp(_, e)
-            | E::Borrow(_, e, _) => exp(context, e),
+            | E::Borrow(_, e, _)
+            | E::Cast(e, _) => exp(context, e),
 
             E::BinopExp(e1, _, e2) => {
                 exp(context, e2);
@@ -358,6 +369,8 @@ mod last_usage {
                 .iter_mut()
                 .rev()
                 .for_each(|item| exp_list_item(context, item)),
+
+            E::Unreachable => panic!("ICE should not analyze dead code"),
         }
     }
 
@@ -390,22 +403,31 @@ mod last_usage {
 /// Then `release_dead_refs_block` adds a release at the beginning of the block if the reference
 /// satisfies (1) and (2)
 
-fn release_dead_refs(
+pub fn release_dead_refs(
+    locals_pre_states: &BTreeMap<Label, locals::state::LocalStates>,
     locals: &UniqueMap<Var, SingleType>,
-    forward_intersections: ForwardIntersections,
-    block_command_states: PerCommandStates,
-    blocks: &mut Blocks,
+    cfg: &mut BlockCFG,
+    infinite_loop_starts: &BTreeSet<Label>,
 ) {
-    for (lbl, block) in &mut *blocks {
-        let initial = forward_intersections.get(lbl).unwrap();
-        let command_states = block_command_states.get(lbl).unwrap();
-        release_dead_refs_block(locals, initial, command_states, block)
+    let (liveness_pre_states, _per_command_states) = analyze(cfg, &infinite_loop_starts);
+    let forward_intersections = build_forward_intersections(cfg, &liveness_pre_states);
+    for (lbl, block) in cfg.blocks_mut() {
+        let locals_pre_state = locals_pre_states.get(lbl).unwrap();
+        let liveness_pre_state = liveness_pre_states.get(lbl).unwrap();
+        let forward_intersection = forward_intersections.get(lbl).unwrap();
+        release_dead_refs_block(
+            locals,
+            locals_pre_state,
+            liveness_pre_state,
+            forward_intersection,
+            block,
+        )
     }
 }
 
 fn build_forward_intersections(
     cfg: &BlockCFG,
-    final_invariants: FinalInvariants,
+    final_invariants: &FinalInvariants,
 ) -> ForwardIntersections {
     cfg.blocks()
         .keys()
@@ -413,28 +435,40 @@ fn build_forward_intersections(
             let mut states = cfg
                 .predecessors(*lbl)
                 .iter()
-                .flat_map(|pred| final_invariants.get(pred))
-                .map(|state| &state.0);
+                .map(|pred| &final_invariants.get(pred).unwrap().0);
             let intersection = states
                 .next()
                 .map(|init| states.fold(init.clone(), |acc, s| &acc & s))
                 .unwrap_or_else(BTreeSet::new);
-            (*lbl, LivenessState(intersection))
+            (*lbl, intersection)
         })
         .collect()
 }
 
 fn release_dead_refs_block(
     locals: &UniqueMap<Var, SingleType>,
-    initial: &LivenessState,
-    command_states: &VecDeque<LivenessState>,
+    locals_pre_state: &locals::state::LocalStates,
+    liveness_pre_state: &LivenessState,
+    forward_intersection: &BTreeSet<Var>,
     block: &mut BasicBlock,
 ) {
+    if forward_intersection.is_empty() {
+        return;
+    }
+
     let cmd_loc = block.get(0).unwrap().loc;
-    let cur_data = command_states.get(0).unwrap();
-    let dead_refs = initial
-        .0
-        .difference(&cur_data.0)
+    let cur_state = {
+        let mut s = liveness_pre_state.clone();
+        for cmd in block.iter().rev() {
+            command(&mut s, cmd);
+        }
+        s
+    };
+    // Free references that were live in ALL predecessors and that have a value
+    // (could not have a value due to errors)
+    let dead_refs = forward_intersection
+        .difference(&cur_state.0)
+        .filter(|var| locals_pre_state.get_state(var).is_available())
         .map(|var| (var, locals.get(var).unwrap()))
         .filter(is_ref);
     for (dead_ref, ty) in dead_refs {
@@ -456,7 +490,7 @@ fn pop_ref(loc: Loc, var: Var, ty: SingleType) -> Command {
         from_user: false,
         var,
     };
-    let move_e = ast::exp(Type_::single(ty), sp(loc, move_e_));
+    let move_e = H::exp(Type_::single(ty), sp(loc, move_e_));
     let pop_ = C::IgnoreAndPop {
         pop_num: 1,
         exp: move_e,

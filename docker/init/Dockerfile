@@ -16,13 +16,14 @@ FROM toolchain AS builder
 
 COPY . /libra
 
+ENV RUSTFLAGS "-Ctarget-cpu=skylake -Ctarget-feature=+aes,+sse2,+sse4.1,+ssse3"
 RUN cargo build --release -p libra-node -p cli -p config-builder -p safety-rules && cd target/release && rm -r build deps incremental
 
 ### Production Image ###
 FROM debian:buster AS prod
 
-RUN apt-get update && apt-get -y install curl gettext-base && apt-get clean && rm -r /var/lib/apt/lists/*
-RUN cd /usr/local/bin && curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.17.0/bin/linux/amd64/kubectl && chmod +x kubectl
+RUN apt-get update && apt-get -y install wget gettext-base && apt-get clean && rm -r /var/lib/apt/lists/*
+RUN cd /usr/local/bin && wget "https://storage.googleapis.com/kubernetes-release/release/v1.17.0/bin/linux/amd64/kubectl" -O kubectl && chmod +x kubectl
 
 RUN mkdir -p /opt/libra/bin
 COPY --from=builder /libra/target/release/config-builder /opt/libra/bin

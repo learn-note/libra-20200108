@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use libra_logger::CHANNEL_SIZE;
+use log::Level;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -8,15 +10,18 @@ use serde::{Deserialize, Serialize};
 pub struct LoggerConfig {
     // Use async logging
     pub is_async: bool,
-    // chan_size of slog async drain for node logging.
+    // channel size for the asychronous channel for node logging.
     pub chan_size: usize,
+    // The default logging level for slog.
+    pub level: Level,
 }
 
 impl Default for LoggerConfig {
     fn default() -> LoggerConfig {
         LoggerConfig {
             is_async: true,
-            chan_size: 256,
+            chan_size: CHANNEL_SIZE,
+            level: Level::Info,
         }
     }
 }

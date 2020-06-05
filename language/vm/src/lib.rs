@@ -6,26 +6,20 @@
 #[macro_use]
 extern crate mirai_annotations;
 
-#[cfg(feature = "mirai-contracts")]
-pub mod foreign_contracts;
-
 use std::fmt;
 
 pub mod access;
 pub mod check_bounds;
 #[macro_use]
 pub mod errors;
+pub mod constant;
 pub mod deserializer;
 pub mod file_format;
 pub mod file_format_common;
-pub mod gas_schedule;
 pub mod internals;
-pub mod printers;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod proptest_types;
-pub mod resolver;
 pub mod serializer;
-pub mod transaction_metadata;
 pub mod views;
 
 #[cfg(test)]
@@ -39,18 +33,21 @@ pub enum IndexKind {
     ModuleHandle,
     StructHandle,
     FunctionHandle,
+    FieldHandle,
+    FunctionInstantiation,
+    FieldInstantiation,
     StructDefinition,
-    FieldDefinition,
+    StructDefInstantiation,
     FunctionDefinition,
-    TypeSignature,
-    FunctionSignature,
-    LocalsSignature,
+    FieldDefinition,
+    Signature,
     Identifier,
-    ByteArrayPool,
-    AddressPool,
+    AddressIdentifier,
+    ConstantPool,
     LocalPool,
     CodeDefinition,
     TypeParameter,
+    MemberCount,
 }
 
 impl IndexKind {
@@ -59,21 +56,23 @@ impl IndexKind {
 
         // XXX ensure this list stays up to date!
         &[
-            ByteArrayPool,
             ModuleHandle,
             StructHandle,
             FunctionHandle,
+            FieldHandle,
+            StructDefInstantiation,
+            FunctionInstantiation,
+            FieldInstantiation,
             StructDefinition,
-            FieldDefinition,
             FunctionDefinition,
-            TypeSignature,
-            FunctionSignature,
-            LocalsSignature,
+            FieldDefinition,
+            Signature,
             Identifier,
-            AddressPool,
+            ConstantPool,
             LocalPool,
             CodeDefinition,
             TypeParameter,
+            MemberCount,
         ]
     }
 }
@@ -86,18 +85,21 @@ impl fmt::Display for IndexKind {
             ModuleHandle => "module handle",
             StructHandle => "struct handle",
             FunctionHandle => "function handle",
+            FieldHandle => "field handle",
+            StructDefInstantiation => "struct instantiation",
+            FunctionInstantiation => "function instantiation",
+            FieldInstantiation => "field instantiation",
             StructDefinition => "struct definition",
-            FieldDefinition => "field definition",
             FunctionDefinition => "function definition",
-            TypeSignature => "type signature",
-            FunctionSignature => "function signature",
-            LocalsSignature => "locals signature",
+            FieldDefinition => "field definition",
+            Signature => "signature",
             Identifier => "identifier",
-            ByteArrayPool => "byte_array pool",
-            AddressPool => "address pool",
+            AddressIdentifier => "address identifier",
+            ConstantPool => "constant pool",
             LocalPool => "local pool",
             CodeDefinition => "code definition pool",
             TypeParameter => "type parameter",
+            MemberCount => "field offset",
         };
 
         f.write_str(desc)

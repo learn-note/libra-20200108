@@ -8,36 +8,24 @@ use anyhow::Result;
 use libra_state_view::StateView;
 use libra_types::{
     access_path::AccessPath,
-    language_storage::ModuleId,
-    transaction::{Transaction, TransactionPayload},
+    on_chain_config::ConfigStorage,
+    transaction::ChangeSet,
     write_set::{WriteOp, WriteSet},
 };
+use move_core_types::language_storage::ModuleId;
+use move_vm_runtime::data_cache::RemoteCache;
 use once_cell::sync::Lazy;
-use std::{collections::HashMap, fs::File, io::prelude::*, path::PathBuf};
+use std::collections::HashMap;
+use stdlib::StdLibOptions;
 use vm::{errors::*, CompiledModule};
-use vm_runtime::data_cache::RemoteCache;
+use vm_genesis::generate_genesis_change_set_for_testing;
 
-/// The write set encoded in the genesis transaction.
-pub static GENESIS_WRITE_SET: Lazy<WriteSet> = Lazy::new(|| {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.push("tools/vm-genesis/genesis/genesis.blob");
+/// Dummy genesis ChangeSet for testing
+pub static GENESIS_CHANGE_SET: Lazy<ChangeSet> =
+    Lazy::new(|| generate_genesis_change_set_for_testing(StdLibOptions::Staged));
 
-    load_genesis(path)
-});
-
-fn load_genesis(path: PathBuf) -> WriteSet {
-    let mut f = File::open(&path).unwrap();
-    let mut bytes = vec![];
-    f.read_to_end(&mut bytes).unwrap();
-    let txn = lcs::from_bytes(&bytes).unwrap();
-    if let Transaction::UserTransaction(txn) = txn {
-        if let TransactionPayload::WriteSet(ws) = txn.payload() {
-            return ws.write_set().clone();
-        }
-    }
-    panic!("Expected writeset txn in genesis txn");
-}
+pub static GENESIS_CHANGE_SET_FRESH: Lazy<ChangeSet> =
+    Lazy::new(|| generate_genesis_change_set_for_testing(StdLibOptions::Fresh));
 
 /// An in-memory implementation of [`StateView`] and [`RemoteCache`] for the VM.
 ///
@@ -84,12 +72,8 @@ impl FakeDataStore {
 
     /// Adds an [`AccountData`] to this data store.
     pub fn add_account_data(&mut self, account_data: &AccountData) {
-        match account_data.to_resource().simple_serialize() {
-            Some(blob) => {
-                self.set(account_data.make_access_path(), blob);
-            }
-            None => panic!("can't create Account data"),
-        }
+        let write_set = account_data.to_writeset();
+        self.add_write_set(&write_set)
     }
 
     /// Adds a [`CompiledModule`] to this data store.
@@ -102,6 +86,12 @@ impl FakeDataStore {
             .serialize(&mut blob)
             .expect("serializing this module should work");
         self.set(access_path, blob);
+    }
+}
+
+impl ConfigStorage for &FakeDataStore {
+    fn fetch_config(&self, access_path: AccessPath) -> Option<Vec<u8>> {
+        StateView::get(*self, &access_path).unwrap_or_default()
     }
 }
 

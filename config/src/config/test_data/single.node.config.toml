@@ -26,33 +26,43 @@ public_metrics_server_port = 9102
 address = "0.0.0.0"
 
 [storage]
-address = "127.0.0.1:6184"
+address = "127.0.0.1:6666"
 dir = "libradb/db"
 grpc_max_receive_len = 100000000
-[test.account_keypair]
-private_key = "82001573a003fd3b7fd72ffb0eaf63aac62f12deb629dca72785a66268ec758b"
-public_key = "664f6e8f36eacb1770fa879d86c2c1d0fafea145e84fa7d671ab7a011a54d509"
-[test.consensus_keypair]
-private_key = "f9e1b4bd35cff88f047043aebedfbd310bb6ca762040ac51c28203fb1873e539"
-public_key = "66535c0f4f9242ea8f9ff7f68b4f50b7c9d8e7961a41cf216124b33a325505ff"
+
+[test]
+auth_key = "8e0d19280063fa870fe4dbb85cc724091a398451c5c11e1e76e64cdc7b588510"
+operator_private_key = "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7"
+consensus_private_key = "9f07e7be5551387a98ba977c732d080dcb0f29a048e3656912c6533e32ee7aed"
+initialize_storage = true
 
 [validator_network]
-peer_id = "dde866d21d22926429919efe44436af450c69e62826119143baad55bb0319403"
 listen_address = "/ip4/0.0.0.0/tcp/65206"
 advertised_address = "/ip4/0.0.0.0/tcp/65206"
 discovery_interval_ms = 1000
 connectivity_check_interval_ms = 5000
-enable_noise = true
 enable_remote_authentication = true
 network_peers_file = ""
 seed_peers_file = ""
 
+[validator_network.identity]
+type = "from_config"
+key = "60dd107034b4582a2ef42c5e1ea475f2fea477a10a9f1d75b3635243b2506b72"
+peer_id = "31893204fa402143c11b26ce8a89ea1d"
+
+[validator_network.network_id]
+type = "Validator"
+
 [consensus]
-max_block_size = 200
+max_block_size = 1000
 max_pruned_blocks_in_mem = 10000
-pacemaker_initial_timeout_ms = 1000
-proposer_type = "multiple_ordered_proposers"
+round_initial_timeout_ms = 1000
 contiguous_rounds = 2
+
+[consensus.proposer_type]
+type = "leader_reputation"
+active_weights = 99
+inactive_weights = 1
 [consensus.safety_rules.backend]
 type = "in_memory_storage"
 
@@ -72,21 +82,8 @@ tick_interval_ms = 100
 long_poll_timeout_ms = 30000
 max_chunk_limit = 1000
 max_timeout_ms = 120000
-upstream_peers = []
 
 [logger]
 is_async = true
 chan_size = 256
-[vm_config.publishing_options]
-type = "Locked"
-whitelist = [
-    "10314990b6f9c1edce753a53866cee17bfde44a7991738b1df0f47e1b2e1b362",
-    "eea7c57e6bce0face0e1f330fee5b15de95a5b96492d2f0388fd95737b224da6",
-    "3e32c930031df5ee1e870f48acd47bf4f4be91455a63280a57843144b672989f",
-    "d620f9bc66513ef600e16333bbe58315921c036809b2c6b1e078a4e13af5cf6a",
-    "81b2f95ae5d4eeb03d732f35b60e6ddf15adc97bef320cbb79deaee748669dd6",
-    "8f81d83dc4ad042f9cdc023e107cf310c2c1e60cc7ac4b901702e5dd7fba7d0d",
-    "aaa23c9d415fc0596a95e1f23f0a45c2ceb3073141fcfc68db279b9cf462827b",
-    "684e9940046ae8da5c23f57c41a5919e6e1296e9de4f2bfefa6bbe12739869a5",
-    "1ee2cdd1fa2f2f68aa06a4a96ef86ab2bb74ed169b9e37e20c11a4c3e0a37e33",
-]
+level = "INFO"

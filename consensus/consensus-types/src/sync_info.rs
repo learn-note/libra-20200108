@@ -3,14 +3,9 @@
 
 use crate::{common::Round, quorum_cert::QuorumCert, timeout_certificate::TimeoutCertificate};
 use anyhow::{ensure, Context};
-use libra_types::block_info::BlockInfo;
-use libra_types::crypto_proxies::ValidatorVerifier;
-use network;
+use libra_types::{block_info::BlockInfo, validator_verifier::ValidatorVerifier};
 use serde::{Deserialize, Serialize};
-use std::{
-    convert::TryFrom,
-    fmt::{Display, Formatter},
-};
+use std::fmt::{Display, Formatter};
 
 #[derive(Deserialize, Serialize, Clone, Debug, Eq, PartialEq)]
 /// This struct describes basic synchronization metadata.
@@ -26,15 +21,14 @@ pub struct SyncInfo {
 impl Display for SyncInfo {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let htc_repr = match self.highest_timeout_certificate() {
-            Some(tc) => format!("TC for round {}", tc.round()),
+            Some(tc) => format!("{}", tc.round()),
             None => "None".to_string(),
         };
         write!(
             f,
-            "SyncInfo[round: {}, HQC: {}, HCC: {}, HTC: {}]",
-            self.highest_round(),
-            self.highest_quorum_cert,
-            self.highest_commit_cert,
+            "SyncInfo[HQC: {}, HCC: {}, HTC: {}]",
+            self.highest_certified_round(),
+            self.highest_commit_round(),
             htc_repr,
         )
     }
@@ -46,6 +40,9 @@ impl SyncInfo {
         highest_commit_cert: QuorumCert,
         highest_timeout_cert: Option<TimeoutCertificate>,
     ) -> Self {
+        // No need to include HTC if it's lower than HQC
+        let highest_timeout_cert = highest_timeout_cert
+            .filter(|tc| tc.round() > highest_quorum_cert.certified_block().round());
         Self {
             highest_quorum_cert,
             highest_commit_cert,
@@ -68,18 +65,22 @@ impl SyncInfo {
         self.highest_timeout_cert.as_ref()
     }
 
-    pub fn hqc_round(&self) -> Round {
+    pub fn highest_certified_round(&self) -> Round {
         self.highest_quorum_cert.certified_block().round()
     }
 
-    pub fn htc_round(&self) -> Round {
+    pub fn highest_timeout_round(&self) -> Round {
         self.highest_timeout_certificate()
             .map_or(0, |tc| tc.round())
     }
 
+    pub fn highest_commit_round(&self) -> Round {
+        self.highest_commit_cert().commit_info().round()
+    }
+
     /// The highest round the SyncInfo carries.
     pub fn highest_round(&self) -> Round {
-        std::cmp::max(self.hqc_round(), self.htc_round())
+        std::cmp::max(self.highest_certified_round(), self.highest_timeout_round())
     }
 
     pub fn verify(&self, validator: &ValidatorVerifier) -> anyhow::Result<()> {
@@ -117,22 +118,10 @@ impl SyncInfo {
     pub fn epoch(&self) -> u64 {
         self.highest_quorum_cert.certified_block().epoch()
     }
-}
 
-impl TryFrom<network::proto::SyncInfo> for SyncInfo {
-    type Error = anyhow::Error;
-
-    fn try_from(proto: network::proto::SyncInfo) -> anyhow::Result<Self> {
-        Ok(lcs::from_bytes(&proto.bytes)?)
-    }
-}
-
-impl TryFrom<SyncInfo> for network::proto::SyncInfo {
-    type Error = anyhow::Error;
-
-    fn try_from(info: SyncInfo) -> anyhow::Result<Self> {
-        Ok(Self {
-            bytes: lcs::to_bytes(&info)?,
-        })
+    pub fn has_newer_certificates(&self, other: &SyncInfo) -> bool {
+        self.highest_certified_round() > other.highest_certified_round()
+            || self.highest_timeout_round() > other.highest_timeout_round()
+            || self.highest_commit_round() > other.highest_commit_round()
     }
 }

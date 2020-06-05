@@ -22,7 +22,7 @@
 //!     //         check: 3
 //!     //     group 2:
 //!     //         not: 4
-//!     //         check: 5
+//!     //         check: bar
 //!     //     group 3:
 //!     //         not: 6
 //!
@@ -32,7 +32,7 @@
 //!
 //!     // [1] abc de
 //!     // [2] foo 3
-//!     // [3] 5 bar 6
+//!     // [3] bar 6
 //!     // [4] 7
 //!
 //! For each group, we find the earliest place in the current entry where any of the
@@ -48,11 +48,11 @@
 //!     // [2] foo 3
 //!     //         ^
 //!     //         check: 3
-//!     // [3] 5 bar 6
-//!     //       ^^^ ^
-//!     //       |   not 6
-//!     //       check: bar
-//!     // [5] 7
+//!     // [3] bar 6
+//!     //     ^^^ ^
+//!     //     |   not 6
+//!     //     check: bar
+//!     // [4] 7
 //!
 //! Note: the group matching procedure above requires searching for multiple string patterns
 //! simultatenously. Right now this is implemented using the Aho-Corasick algorithm, achieving
@@ -238,17 +238,11 @@ pub enum MatchStatus {
 
 impl MatchStatus {
     pub fn is_success(&self) -> bool {
-        match self {
-            Self::Success => true,
-            _ => false,
-        }
+        matches!(self, Self::Success)
     }
 
     pub fn is_failure(&self) -> bool {
-        match self {
-            Self::Failure(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Failure(_))
     }
 }
 

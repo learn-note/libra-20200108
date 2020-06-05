@@ -9,12 +9,11 @@ use futures::{
     ready,
     stream::Stream,
 };
-use parity_multiaddr::{Multiaddr, Protocol};
+use libra_network_address::{parse_dns_tcp, parse_ip_tcp, NetworkAddress, Protocol};
 use std::{
     convert::TryFrom,
     fmt::Debug,
     io,
-    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -70,28 +69,43 @@ impl Transport for TcpTransport {
     type Inbound = future::Ready<io::Result<TcpSocket>>;
     type Outbound = TcpOutbound;
 
-    fn listen_on(&self, addr: Multiaddr) -> Result<(Self::Listener, Multiaddr), Self::Error> {
-        let socket_addr = multiaddr_to_socketaddr(&addr)?;
-        let config = self.clone();
-        let listener = ::std::net::TcpListener::bind(&socket_addr)?;
-        let local_addr = socketaddr_to_multiaddr(listener.local_addr()?);
+    fn listen_on(
+        &self,
+        addr: NetworkAddress,
+    ) -> Result<(Self::Listener, NetworkAddress), Self::Error> {
+        let ((ipaddr, port), addr_suffix) =
+            parse_ip_tcp(addr.as_slice()).ok_or_else(|| invalid_addr_error(&addr))?;
+
+        let listener = ::std::net::TcpListener::bind((ipaddr, port))?;
         let listener = TcpListener::try_from(listener)?;
+
+        // append the addr_suffix so any trailing protocols get included in the
+        // actual listening adddress we return
+        let actual_addr =
+            NetworkAddress::from(listener.local_addr()?).extend_from_slice(addr_suffix);
 
         Ok((
             TcpListenerStream {
                 inner: listener,
-                config,
+                config: self.clone(),
             },
-            local_addr,
+            actual_addr,
         ))
     }
 
-    fn dial(&self, addr: Multiaddr) -> Result<Self::Outbound, Self::Error> {
-        let socket_addr = multiaddr_to_string(&addr)?;
-        let config = self.clone();
+    fn dial(&self, addr: NetworkAddress) -> Result<Self::Outbound, Self::Error> {
+        let (addr_string, _addr_suffix) =
+            parse_addr_and_port(addr.as_slice()).ok_or_else(|| invalid_addr_error(&addr))?;
+        // TODO(philiphayes): use `tokio::net::lookup_host()` then filter the results
+        // so e.g. `Protocol::Dns4` only returns `SocketAddrV4`s and `Protocol::Dns6`
+        // only returns `SocketAddrV6`.
         let f: Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'static>> =
-            Box::pin(TcpStream::connect(socket_addr));
-        Ok(TcpOutbound { inner: f, config })
+            Box::pin(TcpStream::connect(addr_string));
+
+        Ok(TcpOutbound {
+            inner: f,
+            config: self.clone(),
+        })
     }
 }
 
@@ -102,7 +116,7 @@ pub struct TcpListenerStream {
 }
 
 impl Stream for TcpListenerStream {
-    type Item = io::Result<(future::Ready<io::Result<TcpSocket>>, Multiaddr)>;
+    type Item = io::Result<(future::Ready<io::Result<TcpSocket>>, NetworkAddress)>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner.incoming()).poll_next(context) {
@@ -111,7 +125,7 @@ impl Stream for TcpListenerStream {
                     return Poll::Ready(Some(Err(e)));
                 }
                 let dialer_addr = match socket.peer_addr() {
-                    Ok(addr) => socketaddr_to_multiaddr(addr),
+                    Ok(addr) => NetworkAddress::from(addr),
                     Err(e) => return Poll::Ready(Some(Err(e))),
                 };
                 Poll::Ready(Some(Ok((
@@ -190,75 +204,20 @@ impl AsyncWrite for TcpSocket {
     }
 }
 
-fn socketaddr_to_multiaddr(socketaddr: SocketAddr) -> Multiaddr {
-    let ipaddr: Multiaddr = socketaddr.ip().into();
-    ipaddr.with(Protocol::Tcp(socketaddr.port()))
+fn invalid_addr_error(addr: &NetworkAddress) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("Invalid NetworkAddress: '{}'", addr),
+    )
 }
 
-fn multiaddr_to_socketaddr(addr: &Multiaddr) -> ::std::io::Result<SocketAddr> {
-    let mut iter = addr.iter();
-    let proto1 = iter.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        )
-    })?;
-    let proto2 = iter.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        )
-    })?;
-
-    if iter.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        ));
-    }
-
-    match (proto1, proto2) {
-        (Protocol::Ip4(ip), Protocol::Tcp(port)) => Ok(SocketAddr::new(ip.into(), port)),
-        (Protocol::Ip6(ip), Protocol::Tcp(port)) => Ok(SocketAddr::new(ip.into(), port)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        )),
-    }
-}
-
-fn multiaddr_to_string(addr: &Multiaddr) -> ::std::io::Result<String> {
-    let mut iter = addr.iter();
-    let proto1 = iter.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        )
-    })?;
-    let proto2 = iter.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        )
-    })?;
-
-    if iter.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        ));
-    }
-
-    match (proto1, proto2) {
-        (Protocol::Ip4(ip), Protocol::Tcp(port)) => Ok(format!("{}:{}", ip, port)),
-        (Protocol::Ip6(ip), Protocol::Tcp(port)) => Ok(format!("{}:{}", ip, port)),
-        (Protocol::Dns4(host), Protocol::Tcp(port))
-        | (Protocol::Dns6(host), Protocol::Tcp(port)) => Ok(format!("{}:{}", host, port)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        )),
-    }
+fn parse_addr_and_port(protos: &[Protocol]) -> Option<(String, &[Protocol])> {
+    parse_ip_tcp(protos)
+        .map(|((ip, port), suffix)| (format!("{}:{}", ip, port), suffix))
+        .or_else(|| {
+            parse_dns_tcp(protos)
+                .map(|((dnsname, port), suffix)| (format!("{}:{}", dnsname, port), suffix))
+        })
 }
 
 #[cfg(test)]
@@ -272,24 +231,22 @@ mod test {
 
     #[tokio::test]
     async fn simple_listen_and_dial() -> Result<(), ::std::io::Error> {
-        let t = TcpTransport::default().and_then(|mut out, connection| {
-            async move {
-                match connection {
-                    ConnectionOrigin::Inbound => {
-                        out.write_all(b"Earth").await?;
-                        let mut buf = [0; 3];
-                        out.read_exact(&mut buf).await?;
-                        assert_eq!(&buf, b"Air");
-                    }
-                    ConnectionOrigin::Outbound => {
-                        let mut buf = [0; 5];
-                        out.read_exact(&mut buf).await?;
-                        assert_eq!(&buf, b"Earth");
-                        out.write_all(b"Air").await?;
-                    }
+        let t = TcpTransport::default().and_then(|mut out, _addr, origin| async move {
+            match origin {
+                ConnectionOrigin::Inbound => {
+                    out.write_all(b"Earth").await?;
+                    let mut buf = [0; 3];
+                    out.read_exact(&mut buf).await?;
+                    assert_eq!(&buf, b"Air");
                 }
-                Ok(())
+                ConnectionOrigin::Outbound => {
+                    let mut buf = [0; 5];
+                    out.read_exact(&mut buf).await?;
+                    assert_eq!(&buf, b"Earth");
+                    out.write_all(b"Air").await?;
+                }
             }
+            Ok(())
         });
 
         let (listener, addr) = t.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())?;

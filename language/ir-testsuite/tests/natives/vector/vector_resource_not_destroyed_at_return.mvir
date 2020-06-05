@@ -4,10 +4,10 @@ module M {
     resource R { b: bool}
 
     f() {
-        let v: Vector.T<Self.R>;
+        let v: vector<Self.R>;
         v = Vector.empty<Self.R>();
         return;
     }
 }
 
-// check: RET_UNSAFE_TO_DESTROY_ERROR
+// check: UNSAFE_RET_UNUSED_RESOURCES

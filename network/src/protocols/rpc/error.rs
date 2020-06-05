@@ -4,6 +4,7 @@
 //! Rpc protocol errors
 
 use crate::peer_manager::PeerManagerError;
+use anyhow::anyhow;
 use futures::channel::{mpsc, oneshot};
 use libra_types::PeerId;
 use std::io;
@@ -11,17 +12,17 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RpcError {
+    #[error("Error: {0:?}")]
+    Error(#[from] anyhow::Error),
+
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
 
+    #[error("Lcs error: {0:?}")]
+    LcsError(#[from] lcs::Error),
+
     #[error("Failed to open substream, not connected with peer: {0}")]
     NotConnected(PeerId),
-
-    #[error("Error writing protobuf message: {0:?}")]
-    ProstEncodeError(#[from] prost::EncodeError),
-
-    #[error("Error parsing protobuf message: {0:?}")]
-    ProstDecodeError(#[from] prost::DecodeError),
 
     #[error("Received invalid rpc response message")]
     InvalidRpcResponse,
@@ -41,6 +42,9 @@ pub enum RpcError {
     #[error("Error sending on mpsc channel: {0:?}")]
     MpscSendError(#[from] mpsc::SendError),
 
+    #[error("Too many pending RPCs: {0}")]
+    TooManyPending(u32),
+
     #[error("Rpc timed out")]
     TimedOut,
 }
@@ -50,7 +54,7 @@ impl From<PeerManagerError> for RpcError {
         match err {
             PeerManagerError::NotConnected(peer_id) => RpcError::NotConnected(peer_id),
             PeerManagerError::IoError(err) => RpcError::IoError(err),
-            _ => unreachable!("open_substream only returns NotConnected or IoError"),
+            err => RpcError::Error(anyhow!(err)),
         }
     }
 }

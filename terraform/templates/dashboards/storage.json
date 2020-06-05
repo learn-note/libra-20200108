@@ -149,12 +149,12 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "max(storage_gauge{op=\"new_state_nodes\"}) - max(storage_gauge{op=\"stale_state_nodes\"})",
+          "expr": "max(storage_gauge{op=\"new_state_nodes\"} - ignoring(op) storage_gauge{op=\"stale_state_nodes\"})",
           "legendFormat": "accounts",
           "refId": "A"
         },
         {
-          "expr": "max(storage_gauge{op=\"new_state_nodes\"}) - max(storage_gauge{op=\"stale_state_nodes\"}) - max(storage_gauge{op=\"new_state_leaves\"}) + max(storage_gauge{op=\"stale_state_leaves\"})",
+          "expr": "max(storage_gauge{op=\"new_state_nodes\"} - ignoring(op) storage_gauge{op=\"stale_state_nodes\"} - ignoring(op) storage_gauge{op=\"new_state_leaves\"} + ignoring(op) storage_gauge{op=\"stale_state_leaves\"})",
           "legendFormat": "internal_nodes",
           "refId": "B"
         }
@@ -287,6 +287,263 @@
           "min": null,
           "show": false
         }
+      ]
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": null,
+      "fill": 1,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "hiddenSeries": false,
+      "id": 100,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "nullPointMode": "null",
+      "options": {
+        "dataLinks": []
+      },
+      "percentage": false,
+      "pointradius": 2,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "label_replace(\n    irate(schemadb_duration_count{op=~\"db_batch_commit_bytes_.*\"}[1m]),\n    \"db\", \"$1\", \"op\", \"db_batch_commit_bytes_(.*)\"\n)",
+          "legendFormat": "{{peer_id}} {{db}}",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Commits per second",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": null,
+      "fill": 1,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "hiddenSeries": false,
+      "id": 101,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "nullPointMode": "null",
+      "options": {
+        "dataLinks": []
+      },
+      "percentage": false,
+      "pointradius": 2,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "label_replace(\n    irate(schemadb_duration_sum{op=~\"db_batch_commit_bytes_.*\"}[1m]),\n    \"db\", \"$1\", \"op\", \"db_batch_commit_bytes_(.*)\"\n)",
+          "legendFormat": "{{peer_id}} {{db}}",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Commit bytes per second",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "Bps",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": null,
+      "fill": 1,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "hiddenSeries": false,
+      "id": 102,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "nullPointMode": "null",
+      "options": {
+        "dataLinks": []
+      },
+      "percentage": false,
+      "pointradius": 2,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "label_replace(\n    schemadb_duration_sum{op=~\"db_batch_commit_bytes_.*\"} / schemadb_duration_count{op=~\"db_batch_commit_bytes_.*\"},\n    \"db\", \"$1\", \"op\", \"db_batch_commit_bytes_(.*)\"\n)",
+          "legendFormat": "{{peer_id}} {{db}}",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Commit size",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "decbytes",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
       ],
       "yaxis": {
         "align": false,
@@ -299,7 +556,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 8
+        "y": 16
       },
       "id": 16,
       "panels": [
@@ -1624,7 +1881,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 9
+        "y": 17
       },
       "id": 85,
       "panels": [],
@@ -1642,7 +1899,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 10
+        "y": 18
       },
       "id": 70,
       "interval": "",
@@ -1671,7 +1928,7 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "max(rate(storage_gauge{op=\"new_state_leaves\"}[10m])) / max(rate(storage_gauge{op=\"latest_transaction_version\"}[10m]))",
+          "expr": "max(irate(storage_gauge{op=\"new_state_leaves\"}[10m]) / ignoring(op) irate(storage_gauge{op=\"latest_transaction_version\"}[10m]))",
           "legendFormat": "accounts/txn",
           "refId": "A"
         }
@@ -1728,7 +1985,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 10
+        "y": 18
       },
       "id": 71,
       "interval": "",
@@ -1757,7 +2014,7 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "max(rate(storage_gauge{op=\"events_created\"}[10m])) / max(rate(storage_gauge{op=\"latest_transaction_version\"}[10m]))",
+          "expr": "max(irate(storage_gauge{op=\"events_created\"}[10m]) / ignoring(op) irate(storage_gauge{op=\"latest_transaction_version\"}[10m]))",
           "legendFormat": "events/txn",
           "refId": "A"
         }
@@ -1814,7 +2071,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 10
+        "y": 18
       },
       "id": 98,
       "interval": "",
@@ -1843,7 +2100,7 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "max(rate(storage_gauge{op=\"new_state_nodes\"}[10m])) / max(rate(storage_gauge{op=\"new_state_leaves\"}[10m])) - 1",
+          "expr": "max(irate(storage_gauge{op=\"new_state_nodes\"}[10m]) / ignoring(op) irate(storage_gauge{op=\"new_state_leaves\"}[10m])) - 1",
           "legendFormat": "internal nodes/accounts",
           "refId": "A"
         }
@@ -1901,7 +2158,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 18
+        "y": 26
       },
       "id": 52,
       "legend": {

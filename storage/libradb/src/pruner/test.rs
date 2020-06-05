@@ -5,10 +5,7 @@ use super::*;
 use crate::{change_set::ChangeSet, state_store::StateStore, LibraDB};
 use libra_crypto::HashValue;
 use libra_temppath::TempPath;
-use libra_types::{
-    account_address::{AccountAddress, ADDRESS_LENGTH},
-    account_state_blob::AccountStateBlob,
-};
+use libra_types::{account_address::AccountAddress, account_state_blob::AccountStateBlob};
 use std::collections::HashMap;
 
 fn put_account_state_set(
@@ -44,18 +41,15 @@ fn verify_state_in_store(
 
 #[test]
 fn test_pruner() {
-    let address = AccountAddress::new([1u8; ADDRESS_LENGTH]);
+    let address = AccountAddress::new([1u8; AccountAddress::LENGTH]);
     let value0 = AccountStateBlob::from(vec![0x01]);
     let value1 = AccountStateBlob::from(vec![0x02]);
     let value2 = AccountStateBlob::from(vec![0x03]);
 
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir).db;
+    let db = LibraDB::new_for_test(&tmp_dir).db;
     let state_store = &StateStore::new(Arc::clone(&db));
-    let pruner = Pruner::new(
-        Arc::clone(&db),
-        0, /* num_historical_versions_to_keep */
-    );
+    let pruner = Pruner::new(Arc::clone(&db), 0 /* historical_versions_to_keep */);
 
     let _root0 = put_account_state_set(
         &db,
@@ -108,13 +102,13 @@ fn test_pruner() {
 
 #[test]
 fn test_worker_quit_eagerly() {
-    let address = AccountAddress::new([1u8; ADDRESS_LENGTH]);
+    let address = AccountAddress::new([1u8; AccountAddress::LENGTH]);
     let value0 = AccountStateBlob::from(vec![0x01]);
     let value1 = AccountStateBlob::from(vec![0x02]);
     let value2 = AccountStateBlob::from(vec![0x03]);
 
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir).db;
+    let db = LibraDB::new_for_test(&tmp_dir).db;
     let state_store = &StateStore::new(Arc::clone(&db));
 
     let _root0 = put_account_state_set(

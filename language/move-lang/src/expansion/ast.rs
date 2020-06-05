@@ -3,14 +3,16 @@
 
 use crate::{
     parser::ast::{
-        BinOp, Field, FunctionName, FunctionVisibility, Kind, ModuleIdent, ResourceLoc, StructName,
-        UnaryOp, Value, Var,
+        BinOp, Field, FunctionName, FunctionVisibility, Kind, ModuleIdent, ResourceLoc,
+        SpecApplyPattern, SpecBlockTarget, SpecConditionKind, StructName, UnaryOp, Var,
     },
-    shared::ast_debug::*,
-    shared::unique_map::UniqueMap,
-    shared::*,
+    shared::{ast_debug::*, unique_map::UniqueMap, *},
 };
-use std::{collections::BTreeMap, collections::VecDeque, fmt};
+use move_ir_types::location::*;
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    fmt,
+};
 
 //**************************************************************************************************
 // Program
@@ -19,7 +21,19 @@ use std::{collections::BTreeMap, collections::VecDeque, fmt};
 #[derive(Debug)]
 pub struct Program {
     pub modules: UniqueMap<ModuleIdent, ModuleDefinition>,
-    pub main: Option<(Vec<ModuleIdent>, Address, FunctionName, Function)>,
+    pub scripts: BTreeMap<String, Script>,
+}
+
+//**************************************************************************************************
+// Scripts
+//**************************************************************************************************
+
+#[derive(Debug)]
+pub struct Script {
+    pub loc: Loc,
+    pub function_name: FunctionName,
+    pub function: Function,
+    pub specs: Vec<SpecBlock>,
 }
 
 //**************************************************************************************************
@@ -28,11 +42,11 @@ pub struct Program {
 
 #[derive(Debug)]
 pub struct ModuleDefinition {
-    pub uses: BTreeMap<ModuleIdent, Loc>,
-    pub unused_aliases: Vec<ModuleIdent>,
+    pub loc: Loc,
     pub is_source_module: bool,
     pub structs: UniqueMap<StructName, StructDefinition>,
     pub functions: UniqueMap<FunctionName, Function>,
+    pub specs: Vec<SpecBlock>,
 }
 
 //**************************************************************************************************
@@ -43,6 +57,7 @@ pub type Fields<T> = UniqueMap<Field, (usize, T)>;
 
 #[derive(Debug, PartialEq)]
 pub struct StructDefinition {
+    pub loc: Loc,
     pub resource_opt: ResourceLoc,
     pub type_parameters: Vec<(Name, Kind)>,
     pub fields: StructFields,
@@ -50,7 +65,7 @@ pub struct StructDefinition {
 
 #[derive(Debug, PartialEq)]
 pub enum StructFields {
-    Defined(Fields<SingleType>),
+    Defined(Fields<Type>),
     Native(Loc),
 }
 
@@ -61,7 +76,7 @@ pub enum StructFields {
 #[derive(PartialEq, Debug)]
 pub struct FunctionSignature {
     pub type_parameters: Vec<(Name, Kind)>,
-    pub parameters: Vec<(Var, SingleType)>,
+    pub parameters: Vec<(Var, Type)>,
     pub return_type: Type,
 }
 
@@ -73,13 +88,68 @@ pub enum FunctionBody_ {
 }
 pub type FunctionBody = Spanned<FunctionBody_>;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct SpecId(usize);
+
 #[derive(PartialEq, Debug)]
 pub struct Function {
+    pub loc: Loc,
     pub visibility: FunctionVisibility,
     pub signature: FunctionSignature,
     pub acquires: Vec<ModuleAccess>,
     pub body: FunctionBody,
+    pub specs: BTreeMap<SpecId, SpecBlock>,
 }
+
+//**************************************************************************************************
+// Specification Blocks
+//**************************************************************************************************
+
+#[derive(Debug, PartialEq)]
+pub struct SpecBlock_ {
+    pub target: SpecBlockTarget,
+    pub members: Vec<SpecBlockMember>,
+}
+pub type SpecBlock = Spanned<SpecBlock_>;
+
+#[derive(Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum SpecBlockMember_ {
+    Condition {
+        kind: SpecConditionKind,
+        exp: Exp,
+    },
+    Function {
+        name: FunctionName,
+        signature: FunctionSignature,
+        body: FunctionBody,
+    },
+    Variable {
+        is_global: bool,
+        name: Name,
+        type_parameters: Vec<(Name, Kind)>,
+        type_: Type,
+    },
+    Include {
+        exp: Exp,
+    },
+    Apply {
+        exp: Exp,
+        patterns: Vec<SpecApplyPattern>,
+        exclusion_patterns: Vec<SpecApplyPattern>,
+    },
+    Pragma {
+        properties: Vec<PragmaProperty>,
+    },
+}
+pub type SpecBlockMember = Spanned<SpecBlockMember_>;
+
+#[derive(Debug, PartialEq)]
+pub struct PragmaProperty_ {
+    pub name: Name,
+    pub value: Option<Value>,
+}
+pub type PragmaProperty = Spanned<PragmaProperty_>;
 
 //**************************************************************************************************
 // Types
@@ -92,21 +162,15 @@ pub enum ModuleAccess_ {
 }
 pub type ModuleAccess = Spanned<ModuleAccess_>;
 
-#[derive(Debug, PartialEq, Clone)]
-#[allow(clippy::large_enum_variant)]
-pub enum SingleType_ {
-    Apply(ModuleAccess, Vec<SingleType>),
-    Ref(bool, Box<SingleType>),
-    UnresolvedError,
-}
-pub type SingleType = Spanned<SingleType_>;
-
 #[derive(Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum Type_ {
     Unit,
-    Single(SingleType),
-    Multiple(Vec<SingleType>),
+    Multiple(Vec<Type>),
+    Apply(ModuleAccess, Vec<Type>),
+    Ref(bool, Box<Type>),
+    Fun(Vec<Type>, Box<Type>),
+    UnresolvedError,
 }
 pub type Type = Spanned<Type_>;
 
@@ -115,20 +179,13 @@ pub type Type = Spanned<Type_>;
 //**************************************************************************************************
 
 #[derive(Debug, PartialEq)]
-pub enum Assign_ {
-    Var(Var),
-    Unpack(ModuleAccess, Option<Vec<SingleType>>, Fields<Assign>),
+pub enum LValue_ {
+    Var(ModuleAccess, Option<Vec<Type>>),
+    Unpack(ModuleAccess, Option<Vec<Type>>, Fields<LValue>),
 }
-pub type Assign = Spanned<Assign_>;
-pub type AssignList = Spanned<Vec<Assign>>;
-
-#[derive(Debug, PartialEq)]
-pub enum Bind_ {
-    Var(Var),
-    Unpack(ModuleAccess, Option<Vec<SingleType>>, Fields<Bind>),
-}
-pub type Bind = Spanned<Bind_>;
-pub type BindList = Spanned<Vec<Bind>>;
+pub type LValue = Spanned<LValue_>;
+pub type LValueList_ = Vec<LValue>;
+pub type LValueList = Spanned<LValueList_>;
 
 #[derive(Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -139,23 +196,42 @@ pub enum ExpDotted_ {
 pub type ExpDotted = Spanned<ExpDotted_>;
 
 #[derive(Debug, PartialEq)]
+pub enum Value_ {
+    // 0x<hex representation up to 64 digits with padding 0s>
+    Address(Address),
+    // <num>u8
+    U8(u8),
+    // <num>u64
+    U64(u64),
+    // <num>u128
+    U128(u128),
+    // true
+    // false
+    Bool(bool),
+    Bytearray(Vec<u8>),
+}
+pub type Value = Spanned<Value_>;
+
+#[derive(Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum Exp_ {
     Value(Value),
+    InferredNum(u128),
     Move(Var),
     Copy(Var),
 
-    Name(Name),
-    GlobalCall(Name, Option<Vec<SingleType>>, Spanned<Vec<Exp>>),
-    Call(ModuleAccess, Option<Vec<SingleType>>, Spanned<Vec<Exp>>),
-    Pack(ModuleAccess, Option<Vec<SingleType>>, Fields<Exp>),
+    Name(ModuleAccess, Option<Vec<Type>>),
+    GlobalCall(Name, Option<Vec<Type>>, Spanned<Vec<Exp>>),
+    Call(ModuleAccess, Option<Vec<Type>>, Spanned<Vec<Exp>>),
+    Pack(ModuleAccess, Option<Vec<Type>>, Fields<Exp>),
 
     IfElse(Box<Exp>, Box<Exp>, Box<Exp>),
     While(Box<Exp>, Box<Exp>),
     Loop(Box<Exp>),
     Block(Sequence),
+    Lambda(LValueList, Box<Exp>), // spec only
 
-    Assign(AssignList, Box<Exp>),
+    Assign(LValueList, Box<Exp>),
     FieldMutate(Box<ExpDotted>, Box<Exp>),
     Mutate(Box<Exp>, Box<Exp>),
 
@@ -169,12 +245,16 @@ pub enum Exp_ {
     BinopExp(Box<Exp>, BinOp, Box<Exp>),
 
     ExpList(Vec<Exp>),
-    Unit,
+    Unit { trailing: bool },
 
     Borrow(bool, Box<Exp>),
     ExpDotted(Box<ExpDotted>),
+    Index(Box<Exp>, Box<Exp>), // spec only (no mutation needed right now)
 
+    Cast(Box<Exp>, Type),
     Annotate(Box<Exp>, Type),
+
+    Spec(SpecId, BTreeSet<Name>),
 
     UnresolvedError,
 }
@@ -184,10 +264,24 @@ pub type Sequence = VecDeque<SequenceItem>;
 #[derive(Debug, PartialEq)]
 pub enum SequenceItem_ {
     Seq(Exp),
-    Declare(BindList, Option<Type>),
-    Bind(BindList, Exp),
+    Declare(LValueList, Option<Type>),
+    Bind(LValueList, Exp),
 }
 pub type SequenceItem = Spanned<SequenceItem_>;
+
+//**************************************************************************************************
+// impls
+//**************************************************************************************************
+
+impl SpecId {
+    pub fn new(u: usize) -> Self {
+        SpecId(u)
+    }
+
+    pub fn inner(self) -> usize {
+        self.0
+    }
+}
 
 //**************************************************************************************************
 // Display
@@ -203,9 +297,9 @@ impl fmt::Display for ModuleAccess_ {
     }
 }
 
-impl fmt::Display for SingleType_ {
+impl fmt::Display for Type_ {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
-        use SingleType_::*;
+        use Type_::*;
         match self {
             UnresolvedError => write!(f, "_"),
             Apply(n, tys) => {
@@ -218,7 +312,20 @@ impl fmt::Display for SingleType_ {
                 Ok(())
             }
             Ref(mut_, ty) => write!(f, "&{}{}", if *mut_ { "mut " } else { "" }, ty),
+            Fun(args, result) => write!(f, "({}):{}", format_comma(args), result),
+            Unit => write!(f, "()"),
+            Multiple(tys) => {
+                write!(f, "(")?;
+                write!(f, "{}", format_comma(tys))?;
+                write!(f, ")")
+            }
         }
+    }
+}
+
+impl fmt::Display for SpecId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -228,25 +335,33 @@ impl fmt::Display for SingleType_ {
 
 impl AstDebug for Program {
     fn ast_debug(&self, w: &mut AstWriter) {
-        let Program { modules, main } = self;
+        let Program { modules, scripts } = self;
         for (m, mdef) in modules {
             w.write(&format!("module {}", m));
             w.block(|w| mdef.ast_debug(w));
             w.new_line();
         }
 
-        if let Some((unused_aliases, addr, n, fdef)) = main {
-            w.writeln(&format!("address {}:", addr));
-            if !unused_aliases.is_empty() {
-                w.writeln("unused_aliases: ");
-                w.indent(2, |w| {
-                    w.list(unused_aliases, ",", |w, m| {
-                        w.write(&format!("{}", m));
-                        true
-                    })
-                });
-            }
-            (n.clone(), fdef).ast_debug(w);
+        for (n, s) in scripts {
+            w.write(&format!("script {}", n));
+            w.block(|w| s.ast_debug(w));
+            w.new_line()
+        }
+    }
+}
+
+impl AstDebug for Script {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        let Script {
+            loc: _loc,
+            function_name,
+            function,
+            specs,
+        } = self;
+        (function_name.clone(), function).ast_debug(w);
+        for spec in specs {
+            spec.ast_debug(w);
+            w.new_line();
         }
     }
 }
@@ -254,41 +369,27 @@ impl AstDebug for Program {
 impl AstDebug for ModuleDefinition {
     fn ast_debug(&self, w: &mut AstWriter) {
         let ModuleDefinition {
-            uses,
-            unused_aliases,
+            loc: _loc,
             is_source_module,
             structs,
             functions,
+            specs,
         } = self;
         w.writeln(if *is_source_module {
             "source module"
         } else {
             "library module"
         });
-        if !uses.is_empty() {
-            w.writeln("uses: ");
-            w.indent(2, |w| {
-                w.list(uses, ",", |w, (m, _)| {
-                    w.write(&format!("{}", m));
-                    true
-                })
-            });
-        }
-        if !unused_aliases.is_empty() {
-            w.writeln("unused_aliases: ");
-            w.indent(2, |w| {
-                w.list(unused_aliases, ",", |w, m| {
-                    w.write(&format!("{}", m));
-                    true
-                })
-            });
-        }
         for sdef in structs {
             sdef.ast_debug(w);
             w.new_line();
         }
         for fdef in functions {
             fdef.ast_debug(w);
+            w.new_line();
+        }
+        for spec in specs {
+            spec.ast_debug(w);
             w.new_line();
         }
     }
@@ -299,6 +400,7 @@ impl AstDebug for (StructName, &StructDefinition) {
         let (
             name,
             StructDefinition {
+                loc: _loc,
                 resource_opt,
                 type_parameters,
                 fields,
@@ -325,15 +427,111 @@ impl AstDebug for (StructName, &StructDefinition) {
     }
 }
 
+impl AstDebug for SpecBlock_ {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        w.write(" spec ");
+        self.target.ast_debug(w);
+        w.write("{");
+        w.semicolon(&self.members, |w, m| m.ast_debug(w));
+        w.write("}");
+    }
+}
+
+impl AstDebug for SpecBlockMember_ {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        match self {
+            SpecBlockMember_::Condition { kind, exp } => {
+                kind.ast_debug(w);
+                exp.ast_debug(w);
+            }
+            SpecBlockMember_::Function {
+                signature,
+                name,
+                body,
+            } => {
+                if let FunctionBody_::Native = &body.value {
+                    w.write("native ");
+                }
+                w.write("define ");
+                w.write(&format!("{}", name));
+                signature.ast_debug(w);
+                match &body.value {
+                    FunctionBody_::Defined(body) => w.block(|w| body.ast_debug(w)),
+                    FunctionBody_::Native => w.writeln(";"),
+                }
+            }
+            SpecBlockMember_::Variable {
+                is_global,
+                name,
+                type_parameters,
+                type_,
+            } => {
+                if *is_global {
+                    w.write("global ");
+                } else {
+                    w.write("local");
+                }
+                w.write(&format!("{}", name));
+                type_parameters.ast_debug(w);
+                w.write(": ");
+                type_.ast_debug(w);
+            }
+            SpecBlockMember_::Include { exp } => {
+                w.write("include ");
+                exp.ast_debug(w);
+            }
+            SpecBlockMember_::Apply {
+                exp,
+                patterns,
+                exclusion_patterns,
+            } => {
+                w.write("apply ");
+                exp.ast_debug(w);
+                w.write(" to ");
+                w.list(patterns, ", ", |w, p| {
+                    p.ast_debug(w);
+                    true
+                });
+                if !exclusion_patterns.is_empty() {
+                    w.write(" exclude ");
+                    w.list(exclusion_patterns, ", ", |w, p| {
+                        p.ast_debug(w);
+                        true
+                    });
+                }
+            }
+            SpecBlockMember_::Pragma { properties } => {
+                w.write("pragma ");
+                w.list(properties, ", ", |w, p| {
+                    p.ast_debug(w);
+                    true
+                });
+            }
+        }
+    }
+}
+
+impl AstDebug for PragmaProperty_ {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        w.write(&self.name.value);
+        if let Some(value) = &self.value {
+            w.write(" = ");
+            value.ast_debug(w);
+        }
+    }
+}
+
 impl AstDebug for (FunctionName, &Function) {
     fn ast_debug(&self, w: &mut AstWriter) {
         let (
             name,
             Function {
+                loc: _loc,
                 visibility,
                 signature,
                 acquires,
                 body,
+                ..
             },
         ) = self;
         visibility.ast_debug(w);
@@ -376,20 +574,12 @@ impl AstDebug for Type_ {
     fn ast_debug(&self, w: &mut AstWriter) {
         match self {
             Type_::Unit => w.write("()"),
-            Type_::Single(s) => s.ast_debug(w),
             Type_::Multiple(ss) => {
                 w.write("(");
                 ss.ast_debug(w);
                 w.write(")")
             }
-        }
-    }
-}
-
-impl AstDebug for SingleType_ {
-    fn ast_debug(&self, w: &mut AstWriter) {
-        match self {
-            SingleType_::Apply(m, ss) => {
+            Type_::Apply(m, ss) => {
                 m.ast_debug(w);
                 if !ss.is_empty() {
                     w.write("<");
@@ -397,19 +587,25 @@ impl AstDebug for SingleType_ {
                     w.write(">");
                 }
             }
-            SingleType_::Ref(mut_, s) => {
+            Type_::Ref(mut_, s) => {
                 w.write("&");
                 if *mut_ {
                     w.write("mut ");
                 }
                 s.ast_debug(w)
             }
-            SingleType_::UnresolvedError => w.write("_|_"),
+            Type_::Fun(args, result) => {
+                w.write("(");
+                w.comma(args, |w, ty| ty.ast_debug(w));
+                w.write("):");
+                result.ast_debug(w);
+            }
+            Type_::UnresolvedError => w.write("_|_"),
         }
     }
 }
 
-impl AstDebug for Vec<SingleType> {
+impl AstDebug for Vec<Type> {
     fn ast_debug(&self, w: &mut AstWriter) {
         w.comma(self, |w, s| s.ast_debug(w))
     }
@@ -452,15 +648,40 @@ impl AstDebug for SequenceItem_ {
     }
 }
 
+impl AstDebug for Value_ {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        use Value_ as V;
+        w.write(&match self {
+            V::Address(addr) => format!("{}", addr),
+            V::U8(u) => format!("{}u8", u),
+            V::U64(u) => format!("{}u64", u),
+            V::U128(u) => format!("{}u128", u),
+            V::Bool(b) => format!("{}", b),
+            V::Bytearray(v) => format!("{:?}", v),
+        })
+    }
+}
+
 impl AstDebug for Exp_ {
     fn ast_debug(&self, w: &mut AstWriter) {
         use Exp_ as E;
         match self {
-            E::Unit => w.write("()"),
+            E::Unit { trailing } if !trailing => w.write("()"),
+            E::Unit {
+                trailing: _trailing,
+            } => w.write("/*()*/"),
+            E::InferredNum(u) => w.write(&format!("{}", u)),
             E::Value(v) => v.ast_debug(w),
             E::Move(v) => w.write(&format!("move {}", v)),
             E::Copy(v) => w.write(&format!("copy {}", v)),
-            E::Name(n) => w.write(&format!("{}", n)),
+            E::Name(ma, tys_opt) => {
+                ma.ast_debug(w);
+                if let Some(ss) = tys_opt {
+                    w.write("<");
+                    ss.ast_debug(w);
+                    w.write(">");
+                }
+            }
             E::GlobalCall(n, tys_opt, sp!(_, rhs)) => {
                 w.write(&format!("::{}", n));
                 if let Some(ss) = tys_opt {
@@ -517,6 +738,12 @@ impl AstDebug for Exp_ {
                 e.ast_debug(w);
             }
             E::Block(seq) => w.block(|w| seq.ast_debug(w)),
+            E::Lambda(sp!(_, bs), e) => {
+                w.write("fun ");
+                bs.ast_debug(w);
+                w.write(" ");
+                e.ast_debug(w);
+            }
             E::ExpList(es) => {
                 w.write("(");
                 w.comma(es, |w, e| e.ast_debug(w));
@@ -574,12 +801,33 @@ impl AstDebug for Exp_ {
                 e.ast_debug(w);
             }
             E::ExpDotted(ed) => ed.ast_debug(w),
+            E::Cast(e, ty) => {
+                w.write("(");
+                e.ast_debug(w);
+                w.write(" as ");
+                ty.ast_debug(w);
+                w.write(")");
+            }
+            E::Index(oper, index) => {
+                oper.ast_debug(w);
+                w.write("[");
+                index.ast_debug(w);
+                w.write("]");
+            }
             E::Annotate(e, ty) => {
                 w.write("(");
                 e.ast_debug(w);
                 w.write(": ");
                 ty.ast_debug(w);
                 w.write(")");
+            }
+            E::Spec(u, unbound_names) => {
+                w.write(&format!("spec #{}", u));
+                if !unbound_names.is_empty() {
+                    w.write("uses [");
+                    w.comma(unbound_names, |w, n| w.write(&format!("{}", n)));
+                    w.write("]");
+                }
             }
             E::UnresolvedError => w.write("_|_"),
         }
@@ -599,7 +847,7 @@ impl AstDebug for ExpDotted_ {
     }
 }
 
-impl AstDebug for Vec<Bind> {
+impl AstDebug for Vec<LValue> {
     fn ast_debug(&self, w: &mut AstWriter) {
         let parens = self.len() != 1;
         if parens {
@@ -612,12 +860,19 @@ impl AstDebug for Vec<Bind> {
     }
 }
 
-impl AstDebug for Bind_ {
+impl AstDebug for LValue_ {
     fn ast_debug(&self, w: &mut AstWriter) {
-        use Bind_ as B;
+        use LValue_ as L;
         match self {
-            B::Var(v) => w.write(&format!("{}", v)),
-            B::Unpack(ma, tys_opt, fields) => {
+            L::Var(v, tys_opt) => {
+                w.write(&format!("{}", v));
+                if let Some(ss) = tys_opt {
+                    w.write("<");
+                    ss.ast_debug(w);
+                    w.write(">");
+                }
+            }
+            L::Unpack(ma, tys_opt, fields) => {
                 ma.ast_debug(w);
                 if let Some(ss) = tys_opt {
                     w.write("<");
@@ -629,43 +884,6 @@ impl AstDebug for Bind_ {
                     let (idx, b) = idx_b;
                     w.write(&format!("{}#{}: ", idx, f));
                     b.ast_debug(w);
-                });
-                w.write("}");
-            }
-        }
-    }
-}
-
-impl AstDebug for Vec<Assign> {
-    fn ast_debug(&self, w: &mut AstWriter) {
-        let parens = self.len() != 1;
-        if parens {
-            w.write("(");
-        }
-        w.comma(self, |w, a| a.ast_debug(w));
-        if parens {
-            w.write(")");
-        }
-    }
-}
-
-impl AstDebug for Assign_ {
-    fn ast_debug(&self, w: &mut AstWriter) {
-        use Assign_ as A;
-        match self {
-            A::Var(v) => w.write(&format!("{}", v)),
-            A::Unpack(ma, tys_opt, fields) => {
-                ma.ast_debug(w);
-                if let Some(ss) = tys_opt {
-                    w.write("<");
-                    ss.ast_debug(w);
-                    w.write(">");
-                }
-                w.write("{");
-                w.comma(fields, |w, (f, idx_a)| {
-                    let (idx, a) = idx_a;
-                    w.write(&format!("{}#{}: ", idx, f));
-                    a.ast_debug(w);
                 });
                 w.write("}");
             }

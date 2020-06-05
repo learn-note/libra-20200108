@@ -1,16 +1,16 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::core::Context;
+use super::core::{self, Context, Subst};
 use crate::{
-    naming::ast::{self as N, BaseType, BaseType_, TypeName_},
+    naming::ast::{self as N, Type, TypeName_, Type_},
     parser::ast::StructName,
-    shared::*,
     typing::ast as T,
 };
-use std::collections::{BTreeSet, HashMap};
+use move_ir_types::location::*;
+use std::collections::BTreeMap;
 
-pub type Seen = BTreeSet<StructName>;
+pub type Seen = BTreeMap<StructName, Loc>;
 
 //**************************************************************************************************
 // Functions
@@ -18,17 +18,17 @@ pub type Seen = BTreeSet<StructName>;
 
 pub fn function_body_(
     context: &mut Context,
-    annotated_acquires: &BTreeSet<StructName>,
+    annotated_acquires: &BTreeMap<StructName, Loc>,
     b_: &T::FunctionBody_,
 ) {
     let mut seen = Seen::new();
     match b_ {
-        T::FunctionBody_::Native => (),
+        T::FunctionBody_::Native => return,
         T::FunctionBody_::Defined(es) => sequence(context, annotated_acquires, &mut seen, es),
     }
 
-    for annotated_acquire in annotated_acquires {
-        if !seen.contains(&annotated_acquire) {
+    for (annotated_acquire, annotated_loc) in annotated_acquires {
+        if !seen.contains_key(&annotated_acquire) {
             let msg = format!(
                 "Invalid 'acquires' list. The resource '{}::{}' was never acquired by '{}', '{}', \
                  '{}', or a transitive call",
@@ -38,7 +38,7 @@ pub fn function_body_(
                 N::BuiltinFunction_::BORROW_GLOBAL,
                 N::BuiltinFunction_::BORROW_GLOBAL_MUT
             );
-            context.error(vec![(annotated_acquire.loc(), msg)])
+            context.error(vec![(*annotated_loc, msg)])
         }
     }
 }
@@ -49,7 +49,7 @@ pub fn function_body_(
 
 fn sequence(
     context: &mut Context,
-    annotated_acquires: &BTreeSet<StructName>,
+    annotated_acquires: &BTreeMap<StructName, Loc>,
     seen: &mut Seen,
     seq: &T::Sequence,
 ) {
@@ -60,7 +60,7 @@ fn sequence(
 
 fn sequence_item(
     context: &mut Context,
-    annotated_acquires: &BTreeSet<StructName>,
+    annotated_acquires: &BTreeMap<StructName, Loc>,
     seen: &mut Seen,
     item: &T::SequenceItem,
 ) {
@@ -74,34 +74,39 @@ fn sequence_item(
 
 fn exp(
     context: &mut Context,
-    annotated_acquires: &BTreeSet<StructName>,
+    annotated_acquires: &BTreeMap<StructName, Loc>,
     seen: &mut Seen,
     e: &T::Exp,
 ) {
     use T::UnannotatedExp_ as E;
     match &e.exp.value {
-        E::Use(_) => panic!("ICE should have been expanded"),
+        E::InferredNum(_) | E::Use(_) => panic!("ICE should have been expanded"),
 
-        E::Unit
+        E::Unit { .. }
         | E::Value(_)
         | E::Move { .. }
         | E::Copy { .. }
         | E::BorrowLocal(_, _)
         | E::Break
         | E::Continue
+        | E::Spec(_, _)
         | E::UnresolvedError => (),
+
+        E::ModuleCall(call) if is_current_function(context, call) => {
+            exp(context, annotated_acquires, seen, &call.arguments);
+        }
 
         E::ModuleCall(call) => {
             let loc = e.exp.loc;
             let acquires = call
                 .acquires
                 .iter()
-                .filter(|a| valid_acquires_annot(context, loc, a))
-                .collect::<BTreeSet<_>>();
+                .filter(|(a, _)| valid_acquires_annot(context, loc, a))
+                .collect::<BTreeMap<_, _>>();
             let msg = || format!("Invalid call to '{}::{}'", &call.module, &call.name);
-            for sn in acquires {
-                check_acquire_listed(context, annotated_acquires, loc, msg, sn);
-                seen.insert(sn.clone());
+            for (sn, sloc) in acquires {
+                check_acquire_listed(context, annotated_acquires, loc, msg, sn, *sloc);
+                seen.insert(sn.clone(), *sloc);
             }
 
             exp(context, annotated_acquires, seen, &call.arguments);
@@ -144,13 +149,13 @@ fn exp(
         }
         E::ExpList(el) => exp_list(context, annotated_acquires, seen, el),
 
-        E::Annotate(e, _) => exp(context, annotated_acquires, seen, e),
+        E::Cast(e, _) | E::Annotate(e, _) => exp(context, annotated_acquires, seen, e),
     }
 }
 
 fn exp_list(
     context: &mut Context,
-    annotated_acquires: &BTreeSet<StructName>,
+    annotated_acquires: &BTreeMap<StructName, Loc>,
     seen: &mut Seen,
     items: &[T::ExpListItem],
 ) {
@@ -161,7 +166,7 @@ fn exp_list(
 
 fn exp_list_item(
     context: &mut Context,
-    annotated_acquires: &BTreeSet<StructName>,
+    annotated_acquires: &BTreeMap<StructName, Loc>,
     seen: &mut Seen,
     item: &T::ExpListItem,
 ) {
@@ -173,9 +178,13 @@ fn exp_list_item(
     }
 }
 
+fn is_current_function(context: &Context, call: &T::ModuleCall) -> bool {
+    context.is_current_function(&call.module, &call.name)
+}
+
 fn builtin_function(
     context: &mut Context,
-    annotated_acquires: &BTreeSet<StructName>,
+    annotated_acquires: &BTreeMap<StructName, Loc>,
     seen: &mut Seen,
     loc: &Loc,
     b: &T::BuiltinFunction,
@@ -186,8 +195,8 @@ fn builtin_function(
         B::MoveFrom(bt) => {
             let msg = mk_msg(N::BuiltinFunction_::MOVE_FROM);
             if let Some(sn) = check_global_access(context, loc, msg, bt) {
-                check_acquire_listed(context, annotated_acquires, *loc, msg, sn);
-                seen.insert(sn.clone());
+                check_acquire_listed(context, annotated_acquires, *loc, msg, sn, bt.loc);
+                seen.insert(sn.clone(), bt.loc);
             }
         }
         B::BorrowGlobal(mut_, bt) => {
@@ -198,12 +207,16 @@ fn builtin_function(
             };
             let msg = mk_msg(name);
             if let Some(sn) = check_global_access(context, loc, msg, bt) {
-                check_acquire_listed(context, annotated_acquires, *loc, msg, sn);
-                seen.insert(sn.clone());
+                check_acquire_listed(context, annotated_acquires, *loc, msg, sn, bt.loc);
+                seen.insert(sn.clone(), bt.loc);
             }
         }
         B::MoveToSender(bt) => {
             let msg = mk_msg(N::BuiltinFunction_::MOVE_TO_SENDER);
+            check_global_access(context, loc, msg, bt);
+        }
+        B::MoveTo(bt) => {
+            let msg = mk_msg(N::BuiltinFunction_::MOVE_TO);
             check_global_access(context, loc, msg, bt);
         }
         B::Exists(bt) => {
@@ -220,21 +233,22 @@ fn builtin_function(
 
 fn check_acquire_listed<F>(
     context: &mut Context,
-    annotated_acquires: &BTreeSet<StructName>,
+    annotated_acquires: &BTreeMap<StructName, Loc>,
     loc: Loc,
     msg: F,
-    global_type: &StructName,
+    global_type_name: &StructName,
+    global_type_loc: Loc,
 ) where
     F: Fn() -> String,
 {
-    if !annotated_acquires.contains(global_type) {
+    if !annotated_acquires.contains_key(global_type_name) {
         let tmsg = format!(
-            "The call acquires '{}::{}', but the 'acquires' list for the current function does not \
-            contain this type. It must be present in the calling context's acquires list",
+            "The call acquires '{}::{}', but the 'acquires' list for the current function does \
+             not contain this type. It must be present in the calling context's acquires list",
             context.current_module.as_ref().unwrap(),
-            global_type
+            global_type_name
         );
-        context.error(vec![(loc, msg()), (global_type.loc(), tmsg)]);
+        context.error(vec![(loc, msg()), (global_type_loc, tmsg)]);
     }
 }
 
@@ -242,7 +256,7 @@ pub fn check_global_access<'a, F>(
     context: &mut Context,
     loc: &Loc,
     msg: F,
-    global_type: &'a BaseType,
+    global_type: &'a Type,
 ) -> Option<&'a StructName>
 where
     F: Fn() -> String,
@@ -260,39 +274,42 @@ fn check_global_access_<'a, F>(
     context: &mut Context,
     loc: &Loc,
     msg: F,
-    global_type: &'a BaseType,
+    global_type: &'a Type,
 ) -> Option<&'a StructName>
 where
     F: Fn() -> String,
 {
-    use BaseType_ as B;
     use TypeName_ as TN;
+    use Type_ as T;
     let tloc = &global_type.loc;
     let (def_loc, declared_module, sn, resource_opt) = match &global_type.value {
-        B::Var(_) => panic!("ICE type expansion failed"),
-        B::Anything => {
-            assert!(context.has_errors());
+        T::Var(_) => panic!("ICE type expansion failed"),
+        T::Anything | T::UnresolvedError => {
             return None;
         }
-        B::Param(_) | B::Apply(_, sp!(_, TN::Builtin(_)), _) => {
-            let ty_debug = global_type.value.subst_format(&HashMap::new());
+        T::Apply(_, sp!(_, TN::ModuleType(m, s)), _args) => {
+            let def_loc = context.struct_declared_loc(m, s);
+            let resource_opt = context.resource_opt(m, s);
+            (def_loc, m.clone(), s, resource_opt)
+        }
+        T::Ref(_, _)
+        | T::Unit
+        | T::Param(_)
+        | T::Apply(_, sp!(_, TN::Multiple(_)), _)
+        | T::Apply(_, sp!(_, TN::Builtin(_)), _) => {
+            let ty_debug = core::error_format(global_type, &Subst::empty());
             let tmsg = format!("Expected a nominal resource. Found the type: {}", ty_debug);
 
             context.error(vec![(*loc, msg()), (*tloc, tmsg)]);
             return None;
         }
-        B::Apply(_, sp!(_, TN::ModuleType(m, s)), _args) => {
-            let def_loc = context.struct_declared_loc(m, s);
-            let resource_opt = context.resource_opt(m, s);
-            (def_loc, m.clone(), s, resource_opt)
-        }
     };
 
     match &context.current_module {
         Some(current_module) if current_module != &declared_module => {
-            let ty_debug = global_type.value.subst_format(&HashMap::new());
+            let ty_debug = core::error_format(global_type, &Subst::empty());
             let tmsg = format!(
-                "The type '{}' was not declared in the current module. Global storage access is \
+                "The type {} was not declared in the current module. Global storage access is \
                  internal to the module'",
                 ty_debug
             );
@@ -303,7 +320,7 @@ where
     }
 
     if resource_opt.is_none() {
-        let ty_debug = global_type.value.subst_format(&HashMap::new());
+        let ty_debug = core::error_format(global_type, &Subst::empty());
         let tmsg = format!("Expected a nominal resource. Found the type: {}", ty_debug);
 
         context.error(vec![

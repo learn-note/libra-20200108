@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Copyright (c) The Libra Core Contributors
 # SPDX-License-Identifier: Apache-2.0
 set -ex
@@ -33,6 +33,7 @@ docker run \
     --ip $bootstrap \
     --network testnet \
     --publish 8000:8000 \
+    --publish 8080:8080 \
     --publish 9101:9101 \
     --publish 9102:9102 \
     "$image"

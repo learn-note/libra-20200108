@@ -3,19 +3,21 @@
 
 use crate::SynchronizerState;
 use anyhow::{bail, Result};
-use executor::ExecutedTrees;
-use libra_crypto::hash::CryptoHash;
-use libra_crypto::HashValue;
-use libra_types::block_info::BlockInfo;
-use libra_types::crypto_proxies::ValidatorSet;
-use libra_types::crypto_proxies::{ValidatorChangeProof, ValidatorSigner, ValidatorVerifier};
+use executor_types::ExecutedTrees;
+use libra_crypto::{hash::CryptoHash, HashValue};
 use libra_types::{
-    account_address::AccountAddress, crypto_proxies::LedgerInfoWithSignatures,
-    ledger_info::LedgerInfo, test_helpers::transaction_test_helpers::get_test_signed_txn,
-    transaction::Transaction,
+    account_address::AccountAddress,
+    account_config::lbr_type_tag,
+    block_info::BlockInfo,
+    epoch_state::EpochState,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    on_chain_config::ValidatorSet,
+    test_helpers::transaction_test_helpers::get_test_signed_txn,
+    transaction::{authenticator::AuthenticationKey, SignedTransaction, Transaction},
+    validator_signer::ValidatorSigner,
 };
 use std::collections::{BTreeMap, HashMap};
-use transaction_builder::encode_transfer_script;
+use transaction_builder::encode_transfer_with_metadata_script;
 use vm_genesis::GENESIS_KEYPAIR;
 
 pub struct MockStorage {
@@ -31,16 +33,12 @@ pub struct MockStorage {
     // All epochs are built s.t. a single signature is enough for quorum cert
     signer: ValidatorSigner,
     // A validator verifier of the latest epoch
-    verifier: ValidatorVerifier,
+    epoch_state: EpochState,
 }
 
 impl MockStorage {
     pub fn new(genesis_li: LedgerInfoWithSignatures, signer: ValidatorSigner) -> Self {
-        let verifier = genesis_li
-            .ledger_info()
-            .next_validator_set()
-            .unwrap()
-            .into();
+        let epoch_state = genesis_li.ledger_info().next_epoch_state().unwrap().clone();
         let epoch_num = genesis_li.ledger_info().epoch() + 1;
         let mut ledger_infos = HashMap::new();
         ledger_infos.insert(0, genesis_li);
@@ -50,7 +48,7 @@ impl MockStorage {
             ledger_infos,
             epoch_num,
             signer,
-            verifier,
+            epoch_state,
         }
     }
 
@@ -91,16 +89,12 @@ impl MockStorage {
         SynchronizerState::new(
             self.highest_local_li(),
             self.synced_trees().clone(),
-            self.verifier.clone(),
+            self.epoch_state.clone(),
         )
     }
 
-    pub fn get_epoch_changes(&self, known_epoch: u64) -> ValidatorChangeProof {
-        let mut epoch_change_lis = vec![];
-        for epoch_num in known_epoch..self.epoch_num() {
-            epoch_change_lis.push(self.ledger_infos.get(&epoch_num).unwrap().clone());
-        }
-        ValidatorChangeProof::new(epoch_change_lis, /* more = */ false)
+    pub fn get_epoch_changes(&self, known_epoch: u64) -> LedgerInfoWithSignatures {
+        self.ledger_infos.get(&known_epoch).unwrap().clone()
     }
 
     pub fn get_chunk(
@@ -138,25 +132,39 @@ impl MockStorage {
             verified_target_li.ledger_info().epoch(),
             verified_target_li.clone(),
         );
-        if let Some(next_validator_set) = verified_target_li.ledger_info().next_validator_set() {
-            self.epoch_num = verified_target_li.ledger_info().epoch() + 1;
-            self.verifier = next_validator_set.into();
+        if let Some(next_epoch_state) = verified_target_li.ledger_info().next_epoch_state() {
+            self.epoch_num = next_epoch_state.epoch;
+            self.epoch_state = next_epoch_state.clone();
         }
     }
 
     // Generate new dummy txns and updates the LI
     // with the version corresponding to the new transactions, signed by this storage signer.
-    pub fn commit_new_txns(&mut self, num_txns: u64) {
+    pub fn commit_new_txns(&mut self, num_txns: u64) -> (Vec<Transaction>, Vec<SignedTransaction>) {
+        let mut committed_txns = vec![];
+        let mut signed_txns = vec![];
         for _ in 0..num_txns {
-            self.add_txns(&mut vec![Self::gen_mock_user_txn()]);
+            let txn = Self::gen_mock_user_txn();
+            self.add_txns(&mut vec![txn.clone()]);
+            committed_txns.push(txn.clone());
+            if let Transaction::UserTransaction(signed_txn) = txn {
+                signed_txns.push(signed_txn);
+            }
         }
         self.add_li(None);
+        (committed_txns, signed_txns)
     }
 
     fn gen_mock_user_txn() -> Transaction {
         let sender = AccountAddress::random();
-        let receiver = AccountAddress::random();
-        let program = encode_transfer_script(&receiver, 1);
+        let receiver = AuthenticationKey::random();
+        let program = encode_transfer_with_metadata_script(
+            lbr_type_tag(),
+            receiver.derived_address(),
+            1,
+            vec![],
+            vec![],
+        );
         Transaction::UserTransaction(get_test_signed_txn(
             sender,
             0, // sequence number
@@ -168,6 +176,10 @@ impl MockStorage {
 
     // add the LI to the current highest version and sign it
     fn add_li(&mut self, validator_set: Option<ValidatorSet>) {
+        let epoch_state = validator_set.map(|set| EpochState {
+            epoch: self.epoch_num() + 1,
+            verifier: (&set).into(),
+        });
         let ledger_info = LedgerInfo::new(
             BlockInfo::new(
                 self.epoch_num(),
@@ -176,11 +188,11 @@ impl MockStorage {
                 HashValue::zero(),
                 self.version(),
                 0,
-                validator_set,
+                epoch_state,
             ),
             HashValue::zero(),
         );
-        let signature = self.signer.sign_message(ledger_info.hash()).unwrap();
+        let signature = self.signer.sign_message(ledger_info.hash());
         let mut signatures = BTreeMap::new();
         signatures.insert(self.signer.author(), signature);
         self.ledger_infos.insert(
@@ -189,7 +201,7 @@ impl MockStorage {
         );
     }
 
-    // This function is applying the LedgerInfo with the next validator set to the existing version
+    // This function is applying the LedgerInfo with the next epoch info to the existing version
     // (yes, it's different from reality, we're not adding any real reconfiguration txn,
     // just adding a new LedgerInfo).
     // The validator set is different only in the consensus public / private keys, network data
@@ -198,12 +210,12 @@ impl MockStorage {
         self.add_li(Some(validator_set));
         self.epoch_num += 1;
         self.signer = signer;
-        self.verifier = self
+        self.epoch_state = self
             .highest_local_li()
             .ledger_info()
-            .next_validator_set()
+            .next_epoch_state()
             .unwrap()
-            .into();
+            .clone();
     }
 
     // Find LedgerInfo for a given version.

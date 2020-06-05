@@ -4,7 +4,7 @@
 use crate::control_flow_graph::{BlockId, ControlFlowGraph};
 use std::collections::HashMap;
 use vm::{
-    file_format::{Bytecode, CompiledModule},
+    file_format::{Bytecode, CodeUnit, CompiledModule},
     views::FunctionDefinitionView,
 };
 
@@ -16,23 +16,18 @@ pub trait AbstractDomain: Clone + Sized {
 
 #[derive(Debug)]
 pub enum JoinResult {
-    Unchanged,
     Changed,
-    Error,
-}
-
-#[derive(Clone)]
-pub enum BlockPrecondition<State> {
-    State(State),
-    /// joining postconditions of previous blocks ended in failure
-    JoinFailure,
+    Unchanged,
 }
 
 #[derive(Clone)]
 pub enum BlockPostcondition<AnalysisError> {
+    /// Block not yet analyzed
+    Unprocessed,
     /// Analyzing block was successful
+    /// TODO might carry post state at some point
     Success,
-    /// Analyzing block ended in an error
+    /// Analyzing block resulted in an error
     Error(AnalysisError),
 }
 
@@ -40,8 +35,8 @@ pub enum BlockPostcondition<AnalysisError> {
 #[derive(Clone)]
 pub struct BlockInvariant<State, AnalysisError> {
     /// Precondition of the block
-    pub pre: BlockPrecondition<State>,
-    /// Postcondition of the block---just success/error for now
+    pub pre: State,
+    /// Postcondition of the block
     pub post: BlockPostcondition<AnalysisError>,
 }
 
@@ -89,8 +84,8 @@ pub trait AbstractInterpreter: TransferFunctions {
         inv_map.insert(
             entry_block_id,
             BlockInvariant {
-                pre: BlockPrecondition::State(initial_state),
-                post: BlockPostcondition::Success,
+                pre: initial_state,
+                post: BlockPostcondition::Unprocessed,
             },
         );
 
@@ -100,30 +95,32 @@ pub trait AbstractInterpreter: TransferFunctions {
                 None => unreachable!("Missing invariant for block {}", block_id),
             };
 
-            let mut state = match &block_invariant.pre {
-                BlockPrecondition::State(s) => s.clone(),
-                BlockPrecondition::JoinFailure =>
-                // Can't analyze the block from a failing precondition
-                {
-                    continue
-                }
-            };
-            match self.execute_block(block_id, &mut state, &function_view, cfg) {
-                Err(errors) => {
-                    block_invariant.post = BlockPostcondition::Error(errors);
+            let pre_state = &block_invariant.pre;
+            let post_state = match self.execute_block(
+                block_id,
+                pre_state,
+                &function_view
+                    .code()
+                    .expect("Abstract interpreter should only run on non-native functions"),
+                cfg,
+            ) {
+                Err(e) => {
+                    block_invariant.post = BlockPostcondition::Error(e);
                     continue;
                 }
-                Ok(()) => {
+                Ok(s) => {
                     block_invariant.post = BlockPostcondition::Success;
+                    s
                 }
             };
+
             // propagate postcondition of this block to successor blocks
-            for next_block_id in cfg.successors(&block_id) {
+            for next_block_id in cfg.successors(block_id) {
                 match inv_map.get_mut(next_block_id) {
                     Some(next_block_invariant) => {
-                        let join_result = match &mut next_block_invariant.pre {
-                            BlockPrecondition::State(old_pre) => old_pre.join(&state),
-                            BlockPrecondition::JoinFailure => JoinResult::Error,
+                        let join_result = {
+                            let old_pre = &mut next_block_invariant.pre;
+                            old_pre.join(&post_state)
                         };
                         match join_result {
                             JoinResult::Unchanged => {
@@ -135,11 +132,6 @@ pub trait AbstractInterpreter: TransferFunctions {
                                 // The pre changed. Schedule the next block.
                                 work_list.push(*next_block_id);
                             }
-                            JoinResult::Error => {
-                                // This join produced an error. Don't schedule the block.
-                                next_block_invariant.pre = BlockPrecondition::JoinFailure;
-                                continue;
-                            }
                         }
                     }
                     None => {
@@ -148,7 +140,7 @@ pub trait AbstractInterpreter: TransferFunctions {
                         inv_map.insert(
                             *next_block_id,
                             BlockInvariant {
-                                pre: BlockPrecondition::State(state.clone()),
+                                pre: post_state.clone(),
                                 post: BlockPostcondition::Success,
                             },
                         );
@@ -157,23 +149,22 @@ pub trait AbstractInterpreter: TransferFunctions {
                 }
             }
         }
-
         inv_map
     }
 
     fn execute_block(
         &mut self,
         block_id: BlockId,
-        state: &mut Self::State,
-        function_view: &FunctionDefinitionView<CompiledModule>,
+        pre_state: &Self::State,
+        code: &CodeUnit,
         cfg: &dyn ControlFlowGraph,
-    ) -> Result<(), Self::AnalysisError> {
-        let block_end = cfg.block_end(&block_id);
-        for offset in cfg.instr_indexes(&block_id) {
-            let instr = &function_view.code().code[offset as usize];
-            self.execute(state, instr, offset as usize, block_end as usize)?
+    ) -> Result<Self::State, Self::AnalysisError> {
+        let mut state_acc = pre_state.clone();
+        let block_end = cfg.block_end(block_id);
+        for offset in cfg.instr_indexes(block_id) {
+            let instr = &code.code[offset as usize];
+            self.execute(&mut state_acc, instr, offset as usize, block_end as usize)?
         }
-
-        Ok(())
+        Ok(state_acc)
     }
 }

@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::module_generation::{options::ModuleGeneratorOptions, utils::random_string};
-use libra_types::{account_address::AccountAddress, byte_array::ByteArray, identifier::Identifier};
+use libra_types::account_address::AccountAddress;
+use move_core_types::identifier::Identifier;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use vm::file_format::{Bytecode, CompiledModuleMut, LocalsSignature};
+use vm::file_format::{Bytecode, CompiledModuleMut, Signature};
 
 ///////////////////////////////////////////////////////////////////////////
 // Padding of tables in compiled modules
@@ -24,17 +25,16 @@ impl Pad {
             table_size,
             options,
         };
-        slf.pad_address_table(module);
+        slf.pad_cosntant_table(module);
         slf.pad_identifier_table(module);
-        slf.pad_byte_array_table(module);
-        slf.pad_locals_signatures(module);
+        slf.pad_address_identifier_table(module);
+        slf.pad_signatures(module);
         slf.pad_function_bodies(module);
     }
 
-    fn pad_address_table(&mut self, module: &mut CompiledModuleMut) {
-        module.address_pool = (0..(self.table_size + module.address_pool.len()))
-            .map(|_| AccountAddress::random())
-            .collect()
+    fn pad_cosntant_table(&mut self, module: &mut CompiledModuleMut) {
+        // TODO actual constant generation
+        module.constant_pool = vec![]
     }
 
     fn pad_identifier_table(&mut self, module: &mut CompiledModuleMut) {
@@ -46,32 +46,30 @@ impl Pad {
             .collect()
     }
 
-    fn pad_byte_array_table(&mut self, module: &mut CompiledModuleMut) {
-        module.byte_array_pool = (0..(self.table_size + module.byte_array_pool.len()))
-            .map(|_| {
-                let len = self.gen.gen_range(10, self.options.byte_array_max_size);
-                let bytes = (0..len).map(|_| self.gen.gen::<u8>()).collect();
-                ByteArray::new(bytes)
-            })
+    fn pad_address_identifier_table(&mut self, module: &mut CompiledModuleMut) {
+        module.address_identifiers = (0..(self.table_size + module.address_identifiers.len()))
+            .map(|_| AccountAddress::random())
             .collect()
     }
 
     fn pad_function_bodies(&mut self, module: &mut CompiledModuleMut) {
         for fdef in module.function_defs.iter_mut() {
-            fdef.code.code = vec![
-                Bytecode::LdTrue,
-                Bytecode::LdTrue,
-                Bytecode::Pop,
-                Bytecode::Pop,
-                Bytecode::Ret,
-            ];
+            if let Some(code) = &mut fdef.code {
+                code.code = vec![
+                    Bytecode::LdTrue,
+                    Bytecode::LdTrue,
+                    Bytecode::Pop,
+                    Bytecode::Pop,
+                    Bytecode::Ret,
+                ]
+            }
         }
     }
 
     // Ensure that locals signatures always contain an empty signature
-    fn pad_locals_signatures(&mut self, module: &mut CompiledModuleMut) {
-        if module.locals_signatures.iter().all(|v| !v.is_empty()) {
-            module.locals_signatures.push(LocalsSignature(Vec::new()));
+    fn pad_signatures(&mut self, module: &mut CompiledModuleMut) {
+        if module.signatures.iter().all(|v| !v.is_empty()) {
+            module.signatures.push(Signature(Vec::new()));
         }
     }
 }

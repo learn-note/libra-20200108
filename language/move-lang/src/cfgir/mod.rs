@@ -4,38 +4,38 @@
 mod absint;
 pub mod ast;
 mod borrows;
-pub mod cfg;
+pub(crate) mod cfg;
 mod eliminate_locals;
 mod liveness;
 mod locals;
 mod remove_no_ops;
-pub mod translate;
+pub(crate) mod translate;
 
-use crate::shared::unique_map::UniqueMap;
-use crate::{errors::Errors, parser::ast::Var};
-use ast::*;
+use crate::{
+    errors::Errors,
+    hlir::ast::*,
+    parser::ast::{StructName, Var},
+    shared::unique_map::UniqueMap,
+};
 use cfg::*;
-use std::collections::BTreeSet;
+use move_ir_types::location::*;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn refine_inference_and_verify(
     errors: &mut Errors,
     signature: &FunctionSignature,
+    acquires: &BTreeMap<StructName, Loc>,
     locals: &UniqueMap<Var, SingleType>,
     cfg: &mut BlockCFG,
     infinite_loop_starts: &BTreeSet<Label>,
 ) {
     remove_no_ops::optimize(cfg);
-    liveness::refine_inference_and_verify(errors, signature, locals, cfg, infinite_loop_starts);
-}
 
-pub fn verify(
-    errors: &mut Errors,
-    signature: &FunctionSignature,
-    locals: &UniqueMap<Var, SingleType>,
-    cfg: &BlockCFG,
-) {
-    locals::verify(errors, signature, locals, cfg);
-    borrows::verify(errors, signature, locals, cfg)
+    liveness::last_usage(errors, locals, cfg, infinite_loop_starts);
+    let locals_states = locals::verify(errors, signature, acquires, locals, cfg);
+
+    liveness::release_dead_refs(&locals_states, locals, cfg, infinite_loop_starts);
+    borrows::verify(errors, signature, acquires, locals, cfg);
 }
 
 pub fn optimize(

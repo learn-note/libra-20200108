@@ -36,7 +36,7 @@ fn count(cfg: &BlockCFG) -> BTreeSet<Var> {
 
 mod count {
     use crate::{
-        cfgir::ast::*,
+        hlir::ast::*,
         parser::ast::{BinOp, UnaryOp, Var},
         shared::*,
     };
@@ -66,8 +66,8 @@ mod count {
             }
         }
 
-        fn used(&mut self, var: &Var, is_borrow_local: bool) {
-            if is_borrow_local {
+        fn used(&mut self, var: &Var, substitutable: bool) {
+            if !substitutable {
                 self.used.insert(var.clone(), None);
                 return;
             }
@@ -111,6 +111,7 @@ mod count {
             | C::JumpIf { cond: e, .. } => exp(context, e),
 
             C::Jump(_) => (),
+            C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
         }
     }
 
@@ -132,18 +133,22 @@ mod count {
     fn exp(context: &mut Context, parent_e: &Exp) {
         use UnannotatedExp_ as E;
         match &parent_e.exp.value {
-            E::Unit | E::Value(_) | E::UnresolvedError => (),
+            E::Unit { .. } | E::Value(_) | E::UnresolvedError => (),
+            E::Spec(_, used_locals) => {
+                used_locals.keys().for_each(|var| context.used(var, false));
+            }
 
-            E::BorrowLocal(_, var) => context.used(var, true),
+            E::BorrowLocal(_, var) => context.used(var, false),
 
-            E::Copy { var, .. } | E::Move { var, .. } => context.used(var, false),
+            E::Copy { var, .. } | E::Move { var, .. } => context.used(var, true),
 
             E::ModuleCall(mcall) => exp(context, &mcall.arguments),
             E::Builtin(_, e)
             | E::Freeze(e)
             | E::Dereference(e)
             | E::UnaryExp(_, e)
-            | E::Borrow(_, e, _) => exp(context, e),
+            | E::Borrow(_, e, _)
+            | E::Cast(e, _) => exp(context, e),
 
             E::BinopExp(e1, _, e2) => {
                 exp(context, e1);
@@ -153,6 +158,8 @@ mod count {
             E::Pack(_, _, fields) => fields.iter().for_each(|(_, _, e)| exp(context, e)),
 
             E::ExpList(es) => es.iter().for_each(|item| exp_list_item(context, item)),
+
+            E::Unreachable => panic!("ICE should not analyze dead code"),
         }
     }
 
@@ -189,6 +196,7 @@ mod count {
         use UnannotatedExp_ as E;
         match &parent_e.exp.value {
             E::UnresolvedError
+            | E::Spec(_, _)
             | E::BorrowLocal(_, _)
             | E::Copy { .. }
             | E::Builtin(_, _)
@@ -197,8 +205,9 @@ mod count {
             | E::Move { .. }
             | E::Borrow(_, _, _) => false,
 
-            E::Unit | E::Value(_) => true,
+            E::Unit { .. } | E::Value(_) => true,
 
+            E::Cast(e, _) => can_subst_exp_single(e),
             E::UnaryExp(op, e) => can_subst_exp_unary(op) && can_subst_exp_single(e),
             E::BinopExp(e1, op, e2) => {
                 can_subst_exp_binary(op) && can_subst_exp_single(e1) && can_subst_exp_single(e2)
@@ -206,6 +215,8 @@ mod count {
             E::ModuleCall(mcall) => can_subst_exp_module_call(mcall),
             E::ExpList(es) => es.iter().all(|i| can_subst_exp_item(i)),
             E::Pack(_, _, fields) => fields.iter().all(|(_, _, e)| can_subst_exp_single(e)),
+
+            E::Unreachable => panic!("ICE should not analyze dead code"),
         }
     }
 
@@ -270,7 +281,11 @@ fn eliminate(cfg: &mut BlockCFG, ssa_temps: BTreeSet<Var>) {
 }
 
 mod eliminate {
-    use crate::{cfgir::ast, cfgir::ast::*, parser::ast::Var, shared::*};
+    use crate::{
+        hlir::ast::{self as H, *},
+        parser::ast::Var,
+    };
+    use move_ir_types::location::*;
     use std::collections::{BTreeMap, BTreeSet};
 
     pub struct Context {
@@ -309,6 +324,7 @@ mod eliminate {
             | C::JumpIf { cond: e, .. } => exp(context, e),
 
             C::Jump(_) => (),
+            C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
         }
     }
 
@@ -354,14 +370,19 @@ mod eliminate {
                 }
             }
 
-            E::Unit | E::Value(_) | E::UnresolvedError | E::BorrowLocal(_, _) => (),
+            E::Unit { .. }
+            | E::Value(_)
+            | E::Spec(_, _)
+            | E::UnresolvedError
+            | E::BorrowLocal(_, _) => (),
 
             E::ModuleCall(mcall) => exp(context, &mut mcall.arguments),
             E::Builtin(_, e)
             | E::Freeze(e)
             | E::Dereference(e)
             | E::UnaryExp(_, e)
-            | E::Borrow(_, e, _) => exp(context, e),
+            | E::Borrow(_, e, _)
+            | E::Cast(e, _) => exp(context, e),
 
             E::BinopExp(e1, _, e2) => {
                 exp(context, e1);
@@ -371,6 +392,8 @@ mod eliminate {
             E::Pack(_, _, fields) => fields.iter_mut().for_each(|(_, _, e)| exp(context, e)),
 
             E::ExpList(es) => es.iter_mut().for_each(|item| exp_list_item(context, item)),
+
+            E::Unreachable => panic!("ICE should not analyze dead code"),
         }
     }
 
@@ -440,6 +463,9 @@ mod eliminate {
     }
 
     fn unit(loc: Loc) -> Exp {
-        ast::exp(sp(loc, Type_::Unit), sp(loc, UnannotatedExp_::Unit))
+        H::exp(
+            sp(loc, Type_::Unit),
+            sp(loc, UnannotatedExp_::Unit { trailing: false }),
+        )
     }
 }

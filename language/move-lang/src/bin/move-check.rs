@@ -3,8 +3,10 @@
 
 #![forbid(unsafe_code)]
 
-use move_lang::command_line::{self as cli};
-use move_lang::shared::*;
+use move_lang::{
+    command_line::{self as cli},
+    shared::*,
+};
 use structopt::*;
 
 #[derive(Debug, StructOpt)]
@@ -14,18 +16,14 @@ use structopt::*;
 )]
 pub struct Options {
     /// The source files to check
-    #[structopt(
-        name = "PATH_TO_SOURCE_FILE",
-        short = cli::SOURCE_FILES_SHORT,
-        long = cli::SOURCE_FILES,
-    )]
+    #[structopt(name = "PATH_TO_SOURCE_FILE")]
     pub source_files: Vec<String>,
 
     /// The library files needed as dependencies
     #[structopt(
         name = "PATH_TO_DEPENDENCY_FILE",
-        short = cli::DEPENDENCIES_SHORT,
-        long = cli::DEPENDENCIES,
+        short = cli::DEPENDENCY_SHORT,
+        long = cli::DEPENDENCY,
     )]
     pub dependencies: Vec<String>,
 
@@ -39,7 +37,7 @@ pub struct Options {
     pub sender: Option<Address>,
 }
 
-pub fn main() -> std::io::Result<()> {
+pub fn main() -> anyhow::Result<()> {
     let Options {
         source_files,
         dependencies,

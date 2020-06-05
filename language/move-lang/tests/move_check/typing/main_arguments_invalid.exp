@@ -1,0 +1,44 @@
+error: 
+
+   ┌── tests/move_check/typing/main_arguments_invalid.move:2:5 ───
+   │
+ 2 │ fun main<T: copyable>(x: T, y: vector<T>, z: vector<vector<u8>>, a: vector<vector<T>>) {
+   │     ^^^^ Invalid parameter for script function 'main'
+   ·
+ 2 │ fun main<T: copyable>(x: T, y: vector<T>, z: vector<vector<u8>>, a: vector<vector<T>>) {
+   │                          - Found: 'T'. But expected: 'u8', 'u64', 'u128', 'bool', 'address', 'vector<u8>', '&signer'
+   │
+
+error: 
+
+   ┌── tests/move_check/typing/main_arguments_invalid.move:2:5 ───
+   │
+ 2 │ fun main<T: copyable>(x: T, y: vector<T>, z: vector<vector<u8>>, a: vector<vector<T>>) {
+   │     ^^^^ Invalid parameter for script function 'main'
+   ·
+ 2 │ fun main<T: copyable>(x: T, y: vector<T>, z: vector<vector<u8>>, a: vector<vector<T>>) {
+   │                                --------- Found: 'vector<T>'. But expected: 'u8', 'u64', 'u128', 'bool', 'address', 'vector<u8>', '&signer'
+   │
+
+error: 
+
+   ┌── tests/move_check/typing/main_arguments_invalid.move:2:5 ───
+   │
+ 2 │ fun main<T: copyable>(x: T, y: vector<T>, z: vector<vector<u8>>, a: vector<vector<T>>) {
+   │     ^^^^ Invalid parameter for script function 'main'
+   ·
+ 2 │ fun main<T: copyable>(x: T, y: vector<T>, z: vector<vector<u8>>, a: vector<vector<T>>) {
+   │                                              ------------------ Found: 'vector<vector<u8>>'. But expected: 'u8', 'u64', 'u128', 'bool', 'address', 'vector<u8>', '&signer'
+   │
+
+error: 
+
+   ┌── tests/move_check/typing/main_arguments_invalid.move:2:5 ───
+   │
+ 2 │ fun main<T: copyable>(x: T, y: vector<T>, z: vector<vector<u8>>, a: vector<vector<T>>) {
+   │     ^^^^ Invalid parameter for script function 'main'
+   ·
+ 2 │ fun main<T: copyable>(x: T, y: vector<T>, z: vector<vector<u8>>, a: vector<vector<T>>) {
+   │                                                                     ----------------- Found: 'vector<vector<T>>'. But expected: 'u8', 'u64', 'u128', 'bool', 'address', 'vector<u8>', '&signer'
+   │
+

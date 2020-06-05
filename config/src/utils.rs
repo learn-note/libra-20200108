@@ -1,14 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::config::NodeConfig;
 use get_if_addrs::get_if_addrs;
-use libra_types::PeerId;
-use parity_multiaddr::{Multiaddr, Protocol};
+use libra_network_address::{NetworkAddress, Protocol};
+use libra_types::{transaction::Transaction, PeerId};
 use serde::{Serialize, Serializer};
 use std::{
     collections::{BTreeMap, HashMap},
     hash::BuildHasher,
-    net::{IpAddr, TcpListener, TcpStream},
+    net::{TcpListener, TcpStream},
 };
 
 /// Return an ephemeral, available port. On unix systems, the port returned will be in the
@@ -41,35 +42,22 @@ fn get_ephemeral_port() -> ::std::io::Result<u16> {
 }
 
 /// Extracts one local non-loopback IP address, if one exists. Otherwise returns None.
-pub fn get_local_ip() -> Option<Multiaddr> {
+pub fn get_local_ip() -> Option<NetworkAddress> {
     get_if_addrs().ok().and_then(|if_addrs| {
         if_addrs
             .into_iter()
             .find(|if_addr| !if_addr.is_loopback())
-            .and_then(|if_addr| {
-                let mut addr = Multiaddr::empty();
-                match if_addr.ip() {
-                    IpAddr::V4(a) => {
-                        addr.push(Protocol::Ip4(a));
-                    }
-                    IpAddr::V6(a) => {
-                        addr.push(Protocol::Ip6(a));
-                    }
-                }
-                Some(addr)
-            })
+            .map(|if_addr| NetworkAddress::from(Protocol::from(if_addr.ip())))
     })
 }
 
-pub fn get_available_port_in_multiaddr(is_ipv4: bool) -> Multiaddr {
-    let mut addr = Multiaddr::empty();
-    if is_ipv4 {
-        addr.push(Protocol::Ip4("0.0.0.0".parse().unwrap()));
+pub fn get_available_port_in_multiaddr(is_ipv4: bool) -> NetworkAddress {
+    let ip_proto = if is_ipv4 {
+        Protocol::Ip4("0.0.0.0".parse().unwrap())
     } else {
-        addr.push(Protocol::Ip6("::1".parse().unwrap()));
-    }
-    addr.push(Protocol::Tcp(get_available_port()));
-    addr
+        Protocol::Ip6("::1".parse().unwrap())
+    };
+    NetworkAddress::from(ip_proto).push(Protocol::Tcp(get_available_port()))
 }
 
 /// Serialize HashMaps as BTreeMaps for consistent ordering
@@ -84,4 +72,12 @@ where
 {
     let ordered: BTreeMap<_, _> = value.iter().collect();
     ordered.serialize(serializer)
+}
+
+pub fn get_genesis_txn(config: &NodeConfig) -> anyhow::Result<&Transaction> {
+    config
+        .execution
+        .genesis
+        .as_ref()
+        .ok_or_else(|| anyhow::format_err!("Genesis txn not present."))
 }

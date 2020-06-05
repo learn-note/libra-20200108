@@ -1,12 +1,12 @@
 module M {
     struct S {}
 
-    imm<T>(x: &T) {}
-    imm_mut<T>(x: &T, y: &mut T) {}
-    mut_imm<T>(x: &mut T, y: &T) {}
-    imm_imm<T>(x: &T, y: &T) {}
+    fun imm<T>(_x: &T) {}
+    fun imm_mut<T>(_x: &T, _y: &mut T) {}
+    fun mut_imm<T>(_x: &mut T, _y: &T) {}
+    fun imm_imm<T>(_x: &T, _y: &T) {}
 
-    t0() {
+    fun t0() {
         imm(&mut 0);
         imm(&0);
 
@@ -14,7 +14,7 @@ module M {
         imm(&S{});
     }
 
-    t1() {
+    fun t1() {
         imm_mut(&mut 0, &mut 0);
         mut_imm(&mut 0, &mut 0);
         imm_imm(&mut 0, &mut 0);

@@ -27,23 +27,24 @@
 //! those structs translate to tables and table specifications.
 
 use crate::{
-    access::ModuleAccess, check_bounds::BoundsChecker, internals::ModuleIndex, IndexKind,
-    SignatureTokenKind,
+    access::ModuleAccess, check_bounds::BoundsChecker, errors::VMResult, internals::ModuleIndex,
+    IndexKind, SignatureTokenKind,
 };
 use libra_types::{
     account_address::AccountAddress,
-    byte_array::ByteArray,
-    identifier::{IdentStr, Identifier},
-    language_storage::ModuleId,
     vm_error::{StatusCode, VMStatus},
 };
 use mirai_annotations::*;
+use move_core_types::{
+    identifier::{IdentStr, Identifier},
+    language_storage::ModuleId,
+};
 use num_variants::NumVariants;
-use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest::{collection::vec, prelude::*, strategy::BoxedStrategy};
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
+use ref_cast::RefCast;
 
 /// Generic index into one of the tables in the binary format.
 pub type TableIndex = u16;
@@ -106,44 +107,49 @@ define_index! {
     doc: "Index into the `FunctionHandle` table.",
 }
 define_index! {
+    name: FieldHandleIndex,
+    kind: FieldHandle,
+    doc: "Index into the `FieldHandle` table.",
+}
+define_index! {
+    name: StructDefInstantiationIndex,
+    kind: StructDefInstantiation,
+    doc: "Index into the `StructInstantiation` table.",
+}
+define_index! {
+    name: FunctionInstantiationIndex,
+    kind: FunctionInstantiation,
+    doc: "Index into the `FunctionInstantiation` table.",
+}
+define_index! {
+    name: FieldInstantiationIndex,
+    kind: FieldInstantiation,
+    doc: "Index into the `FieldInstantiation` table.",
+}
+define_index! {
     name: IdentifierIndex,
     kind: Identifier,
     doc: "Index into the `Identifier` table.",
 }
 define_index! {
-    name: ByteArrayPoolIndex,
-    kind: ByteArrayPool,
-    doc: "Index into the `ByteArrayPool` table.",
+    name: AddressIdentifierIndex,
+    kind: AddressIdentifier,
+    doc: "Index into the `AddressIdentifier` table.",
 }
 define_index! {
-    name: AddressPoolIndex,
-    kind: AddressPool,
-    doc: "Index into the `AddressPool` table.",
+    name: ConstantPoolIndex,
+    kind: ConstantPool,
+    doc: "Index into the `ConstantPool` table.",
 }
 define_index! {
-    name: TypeSignatureIndex,
-    kind: TypeSignature,
-    doc: "Index into the `TypeSignature` table.",
-}
-define_index! {
-    name: FunctionSignatureIndex,
-    kind: FunctionSignature,
-    doc: "Index into the `FunctionSignature` table.",
-}
-define_index! {
-    name: LocalsSignatureIndex,
-    kind: LocalsSignature,
-    doc: "Index into the `LocalsSignature` table.",
+    name: SignatureIndex,
+    kind: Signature,
+    doc: "Index into the `Signature` table.",
 }
 define_index! {
     name: StructDefinitionIndex,
     kind: StructDefinition,
     doc: "Index into the `StructDefinition` table.",
-}
-define_index! {
-    name: FieldDefinitionIndex,
-    kind: FieldDefinition,
-    doc: "Index into the `FieldDefinition` table.",
 }
 define_index! {
     name: FunctionDefinitionIndex,
@@ -163,39 +169,33 @@ pub type CodeOffset = u16;
 
 /// The pool of identifiers.
 pub type IdentifierPool = Vec<Identifier>;
-/// The pool of `ByteArray` literals.
-pub type ByteArrayPool = Vec<ByteArray>;
-/// The pool of `AccountAddress` literals.
-///
-/// Code references have a literal addresses in `ModuleHandle`s. Literal references to data in
-/// the blockchain are also published here.
-pub type AddressPool = Vec<AccountAddress>;
+/// The pool of address identifiers (addresses used in ModuleHandles/ModuleIds).
+/// Does not include runtime values. Those are placed in the `ConstantPool`
+pub type AddressIdentifierPool = Vec<AccountAddress>;
+/// The pool of `Constant` values
+pub type ConstantPool = Vec<Constant>;
 /// The pool of `TypeSignature` instances. Those are system and user types used and
 /// their composition (e.g. &U64).
 pub type TypeSignaturePool = Vec<TypeSignature>;
-/// The pool of `FunctionSignature` instances.
-pub type FunctionSignaturePool = Vec<FunctionSignature>;
-/// The pool of `LocalsSignature` instances. Every function definition must define the set of
+/// The pool of `Signature` instances. Every function definition must define the set of
 /// locals used and their types.
-pub type LocalsSignaturePool = Vec<LocalsSignature>;
+pub type SignaturePool = Vec<Signature>;
 
 // TODO: "<SELF>" only passes the validator for identifiers because it is special cased. Whenever
 // "<SELF>" is removed, so should the special case in identifier.rs.
-static SELF_MODULE_NAME: Lazy<Identifier> = Lazy::new(|| Identifier::new("<SELF>").unwrap());
-
 pub fn self_module_name() -> &'static IdentStr {
-    &*SELF_MODULE_NAME
+    IdentStr::ref_cast("<SELF>")
 }
 
 /// Index 0 into the LocalsSignaturePool, which is guaranteed to be an empty list.
-/// Used to represent function/struct instantiation with no type actuals -- effectively
+/// Used to represent function/struct instantiation with no type arguments -- effectively
 /// non-generic functions and structs.
-pub const NO_TYPE_ACTUALS: LocalsSignatureIndex = LocalsSignatureIndex(0);
+pub const NO_TYPE_ARGUMENTS: SignatureIndex = SignatureIndex(0);
 
 // HANDLES:
 // Handles are structs that accompany opcodes that need references: a type reference,
 // or a function reference (a field reference being available only within the module that
-// defrines the field can be a definition).
+// defines the field can be a definition).
 // Handles refer to both internal and external "entities" and are embedded as indexes
 // in the instruction stream.
 // Handles define resolution. Resolution is assumed to be by (name, signature)
@@ -215,8 +215,8 @@ pub const NO_TYPE_ACTUALS: LocalsSignatureIndex = LocalsSignatureIndex(0);
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct ModuleHandle {
-    /// Index into the `AddressPool`. Identifies the account that holds the module.
-    pub address: AddressPoolIndex,
+    /// Index into the `AddressIdentifierIndex`. Identifies module-holding account's address.
+    pub address: AddressIdentifierIndex,
     /// The name of the module published in the code section for the account in `address`.
     pub name: IdentifierIndex,
 }
@@ -250,7 +250,7 @@ pub struct StructHandle {
     /// If `is_nominal_resource` is true, it is a *nominal resource*
     pub is_nominal_resource: bool,
     /// The type formals (identified by their index into the vec) and their kind constraints
-    pub type_formals: Vec<Kind>,
+    pub type_parameters: Vec<Kind>,
 }
 
 /// A `FunctionHandle` is a reference to a function. It is composed by a
@@ -262,14 +262,27 @@ pub struct StructHandle {
 /// function calls.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
 pub struct FunctionHandle {
     /// The module that defines the function.
     pub module: ModuleHandleIndex,
     /// The name of the function.
     pub name: IdentifierIndex,
-    /// The signature of the function.
-    pub signature: FunctionSignatureIndex,
+    /// The list of arguments to the function.
+    pub parameters: SignatureIndex,
+    /// The list of return types.
+    pub return_: SignatureIndex,
+    /// The type formals (identified by their index into the vec) and their kind constraints
+    pub type_parameters: Vec<Kind>,
+}
+
+/// A field access info (owner type and offset)
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
+pub struct FieldHandle {
+    pub owner: StructDefinitionIndex,
+    pub field: MemberCount,
 }
 
 // DEFINITIONS:
@@ -281,13 +294,47 @@ pub struct FunctionHandle {
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub enum StructFieldInformation {
     Native,
-    Declared {
-        /// The number of fields in this type.
-        field_count: MemberCount,
-        /// The starting index for the fields of this type. `FieldDefinition`s for each type must
-        /// be consecutively stored in the `FieldDefinition` table.
-        fields: FieldDefinitionIndex,
-    },
+    Declared(Vec<FieldDefinition>),
+}
+
+//
+// Instantiations
+//
+// Instantiations point to a generic handle and its instantiation.
+// The instantiation can be partial.
+// So, for example, `S<T, W>`, `S<u8, bool>`, `S<T, u8>`, `S<X<T>, address>` are all
+// `StructInstantiation`s
+
+/// A complete or partial instantiation of a generic struct
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
+pub struct StructDefInstantiation {
+    pub def: StructDefinitionIndex,
+    pub type_parameters: SignatureIndex,
+}
+
+/// A complete or partial instantiation of a function
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
+pub struct FunctionInstantiation {
+    pub handle: FunctionHandleIndex,
+    pub type_parameters: SignatureIndex,
+}
+
+/// A complete or partial instantiation of a field (or the type of it).
+///
+/// A `FieldInstantiation` points to a generic `FieldHandle` and the instantiation
+/// of the owner type.
+/// E.g. for `S<u8, bool>.f` where `f` is a field of any type, `instantiation`
+/// would be `[u8, boo]`
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
+pub struct FieldInstantiation {
+    pub handle: FieldHandleIndex,
+    pub type_parameters: SignatureIndex,
 }
 
 /// A `StructDefinition` is a type definition. It either indicates it is native or
@@ -301,7 +348,7 @@ pub struct StructDefinition {
     pub struct_handle: StructHandleIndex,
     /// Contains either
     /// - Information indicating the struct is native and has no accessible fields
-    /// - Information indicating the number of fields and the start `FieldDefinitionIndex`
+    /// - Information indicating the number of fields and the start `FieldDefinition`s
     pub field_information: StructFieldInformation,
 }
 
@@ -309,35 +356,34 @@ impl StructDefinition {
     pub fn declared_field_count(&self) -> Result<MemberCount, VMStatus> {
         match &self.field_information {
             // TODO we might want a more informative error here
-            StructFieldInformation::Native => Err(VMStatus::new(StatusCode::LINKER_ERROR)),
-            StructFieldInformation::Declared { field_count, .. } => Ok(*field_count),
+            StructFieldInformation::Native => Err(VMStatus::new(StatusCode::LINKER_ERROR)
+                .with_message("Looking for field in native structure".to_string())),
+            StructFieldInformation::Declared(fields) => Ok(fields.len() as u16),
         }
     }
 }
-/// A `FieldDefinition` is the definition of a field: the type the field is defined on,
-/// its name and the field type.
+/// A `FieldDefinition` is the definition of a field: its name and the field type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct FieldDefinition {
-    /// The type (resource or unrestricted) the field is defined on.
-    pub struct_: StructHandleIndex,
     /// The name of the field.
     pub name: IdentifierIndex,
     /// The type of the field.
-    pub signature: TypeSignatureIndex,
+    pub signature: TypeSignature,
 }
 
 /// A `FunctionDefinition` is the implementation of a function. It defines
 /// the *prototype* of the function and the function body.
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
 pub struct FunctionDefinition {
     /// The prototype of the function (module, name, signature).
     pub function: FunctionHandleIndex,
-    /// Flags for this function (private, public, native, etc.)
-    pub flags: u8,
+    /// Flag to indicate if this function is public.
+    pub is_public: bool,
     /// List of nominal resources (declared in this module) that the procedure might access
     /// Either through: BorrowGlobal, MoveFrom, or transitively through another procedure
     /// This list of acquires grants the borrow checker the ability to statically verify the safety
@@ -345,26 +391,31 @@ pub struct FunctionDefinition {
     ///
     /// Not in the signature as it is not needed outside of the declaring module
     ///
-    /// Note, there is no LocalsSignatureIndex with each struct definition index, as global
+    /// Note, there is no SignatureIndex with each struct definition index, as global
     /// resources cannot currently take type arguments
     pub acquires_global_resources: Vec<StructDefinitionIndex>,
     /// Code for this function.
     #[cfg_attr(
         any(test, feature = "fuzzing"),
-        proptest(strategy = "any_with::<CodeUnit>(params)")
+        proptest(strategy = "any_with::<CodeUnit>(params).prop_map(Some)")
     )]
-    pub code: CodeUnit,
+    pub code: Option<CodeUnit>,
 }
 
 impl FunctionDefinition {
     /// Returns whether the FunctionDefinition is public.
     pub fn is_public(&self) -> bool {
-        self.flags & CodeUnit::PUBLIC != 0
+        self.is_public
     }
     /// Returns whether the FunctionDefinition is native.
     pub fn is_native(&self) -> bool {
-        self.flags & CodeUnit::NATIVE != 0
+        self.code.is_none()
     }
+
+    /// Function can be invoked outside of its declaring module.
+    pub const PUBLIC: u8 = 0x1;
+    /// A native function implemented in Rust.
+    pub const NATIVE: u8 = 0x2;
 }
 
 // Signature
@@ -379,11 +430,9 @@ impl FunctionDefinition {
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct TypeSignature(pub SignatureToken);
 
-/// A `FunctionSignature` describes the types of a function.
-///
-/// The `FunctionSignature` is polymorphic: it can have type parameters in the argument and return
-/// types and carries kind constraints for those type parameters (empty list for non-generic
-/// functions).
+// TODO: remove at some point or move it in the front end (language/compiler)
+/// A `FunctionSignature` in internally used to create a unique representation of the overall
+/// signature as need. Consider deprecated...
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
@@ -393,25 +442,25 @@ pub struct FunctionSignature {
         any(test, feature = "fuzzing"),
         proptest(strategy = "vec(any::<SignatureToken>(), 0..=params)")
     )]
-    pub return_types: Vec<SignatureToken>,
+    pub return_: Vec<SignatureToken>,
     /// The list of arguments to the function.
     #[cfg_attr(
         any(test, feature = "fuzzing"),
         proptest(strategy = "vec(any::<SignatureToken>(), 0..=params)")
     )]
-    pub arg_types: Vec<SignatureToken>,
+    pub parameters: Vec<SignatureToken>,
     /// The type formals (identified by their index into the vec) and their kind constraints
-    pub type_formals: Vec<Kind>,
+    pub type_parameters: Vec<Kind>,
 }
 
-/// A `LocalsSignature` is the list of locals used by a function.
+/// A `Signature` is the list of locals used by a function.
 ///
 /// Locals include the arguments to the function from position `0` to argument `count - 1`.
 /// The remaining elements are the type of each local.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
-pub struct LocalsSignature(
+pub struct Signature(
     #[cfg_attr(
         any(test, feature = "fuzzing"),
         proptest(strategy = "vec(any::<SignatureToken>(), 0..=params)")
@@ -419,8 +468,8 @@ pub struct LocalsSignature(
     pub Vec<SignatureToken>,
 );
 
-impl LocalsSignature {
-    /// Length of the `LocalsSignature`.
+impl Signature {
+    /// Length of the `Signature`.
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
@@ -434,28 +483,28 @@ impl LocalsSignature {
 }
 
 /// Type parameters are encoded as indices. This index can also be used to lookup the kind of a
-/// type parameter in the `FunctionSignature/Handle` and `StructHandle`.
+/// type parameter in the `FunctionHandle` and `StructHandle`.
 pub type TypeParameterIndex = u16;
 
 /// A `Kind` classifies types into sets with rules each set must follow.
 ///
-/// Currently there are three kinds in Move: `All`, `Resource` and `Unrestricted`.
+/// Currently there are three kinds in Move: `All`, `Resource` and `Copyable`.
 #[derive(Debug, Clone, Eq, Copy, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub enum Kind {
     /// Represents the super set of all types. The type might actually be a `Resource` or
-    /// `Unrestricted` A type might be in this set if it is not known to be a `Resource` or
-    /// `Unrestricted`
+    /// `Copyable` A type might be in this set if it is not known to be a `Resource` or
+    /// `Copyable`
     ///   - This occurs when there is a type parameter with this kind as a constraint
     All,
     /// `Resource` types must follow move semantics and various resource safety rules, namely:
     /// - `Resource` values cannot be copied
     /// - `Resource` values cannot be popped, i.e. they must be used
     Resource,
-    /// `Unrestricted` types do not need to follow the `Resource` rules.
-    /// - `Unrestricted` values can be copied
-    /// - `Unrestricted` values can be popped
-    Unrestricted,
+    /// `Copyable` types do not need to follow the `Resource` rules.
+    /// - `Copyable` values can be copied
+    /// - `Copyable` values can be popped
+    Copyable,
 }
 
 impl Kind {
@@ -464,19 +513,16 @@ impl Kind {
     pub fn is_sub_kind_of(self, k: Kind) -> bool {
         use Kind::*;
 
-        match (self, k) {
-            (_, All) | (Resource, Resource) | (Unrestricted, Unrestricted) => true,
-            _ => false,
-        }
+        matches!((self, k), (_, All) | (Resource, Resource) | (Copyable, Copyable))
     }
 
     /// Helper function to determine the kind of a struct instance by taking the kind of a type
-    /// actual and join it with the existing partial result.
-    pub fn join(self, other: &Kind) -> Kind {
+    /// argument and join it with the existing partial result.
+    pub fn join(self, other: Kind) -> Kind {
         match (self, other) {
             (Kind::All, _) | (_, Kind::All) => Kind::All,
             (Kind::Resource, _) | (_, Kind::Resource) => Kind::Resource,
-            (Kind::Unrestricted, Kind::Unrestricted) => Kind::Unrestricted,
+            (Kind::Copyable, Kind::Copyable) => Kind::Copyable,
         }
     }
 }
@@ -498,18 +544,55 @@ pub enum SignatureToken {
     U64,
     /// Unsigned integers, 128 bits length.
     U128,
-    /// ByteArray, variable size, immutable byte array.
-    ByteArray,
-    /// Address, a 32 bytes immutable type.
+    /// Address, a 16 bytes immutable type.
     Address,
-    /// MOVE user type, resource or unrestricted
-    Struct(StructHandleIndex, Vec<SignatureToken>),
+    /// Signer, a 16 bytes immutable type representing the capability to publish at an address
+    Signer,
+    /// Vector
+    Vector(Box<SignatureToken>),
+    /// MOVE user type, resource or copyable
+    Struct(StructHandleIndex),
+    StructInstantiation(StructHandleIndex, Vec<SignatureToken>),
     /// Reference to a type.
     Reference(Box<SignatureToken>),
     /// Mutable reference to a type.
     MutableReference(Box<SignatureToken>),
     /// Type parameter.
     TypeParameter(TypeParameterIndex),
+}
+
+/// An iterator to help traverse the `SignatureToken` in a non-recursive fashion to avoid
+/// overflowing the stack.
+///
+/// Traversal order: root -> left -> right
+pub struct SignatureTokenPreorderTraversalIter<'a> {
+    stack: Vec<&'a SignatureToken>,
+}
+
+impl<'a> Iterator for SignatureTokenPreorderTraversalIter<'a> {
+    type Item = &'a SignatureToken;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use SignatureToken::*;
+
+        match self.stack.pop() {
+            Some(tok) => {
+                match tok {
+                    Reference(inner_tok) | MutableReference(inner_tok) | Vector(inner_tok) => {
+                        self.stack.push(inner_tok)
+                    }
+
+                    StructInstantiation(_, inner_toks) => {
+                        self.stack.extend(inner_toks.iter().rev())
+                    }
+
+                    Signer | Bool | Address | U8 | U64 | U128 | Struct(_) | TypeParameter(_) => (),
+                }
+                Some(tok)
+            }
+            None => None,
+        }
+    }
 }
 
 /// `Arbitrary` for `SignatureToken` cannot be derived automatically as it's a recursive type.
@@ -523,11 +606,11 @@ impl Arbitrary for SignatureToken {
 
         let leaf = prop_oneof![
             Just(Bool),
+            Just(U8),
             Just(U64),
-            Just(ByteArray),
+            Just(U128),
             Just(Address),
-            // TODO: generate type actuals when generics is implemented
-            any::<StructHandleIndex>().prop_map(|sh_idx| Struct(sh_idx, vec![])),
+            any::<StructHandleIndex>().prop_map(Struct),
             any::<TypeParameterIndex>().prop_map(TypeParameter),
         ];
         leaf.prop_recursive(
@@ -536,6 +619,7 @@ impl Arbitrary for SignatureToken {
             1,  // items per collection
             |inner| {
                 prop_oneof![
+                    inner.clone().prop_map(|token| Vector(Box::new(token))),
                     inner.clone().prop_map(|token| Reference(Box::new(token))),
                     inner.prop_map(|token| MutableReference(Box::new(token))),
                 ]
@@ -545,16 +629,20 @@ impl Arbitrary for SignatureToken {
     }
 }
 
-impl ::std::fmt::Debug for SignatureToken {
+impl std::fmt::Debug for SignatureToken {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
         match self {
             SignatureToken::Bool => write!(f, "Bool"),
             SignatureToken::U8 => write!(f, "U8"),
             SignatureToken::U64 => write!(f, "U64"),
             SignatureToken::U128 => write!(f, "U128"),
-            SignatureToken::ByteArray => write!(f, "ByteArray"),
             SignatureToken::Address => write!(f, "Address"),
-            SignatureToken::Struct(idx, types) => write!(f, "Struct({:?}, {:?})", idx, types),
+            SignatureToken::Signer => write!(f, "Signer"),
+            SignatureToken::Vector(boxed) => write!(f, "Vector({:?})", boxed),
+            SignatureToken::Struct(idx) => write!(f, "Struct({:?})", idx),
+            SignatureToken::StructInstantiation(idx, types) => {
+                write!(f, "StructInstantiation({:?}, {:?})", idx, types)
+            }
             SignatureToken::Reference(boxed) => write!(f, "Reference({:?})", boxed),
             SignatureToken::MutableReference(boxed) => write!(f, "MutableReference({:?})", boxed),
             SignatureToken::TypeParameter(idx) => write!(f, "TypeParameter({:?})", idx),
@@ -563,38 +651,6 @@ impl ::std::fmt::Debug for SignatureToken {
 }
 
 impl SignatureToken {
-    /// If a `SignatureToken` is a reference it returns the underlying type of the reference (e.g.
-    /// U64 for &U64).
-    #[inline]
-    pub fn get_struct_handle_from_reference(
-        reference_signature: &SignatureToken,
-    ) -> Option<StructHandleIndex> {
-        match reference_signature {
-            SignatureToken::Reference(signature) => match **signature {
-                SignatureToken::Struct(idx, _) => Some(idx),
-                _ => None,
-            },
-            SignatureToken::MutableReference(signature) => match **signature {
-                SignatureToken::Struct(idx, _) => Some(idx),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// Returns the type actuals if the signature token is a reference to a struct instance.
-    pub fn get_type_actuals_from_reference(&self) -> Option<&[SignatureToken]> {
-        use SignatureToken::*;
-
-        match self {
-            Reference(box_) | MutableReference(box_) => match &**box_ {
-                Struct(_, tys) => Some(&tys),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
     /// Returns the "value kind" for the `SignatureToken`
     #[inline]
     pub fn signature_token_kind(&self) -> SignatureTokenKind {
@@ -605,34 +661,18 @@ impl SignatureToken {
         match self {
             Reference(_) => SignatureTokenKind::Reference,
             MutableReference(_) => SignatureTokenKind::MutableReference,
-            Bool | U8 | U64 | U128 | ByteArray | Address | Struct(_, _) => {
-                SignatureTokenKind::Value
-            }
+            Bool
+            | U8
+            | U64
+            | U128
+            | Address
+            | Signer
+            | Struct(_)
+            | StructInstantiation(_, _)
+            | Vector(_) => SignatureTokenKind::Value,
             // TODO: This is a temporary hack to please the verifier. SignatureTokenKind will soon
             // be completely removed. `SignatureTokenView::kind()` should be used instead.
             TypeParameter(_) => SignatureTokenKind::Value,
-        }
-    }
-
-    /// Returns the `StructHandleIndex` for a `SignatureToken` that contains a reference to a user
-    /// defined type (a resource or unrestricted type).
-    #[inline]
-    pub fn struct_index(&self) -> Option<StructHandleIndex> {
-        use SignatureToken::*;
-
-        match self {
-            Struct(sh_idx, _) => Some(*sh_idx),
-            Reference(token) | MutableReference(token) => token.struct_index(),
-            Bool | U8 | U64 | U128 | ByteArray | Address | TypeParameter(_) => None,
-        }
-    }
-
-    /// Returns `true` if the `SignatureToken` is a primitive type.
-    pub fn is_primitive(&self) -> bool {
-        use SignatureToken::*;
-        match self {
-            Bool | U8 | U64 | U128 | ByteArray | Address => true,
-            Struct(_, _) | Reference(_) | MutableReference(_) | TypeParameter(_) => false,
         }
     }
 
@@ -642,29 +682,14 @@ impl SignatureToken {
         match self {
             U8 | U64 | U128 => true,
             Bool
-            | ByteArray
             | Address
-            | Struct(_, _)
+            | Signer
+            | Vector(_)
+            | Struct(_)
+            | StructInstantiation(_, _)
             | Reference(_)
             | MutableReference(_)
             | TypeParameter(_) => false,
-        }
-    }
-
-    /// Checks if the signature token is usable for Eq and Neq.
-    ///
-    /// Currently equality operations are only allowed on:
-    /// - Bool
-    /// - U64
-    /// - ByteArray
-    /// - Address
-    /// - Reference or Mutable reference to these types
-    pub fn allows_equality(&self) -> bool {
-        use SignatureToken::*;
-        match self {
-            Struct(_, _) => false,
-            Reference(token) | MutableReference(token) => token.is_primitive(),
-            token => token.is_primitive(),
         }
     }
 
@@ -672,20 +697,14 @@ impl SignatureToken {
     pub fn is_reference(&self) -> bool {
         use SignatureToken::*;
 
-        match self {
-            Reference(_) | MutableReference(_) => true,
-            _ => false,
-        }
+        matches!(self, Reference(_) | MutableReference(_))
     }
 
     /// Returns true if the `SignatureToken` is a mutable reference.
     pub fn is_mutable_reference(&self) -> bool {
         use SignatureToken::*;
 
-        match self {
-            MutableReference(_) => true,
-            _ => false,
-        }
+        matches!(self, MutableReference(_))
     }
 
     /// Set the index to this one. Useful for random testing.
@@ -693,7 +712,7 @@ impl SignatureToken {
     /// Panics if this token doesn't contain a struct handle.
     pub fn debug_set_sh_idx(&mut self, sh_idx: StructHandleIndex) {
         match self {
-            SignatureToken::Struct(ref mut wrapped, _) => *wrapped = sh_idx,
+            SignatureToken::Struct(ref mut wrapped) => *wrapped = sh_idx,
             SignatureToken::Reference(ref mut token)
             | SignatureToken::MutableReference(ref mut token) => token.debug_set_sh_idx(sh_idx),
             other => panic!(
@@ -703,73 +722,17 @@ impl SignatureToken {
         }
     }
 
-    /// Creating a new type by Substituting the type variables with type actuals.
-    pub fn substitute(&self, tys: &[SignatureToken]) -> SignatureToken {
-        use SignatureToken::*;
-
-        match self {
-            Bool => Bool,
-            U8 => U8,
-            U64 => U64,
-            U128 => U128,
-            ByteArray => ByteArray,
-            Address => Address,
-            Struct(idx, actuals) => Struct(
-                *idx,
-                actuals
-                    .iter()
-                    .map(|ty| ty.substitute(tys))
-                    .collect::<Vec<_>>(),
-            ),
-            Reference(ty) => Reference(Box::new(ty.substitute(tys))),
-            MutableReference(ty) => MutableReference(Box::new(ty.substitute(tys))),
-            TypeParameter(idx) => tys[*idx as usize].clone(),
-        }
+    pub fn preorder_traversal(&self) -> SignatureTokenPreorderTraversalIter<'_> {
+        SignatureTokenPreorderTraversalIter { stack: vec![self] }
     }
+}
 
-    /// Returns the kind of the signature token in the given context (module, function/struct).
-    /// The context is needed to determine the kinds of structs & type variables.
-    pub fn kind(
-        (struct_handles, type_formals): (&[StructHandle], &[Kind]),
-        ty: &SignatureToken,
-    ) -> Kind {
-        use SignatureToken::*;
-
-        match ty {
-            // The primitive types & references have kind unrestricted.
-            Bool | U8 | U64 | U128 | ByteArray | Address | Reference(_) | MutableReference(_) => {
-                Kind::Unrestricted
-            }
-
-            // To get the kind of a type parameter, we lookup its constraint in the formals.
-            TypeParameter(idx) => type_formals[*idx as usize],
-
-            Struct(idx, tys) => {
-                // Get the struct handle at idx. Note the index could be out of bounds.
-                let sh = &struct_handles[idx.0 as usize];
-
-                if sh.is_nominal_resource {
-                    return Kind::Resource;
-                }
-
-                // Gather the kinds of the type actuals.
-                let kinds = tys
-                    .iter()
-                    .map(|ty| Self::kind((struct_handles, type_formals), ty))
-                    .collect::<Vec<_>>();
-
-                // Derive the kind of the struct.
-                //   - If any of the type actuals is `all`, then the struct is `all`.
-                //     - `all` means some part of the type can be either `resource` or
-                //       `unrestricted`.
-                //     - Therefore it is also impossible to determine the kind of the type as a
-                //       whole, and thus `all`.
-                //   - If none of the type actuals is `all`, then the struct is a resource if
-                //     and only if one of the type actuals is `resource`.
-                kinds.iter().fold(Kind::Unrestricted, Kind::join)
-            }
-        }
-    }
+/// A `Constant` is a serialized value along with it's type. That type will be deserialized by the
+/// loader/evauluator
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct Constant {
+    pub type_: SignatureToken,
+    pub data: Vec<u8>,
 }
 
 /// A `CodeUnit` is the body of a function. It has the function header and the instruction stream.
@@ -777,24 +740,14 @@ impl SignatureToken {
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
 pub struct CodeUnit {
-    /// Max stack size for the function - currently unused.
-    pub max_stack_size: u16,
     /// List of locals type. All locals are typed.
-    pub locals: LocalsSignatureIndex,
+    pub locals: SignatureIndex,
     /// Code stream, function body.
     #[cfg_attr(
         any(test, feature = "fuzzing"),
         proptest(strategy = "vec(any::<Bytecode>(), 0..=params)")
     )]
     pub code: Vec<Bytecode>,
-}
-
-/// Flags for `FunctionDeclaration`.
-impl CodeUnit {
-    /// Function can be invoked outside of its declaring module.
-    pub const PUBLIC: u8 = 0x1;
-    /// A native function implemented in Rust.
-    pub const NATIVE: u8 = 0x2;
 }
 
 /// `Bytecode` is a VM instruction of variable size. The type of the bytecode (opcode) defines
@@ -808,7 +761,7 @@ impl CodeUnit {
 #[num_variants = "NUM_INSTRUCTIONS"]
 pub enum Bytecode {
     /// Pop and discard the value at the top of the stack.
-    /// The value on the stack must be an unrestricted type.
+    /// The value on the stack must be an copyable type.
     ///
     /// Stack transition:
     ///
@@ -878,20 +831,13 @@ pub enum Bytecode {
     ///
     /// ```..., integer_value -> ..., u128_value```
     CastU128,
-    /// Push a `ByteArray` literal onto the stack. The `ByteArray` is loaded from the
-    /// `ByteArrayPool` via `ByteArrayPoolIndex`.
+    /// Push a `Constant` onto the stack. The value is loaded and deserialized (according to it's
+    /// type) from the the `ConstantPool` via `ConstantPoolIndex`
     ///
     /// Stack transition:
     ///
-    /// ```... -> ..., bytearray_value```
-    LdByteArray(ByteArrayPoolIndex),
-    /// Push an 'Address' literal onto the stack. The address is loaded from the
-    /// `AddressPool` via `AddressPoolIndex`.
-    ///
-    /// Stack transition:
-    ///
-    /// ```... -> ..., address_value```
-    LdAddr(AddressPoolIndex),
+    /// ```... -> ..., value```
+    LdConst(ConstantPoolIndex),
     /// Push `true` onto the stack.
     ///
     /// Stack transition:
@@ -934,7 +880,8 @@ pub enum Bytecode {
     ///
     /// ```..., arg(1), arg(2), ...,  arg(n) -> ..., return_value(1), return_value(2), ...,
     /// return_value(k)```
-    Call(FunctionHandleIndex, LocalsSignatureIndex),
+    Call(FunctionHandleIndex),
+    CallGeneric(FunctionInstantiationIndex),
     /// Create an instance of the type specified via `StructHandleIndex` and push it on the stack.
     /// The values of the fields of the struct, in the order they appear in the struct declaration,
     /// must be pushed on the stack. All fields must be provided.
@@ -944,7 +891,8 @@ pub enum Bytecode {
     /// Stack transition:
     ///
     /// ```..., field(1)_value, field(2)_value, ..., field(n)_value -> ..., instance_value```
-    Pack(StructDefinitionIndex, LocalsSignatureIndex),
+    Pack(StructDefinitionIndex),
+    PackGeneric(StructDefInstantiationIndex),
     /// Destroy an instance of a type and push the values bound to each field on the
     /// stack.
     ///
@@ -957,7 +905,8 @@ pub enum Bytecode {
     /// Stack transition:
     ///
     /// ```..., instance_value -> ..., field(1)_value, field(2)_value, ..., field(n)_value```
-    Unpack(StructDefinitionIndex, LocalsSignatureIndex),
+    Unpack(StructDefinitionIndex),
+    UnpackGeneric(StructDefInstantiationIndex),
     /// Read a reference. The reference is on the stack, it is consumed and the value read is
     /// pushed on the stack.
     ///
@@ -971,7 +920,7 @@ pub enum Bytecode {
     /// Write to a reference. The reference and the value are on the stack and are consumed.
     ///
     ///
-    /// The reference must be to an unrestricted type because Resources cannot be overwritten.
+    /// The reference must be to an copyable type because Resources cannot be overwritten.
     ///
     /// Stack transition:
     ///
@@ -999,21 +948,36 @@ pub enum Bytecode {
     ///
     /// ```... -> ..., reference```
     ImmBorrowLoc(LocalIndex),
-    /// Load a mutable reference to a field identified by `FieldDefinitionIndex`.
+    /// Load a mutable reference to a field identified by `FieldHandleIndex`.
     /// The top of the stack must be a mutable reference to a type that contains the field
     /// definition.
     ///
     /// Stack transition:
     ///
     /// ```..., reference -> ..., field_reference```
-    MutBorrowField(FieldDefinitionIndex),
-    /// Load an immutable reference to a field identified by `FieldDefinitionIndex`.
+    MutBorrowField(FieldHandleIndex),
+    /// Load a mutable reference to a field identified by `FieldInstantiationIndex`.
+    /// The top of the stack must be a mutable reference to a type that contains the field
+    /// definition.
+    ///
+    /// Stack transition:
+    ///
+    /// ```..., reference -> ..., field_reference```
+    MutBorrowFieldGeneric(FieldInstantiationIndex),
+    /// Load an immutable reference to a field identified by `FieldHandleIndex`.
     /// The top of the stack must be a reference to a type that contains the field definition.
     ///
     /// Stack transition:
     ///
     /// ```..., reference -> ..., field_reference```
-    ImmBorrowField(FieldDefinitionIndex),
+    ImmBorrowField(FieldHandleIndex),
+    /// Load an immutable reference to a field identified by `FieldInstantiationIndex`.
+    /// The top of the stack must be a reference to a type that contains the field definition.
+    ///
+    /// Stack transition:
+    ///
+    /// ```..., reference -> ..., field_reference```
+    ImmBorrowFieldGeneric(FieldInstantiationIndex),
     /// Return a mutable reference to an instance of type `StructDefinitionIndex` published at the
     /// address passed as argument. Abort execution if such an object does not exist or if a
     /// reference has already been handed out.
@@ -1021,7 +985,8 @@ pub enum Bytecode {
     /// Stack transition:
     ///
     /// ```..., address_value -> ..., reference_value```
-    MutBorrowGlobal(StructDefinitionIndex, LocalsSignatureIndex),
+    MutBorrowGlobal(StructDefinitionIndex),
+    MutBorrowGlobalGeneric(StructDefInstantiationIndex),
     /// Return an immutable reference to an instance of type `StructDefinitionIndex` published at
     /// the address passed as argument. Abort execution if such an object does not exist or if a
     /// reference has already been handed out.
@@ -1029,7 +994,8 @@ pub enum Bytecode {
     /// Stack transition:
     ///
     /// ```..., address_value -> ..., reference_value```
-    ImmBorrowGlobal(StructDefinitionIndex, LocalsSignatureIndex),
+    ImmBorrowGlobal(StructDefinitionIndex),
+    ImmBorrowGlobalGeneric(StructDefInstantiationIndex),
     /// Add the 2 u64 at the top of the stack and pushes the result on the stack.
     /// The operation aborts the transaction in case of overflow.
     ///
@@ -1152,25 +1118,6 @@ pub enum Bytecode {
     ///
     /// ```..., errorcode -> ...```
     Abort,
-    /// Get gas unit price from the transaction and pushes it on the stack.
-    ///
-    /// Stack transition:
-    ///
-    /// ```... -> ..., u64_value```
-    GetTxnGasUnitPrice,
-    /// Get max gas units set in the transaction and pushes it on the stack.
-    ///
-    /// Stack transition:
-    ///
-    /// ```... -> ..., u64_value```
-    GetTxnMaxGasUnits,
-    /// Get remaining gas for the given transaction at the point of execution of this bytecode.
-    /// The result is pushed on the stack.
-    ///
-    /// Stack transition:
-    ///
-    /// ```... -> ..., u64_value```
-    GetGasRemaining,
     /// Get the sender address from the transaction and pushes it on the stack.
     ///
     /// Stack transition:
@@ -1183,33 +1130,33 @@ pub enum Bytecode {
     /// Stack transition:
     ///
     /// ```..., address_value -> ..., bool_value```
-    Exists(StructDefinitionIndex, LocalsSignatureIndex),
+    Exists(StructDefinitionIndex),
+    ExistsGeneric(StructDefInstantiationIndex),
     /// Move the instance of type StructDefinitionIndex, at the address at the top of the stack.
     /// Abort execution if such an object does not exist.
     ///
     /// Stack transition:
     ///
     /// ```..., address_value -> ..., value```
-    MoveFrom(StructDefinitionIndex, LocalsSignatureIndex),
+    MoveFrom(StructDefinitionIndex),
+    MoveFromGeneric(StructDefInstantiationIndex),
     /// Move the instance at the top of the stack to the address of the sender.
     /// Abort execution if an object of type StructDefinitionIndex already exists in address.
     ///
     /// Stack transition:
     ///
     /// ```..., value -> ...```
-    MoveToSender(StructDefinitionIndex, LocalsSignatureIndex),
-    /// Get the sequence number submitted with the transaction and pushes it on the stack.
+    MoveToSender(StructDefinitionIndex),
+    MoveToSenderGeneric(StructDefInstantiationIndex),
+    /// Move the instance at the top of the stack to the address of the `Signer` on the stack below
+    /// it
+    /// Abort execution if an object of type StructDefinitionIndex already exists in address.
     ///
     /// Stack transition:
     ///
-    /// ```... -> ..., u64_value```
-    GetTxnSequenceNumber,
-    /// Get the public key of the sender from the transaction and pushes it on the stack.
-    ///
-    /// Stack transition:
-    ///
-    /// ```..., -> ..., bytearray_value```
-    GetTxnPublicKey,
+    /// ```..., signer_value, value -> ...```
+    MoveTo(StructDefinitionIndex),
+    MoveToGeneric(StructDefInstantiationIndex),
     /// Shift the (second top value) left (top value) bits and pushes the result on the stack.
     ///
     /// Stack transition:
@@ -1222,6 +1169,10 @@ pub enum Bytecode {
     ///
     /// ```..., u64_value(1), u64_value(2) -> ..., u64_value```
     Shr,
+    /// No operation.
+    ///
+    /// Stack transition: none
+    Nop,
 }
 
 pub const NUMBER_OF_NATIVE_FUNCTIONS: usize = 17;
@@ -1240,25 +1191,31 @@ impl ::std::fmt::Debug for Bytecode {
             Bytecode::CastU8 => write!(f, "CastU8"),
             Bytecode::CastU64 => write!(f, "CastU64"),
             Bytecode::CastU128 => write!(f, "CastU128"),
-            Bytecode::LdByteArray(a) => write!(f, "LdByteArray({})", a),
-            Bytecode::LdAddr(a) => write!(f, "LdAddr({})", a),
+            Bytecode::LdConst(a) => write!(f, "LdConst({})", a),
             Bytecode::LdTrue => write!(f, "LdTrue"),
             Bytecode::LdFalse => write!(f, "LdFalse"),
             Bytecode::CopyLoc(a) => write!(f, "CopyLoc({})", a),
             Bytecode::MoveLoc(a) => write!(f, "MoveLoc({})", a),
             Bytecode::StLoc(a) => write!(f, "StLoc({})", a),
-            Bytecode::Call(a, b) => write!(f, "Call({}, {:?})", a, b),
-            Bytecode::Pack(a, b) => write!(f, "Pack({}, {:?})", a, b),
-            Bytecode::Unpack(a, b) => write!(f, "Unpack({}, {:?})", a, b),
+            Bytecode::Call(a) => write!(f, "Call({})", a),
+            Bytecode::CallGeneric(a) => write!(f, "CallGeneric({})", a),
+            Bytecode::Pack(a) => write!(f, "Pack({})", a),
+            Bytecode::PackGeneric(a) => write!(f, "PackGeneric({})", a),
+            Bytecode::Unpack(a) => write!(f, "Unpack({})", a),
+            Bytecode::UnpackGeneric(a) => write!(f, "UnpackGeneric({})", a),
             Bytecode::ReadRef => write!(f, "ReadRef"),
             Bytecode::WriteRef => write!(f, "WriteRef"),
             Bytecode::FreezeRef => write!(f, "FreezeRef"),
             Bytecode::MutBorrowLoc(a) => write!(f, "MutBorrowLoc({})", a),
             Bytecode::ImmBorrowLoc(a) => write!(f, "ImmBorrowLoc({})", a),
-            Bytecode::MutBorrowField(a) => write!(f, "MutBorrowField({})", a),
-            Bytecode::ImmBorrowField(a) => write!(f, "ImmBorrowField({})", a),
-            Bytecode::MutBorrowGlobal(a, b) => write!(f, "MutBorrowGlobal({}, {:?})", a, b),
-            Bytecode::ImmBorrowGlobal(a, b) => write!(f, "ImmBorrowGlobal({}, {:?})", a, b),
+            Bytecode::MutBorrowField(a) => write!(f, "MutBorrowField({:?})", a),
+            Bytecode::MutBorrowFieldGeneric(a) => write!(f, "MutBorrowFieldGeneric({:?})", a),
+            Bytecode::ImmBorrowField(a) => write!(f, "ImmBorrowField({:?})", a),
+            Bytecode::ImmBorrowFieldGeneric(a) => write!(f, "ImmBorrowFieldGeneric({:?})", a),
+            Bytecode::MutBorrowGlobal(a) => write!(f, "MutBorrowGlobal({:?})", a),
+            Bytecode::MutBorrowGlobalGeneric(a) => write!(f, "MutBorrowGlobalGeneric({:?})", a),
+            Bytecode::ImmBorrowGlobal(a) => write!(f, "ImmBorrowGlobal({:?})", a),
+            Bytecode::ImmBorrowGlobalGeneric(a) => write!(f, "ImmBorrowGlobalGeneric({:?})", a),
             Bytecode::Add => write!(f, "Add"),
             Bytecode::Sub => write!(f, "Sub"),
             Bytecode::Mul => write!(f, "Mul"),
@@ -1279,15 +1236,16 @@ impl ::std::fmt::Debug for Bytecode {
             Bytecode::Le => write!(f, "Le"),
             Bytecode::Ge => write!(f, "Ge"),
             Bytecode::Abort => write!(f, "Abort"),
-            Bytecode::GetTxnGasUnitPrice => write!(f, "GetTxnGasUnitPrice"),
-            Bytecode::GetTxnMaxGasUnits => write!(f, "GetTxnMaxGasUnits"),
-            Bytecode::GetGasRemaining => write!(f, "GetGasRemaining"),
             Bytecode::GetTxnSenderAddress => write!(f, "GetTxnSenderAddress"),
-            Bytecode::Exists(a, b) => write!(f, "Exists({}, {:?})", a, b),
-            Bytecode::MoveFrom(a, b) => write!(f, "MoveFrom({}, {:?})", a, b),
-            Bytecode::MoveToSender(a, b) => write!(f, "MoveToSender({}, {:?})", a, b),
-            Bytecode::GetTxnSequenceNumber => write!(f, "GetTxnSequenceNumber"),
-            Bytecode::GetTxnPublicKey => write!(f, "GetTxnPublicKey"),
+            Bytecode::Exists(a) => write!(f, "Exists({:?})", a),
+            Bytecode::ExistsGeneric(a) => write!(f, "ExistsGeneric({:?})", a),
+            Bytecode::MoveFrom(a) => write!(f, "MoveFrom({:?})", a),
+            Bytecode::MoveFromGeneric(a) => write!(f, "MoveFromGeneric({:?})", a),
+            Bytecode::MoveToSender(a) => write!(f, "MoveToSender({:?})", a),
+            Bytecode::MoveToSenderGeneric(a) => write!(f, "MoveToSenderGeneric({:?})", a),
+            Bytecode::MoveTo(a) => write!(f, "MoveTo({:?})", a),
+            Bytecode::MoveToGeneric(a) => write!(f, "MoveToGeneric({:?})", a),
+            Bytecode::Nop => write!(f, "Nop"),
         }
     }
 }
@@ -1295,19 +1253,13 @@ impl ::std::fmt::Debug for Bytecode {
 impl Bytecode {
     /// Return true if this bytecode instruction always branches
     pub fn is_unconditional_branch(&self) -> bool {
-        match self {
-            Bytecode::Ret | Bytecode::Abort | Bytecode::Branch(_) => true,
-            _ => false,
-        }
+        matches!(self, Bytecode::Ret | Bytecode::Abort | Bytecode::Branch(_))
     }
 
     /// Return true if the branching behavior of this bytecode instruction depends on a runtime
     /// value
     pub fn is_conditional_branch(&self) -> bool {
-        match self {
-            Bytecode::BrFalse(_) | Bytecode::BrTrue(_) => true,
-            _ => false,
-        }
+        matches!(self, Bytecode::BrFalse(_) | Bytecode::BrTrue(_))
     }
 
     /// Returns true if this bytecode instruction is either a conditional or an unconditional branch
@@ -1360,23 +1312,6 @@ impl Bytecode {
     }
 }
 
-/// A `CompiledProgram` defines the structure of a transaction to execute.
-/// It has two parts: modules to be published and a transaction script.
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub struct CompiledProgram {
-    /// The modules to be published
-    pub modules: Vec<CompiledModule>,
-    /// The transaction script to execute
-    pub script: CompiledScript,
-}
-
-impl CompiledProgram {
-    /// Creates a new compiled program from compiled modules and script
-    pub fn new(modules: Vec<CompiledModule>, script: CompiledScript) -> Self {
-        CompiledProgram { modules, script }
-    }
-}
-
 // Note that this doesn't derive either `Arbitrary` or `Default` while `CompiledScriptMut` does.
 // That's because a CompiledScript is guaranteed to be valid while a CompiledScriptMut isn't.
 /// Contains the main function to execute and its dependencies.
@@ -1398,23 +1333,23 @@ pub struct CompiledScriptMut {
     /// Handles to external/imported functions.
     pub function_handles: Vec<FunctionHandle>,
 
-    /// Type pool. All external types referenced by the transaction.
-    pub type_signatures: TypeSignaturePool,
-    /// Function signature pool. The signatures of the function referenced by the transaction.
-    pub function_signatures: FunctionSignaturePool,
-    /// Locals signature pool. The signature of the locals in `main`.
-    pub locals_signatures: LocalsSignaturePool,
+    /// Function instantiations.
+    pub function_instantiations: Vec<FunctionInstantiation>,
+
+    pub signatures: SignaturePool,
 
     /// All identifiers used in this transaction.
     pub identifiers: IdentifierPool,
-    /// ByteArray pool. The byte array literals used in the transaction.
-    pub byte_array_pool: ByteArrayPool,
-    /// Address pool. The address literals used in the module. Those include literals for
-    /// code references (`ModuleHandle`).
-    pub address_pool: AddressPool,
+    /// All address identifiers used in this transaction.
+    pub address_identifiers: AddressIdentifierPool,
+    /// Constant pool. The constant values used in the transaction.
+    pub constant_pool: ConstantPool,
 
-    /// The main (script) to execute.
-    pub main: FunctionDefinition,
+    pub type_parameters: Vec<Kind>,
+
+    pub parameters: SignatureIndex,
+
+    pub code: CodeUnit,
 }
 
 impl CompiledScript {
@@ -1437,39 +1372,152 @@ impl CompiledScript {
     ///
     /// If a `CompiledScript` has been bounds checked, the corresponding `CompiledModule` can be
     /// assumed to pass the bounds checker as well.
-    pub fn into_module(self) -> CompiledModule {
-        CompiledModule(self.0.into_module())
+    #[allow(deprecated)]
+    pub fn into_module(self) -> (ScriptConversionInfo, CompiledModule) {
+        let (info, m) = self.0.into_module();
+        (info, CompiledModule(m))
     }
+}
+
+pub struct ScriptConversionInfo {
+    // If a dummy address was added.
+    added_dummy_addr: bool,
+    // If an empty signature was added.
+    added_dummy_sig: bool,
+    // If the <SELF> identifier was added.
+    added_self_ident: bool,
+    // If a self module handle was added.
+    added_self_module_handle: bool,
 }
 
 impl CompiledScriptMut {
     /// Converts this instance into `CompiledScript` after verifying it for basic internal
     /// consistency. This includes bounds checks but no others.
-    pub fn freeze(self) -> Result<CompiledScript, Vec<VMStatus>> {
-        let fake_module = self.into_module();
-        Ok(fake_module.freeze()?.into_script())
+    #[allow(deprecated)]
+    pub fn freeze(self) -> VMResult<CompiledScript> {
+        let (info, fake_module) = self.into_module();
+        Ok(fake_module.freeze()?.into_script(info))
     }
 
     /// Converts a `CompiledScriptMut` to a `CompiledModule` for code that wants a uniform view
     /// of both.
-    pub fn into_module(self) -> CompiledModuleMut {
-        CompiledModuleMut {
+    ///
+    /// This also produces a `ScriptConversionInfo`, which will be required to convert the
+    /// module back into a script.
+    ///
+    /// TODO: rewrite things that depend on this and get this removed.
+    #[deprecated(
+        note = "This function is deprecated and will be removed soon. Please do not introduce new dependencies."
+    )]
+    pub fn into_module(mut self) -> (ScriptConversionInfo, CompiledModuleMut) {
+        // Add the "<SELF>" identifier if it isn't present.
+        //
+        // Note: When adding an element to the table, in theory it is possible for the index
+        // to overflow. This will not be a problem if we get rid of the script/module conversion.
+        let (added_self_ident, self_ident_idx) = match self
+            .identifiers
+            .iter()
+            .position(|ident| ident.as_ident_str() == self_module_name())
+        {
+            Some(idx) => (false, IdentifierIndex::new(idx as u16)),
+            None => {
+                let idx = IdentifierIndex::new(self.identifiers.len() as u16);
+                self.identifiers
+                    .push(Identifier::new(self_module_name().to_string()).unwrap());
+                (true, idx)
+            }
+        };
+
+        // Add a dummy adress if none exists.
+        let dummy_addr = AccountAddress::new([0xff; AccountAddress::LENGTH]);
+        let (added_dummy_addr, dummy_addr_idx) = match self
+            .address_identifiers
+            .iter()
+            .position(|addr| addr == &dummy_addr)
+        {
+            Some(idx) => (false, AddressIdentifierIndex::new(idx as u16)),
+            None => {
+                let idx = AddressIdentifierIndex::new(self.address_identifiers.len() as u16);
+                self.address_identifiers.push(dummy_addr);
+                (true, idx)
+            }
+        };
+
+        // Add a self module handle.
+        let (added_self_module_handle, self_module_handle_idx) =
+            match self.module_handles.iter().position(|handle| {
+                handle.address == dummy_addr_idx && handle.name == self_ident_idx
+            }) {
+                Some(idx) => (false, ModuleHandleIndex::new(idx as u16)),
+                None => {
+                    let idx = ModuleHandleIndex::new(self.module_handles.len() as u16);
+                    self.module_handles.push(ModuleHandle {
+                        address: dummy_addr_idx,
+                        name: self_ident_idx,
+                    });
+                    (true, idx)
+                }
+            };
+
+        // Find the index to the empty signature [].
+        // Create one if it doesn't exist.
+        let (added_dummy_sig, return_sig_idx) =
+            match self.signatures.iter().position(|sig| sig.0.is_empty()) {
+                Some(idx) => (false, SignatureIndex::new(idx as u16)),
+                None => {
+                    let idx = SignatureIndex::new(self.signatures.len() as u16);
+                    self.signatures.push(Signature(vec![]));
+                    (true, idx)
+                }
+            };
+
+        // Create a function handle for the main function.
+        let main_handle_idx = FunctionHandleIndex::new(self.function_handles.len() as u16);
+        self.function_handles.push(FunctionHandle {
+            module: self_module_handle_idx,
+            name: self_ident_idx,
+            parameters: self.parameters,
+            return_: return_sig_idx,
+            type_parameters: self.type_parameters,
+        });
+
+        // Create a function definition for the main function.
+        let main_def = FunctionDefinition {
+            function: main_handle_idx,
+            is_public: true,
+            acquires_global_resources: vec![],
+            code: Some(self.code),
+        };
+
+        let info = ScriptConversionInfo {
+            added_dummy_addr,
+            added_dummy_sig,
+            added_self_ident,
+            added_self_module_handle,
+        };
+
+        let m = CompiledModuleMut {
             module_handles: self.module_handles,
+            self_module_handle_idx,
             struct_handles: self.struct_handles,
             function_handles: self.function_handles,
+            field_handles: vec![],
 
-            type_signatures: self.type_signatures,
-            function_signatures: self.function_signatures,
-            locals_signatures: self.locals_signatures,
+            struct_def_instantiations: vec![],
+            function_instantiations: self.function_instantiations,
+            field_instantiations: vec![],
+
+            signatures: self.signatures,
 
             identifiers: self.identifiers,
-            byte_array_pool: self.byte_array_pool,
-            address_pool: self.address_pool,
+            address_identifiers: self.address_identifiers,
+            constant_pool: self.constant_pool,
 
             struct_defs: vec![],
-            field_defs: vec![],
-            function_defs: vec![self.main],
-        }
+            function_defs: vec![main_def],
+        };
+
+        (info, m)
     }
 }
 
@@ -1486,34 +1534,37 @@ pub struct CompiledModule(CompiledModuleMut);
 /// the bounds checker.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompiledModuleMut {
-    /// Handles to external modules and self at position 0.
+    /// Handles to external modules and self.
     pub module_handles: Vec<ModuleHandle>,
+    /// Handle to self.
+    pub self_module_handle_idx: ModuleHandleIndex,
     /// Handles to external and internal types.
     pub struct_handles: Vec<StructHandle>,
     /// Handles to external and internal functions.
     pub function_handles: Vec<FunctionHandle>,
+    /// Handles to fields.
+    pub field_handles: Vec<FieldHandle>,
 
-    /// Type pool. A definition for all types used in the module.
-    pub type_signatures: TypeSignaturePool,
-    /// Function signature pool. Represents all function signatures defined or used in
-    /// the module.
-    pub function_signatures: FunctionSignaturePool,
+    /// Struct instantiations.
+    pub struct_def_instantiations: Vec<StructDefInstantiation>,
+    /// Function instantiations.
+    pub function_instantiations: Vec<FunctionInstantiation>,
+    /// Field instantiations.
+    pub field_instantiations: Vec<FieldInstantiation>,
+
     /// Locals signature pool. The signature for all locals of the functions defined in
     /// the module.
-    pub locals_signatures: LocalsSignaturePool,
+    pub signatures: SignaturePool,
 
     /// All identifiers used in this module.
     pub identifiers: IdentifierPool,
-    /// ByteArray pool. The byte array literals used in the module.
-    pub byte_array_pool: ByteArrayPool,
-    /// Address pool. The address literals used in the module. Those include literals for
-    /// code references (`ModuleHandle`).
-    pub address_pool: AddressPool,
+    /// All address identifiers used in this module.
+    pub address_identifiers: AddressIdentifierPool,
+    /// Constant pool. The constant values used in the module.
+    pub constant_pool: ConstantPool,
 
     /// Types defined in this module.
     pub struct_defs: Vec<StructDefinition>,
-    /// Fields defined on types in this module.
-    pub field_defs: Vec<FieldDefinition>,
     /// Function defined in this module.
     pub function_defs: Vec<FunctionDefinition>,
 }
@@ -1533,36 +1584,37 @@ impl Arbitrary for CompiledScriptMut {
                 vec(any::<StructHandle>(), 0..=size),
                 vec(any::<FunctionHandle>(), 0..=size),
             ),
-            (
-                vec(any::<TypeSignature>(), 0..=size),
-                vec(any_with::<FunctionSignature>(size), 0..=size),
-                vec(any_with::<LocalsSignature>(size), 0..=size),
-            ),
+            vec(any_with::<Signature>(size), 0..=size),
             (
                 vec(any::<Identifier>(), 0..=size),
-                vec(any::<ByteArray>(), 0..=size),
                 vec(any::<AccountAddress>(), 0..=size),
             ),
-            any_with::<FunctionDefinition>(size),
+            vec(any::<Kind>(), 0..=size),
+            any::<SignatureIndex>(),
+            any::<CodeUnit>(),
         )
             .prop_map(
                 |(
                     (module_handles, struct_handles, function_handles),
-                    (type_signatures, function_signatures, locals_signatures),
-                    (identifiers, byte_array_pool, address_pool),
-                    main,
+                    signatures,
+                    (identifiers, address_identifiers),
+                    type_parameters,
+                    parameters,
+                    code,
                 )| {
+                    // TODO actual constant generation
                     CompiledScriptMut {
                         module_handles,
                         struct_handles,
                         function_handles,
-                        type_signatures,
-                        function_signatures,
-                        locals_signatures,
+                        function_instantiations: vec![],
+                        signatures,
                         identifiers,
-                        byte_array_pool,
-                        address_pool,
-                        main,
+                        address_identifiers,
+                        constant_pool: vec![],
+                        type_parameters,
+                        parameters,
+                        code,
                     }
                 },
             )
@@ -1583,41 +1635,40 @@ impl Arbitrary for CompiledModuleMut {
                 vec(any::<StructHandle>(), 0..=size),
                 vec(any::<FunctionHandle>(), 0..=size),
             ),
-            (
-                vec(any::<TypeSignature>(), 0..=size),
-                vec(any_with::<FunctionSignature>(size), 0..=size),
-                vec(any_with::<LocalsSignature>(size), 0..=size),
-            ),
+            any::<ModuleHandleIndex>(),
+            vec(any_with::<Signature>(size), 0..=size),
             (
                 vec(any::<Identifier>(), 0..=size),
-                vec(any::<ByteArray>(), 0..=size),
                 vec(any::<AccountAddress>(), 0..=size),
             ),
             (
                 vec(any::<StructDefinition>(), 0..=size),
-                vec(any::<FieldDefinition>(), 0..=size),
                 vec(any_with::<FunctionDefinition>(size), 0..=size),
             ),
         )
             .prop_map(
                 |(
                     (module_handles, struct_handles, function_handles),
-                    (type_signatures, function_signatures, locals_signatures),
-                    (identifiers, byte_array_pool, address_pool),
-                    (struct_defs, field_defs, function_defs),
+                    self_module_handle_idx,
+                    signatures,
+                    (identifiers, address_identifiers),
+                    (struct_defs, function_defs),
                 )| {
+                    // TODO actual constant generation
                     CompiledModuleMut {
                         module_handles,
                         struct_handles,
                         function_handles,
-                        type_signatures,
-                        function_signatures,
-                        locals_signatures,
+                        self_module_handle_idx,
+                        field_handles: vec![],
+                        struct_def_instantiations: vec![],
+                        function_instantiations: vec![],
+                        field_instantiations: vec![],
+                        signatures,
                         identifiers,
-                        byte_array_pool,
-                        address_pool,
+                        address_identifiers,
+                        constant_pool: vec![],
                         struct_defs,
-                        field_defs,
                         function_defs,
                     }
                 },
@@ -1633,40 +1684,34 @@ impl CompiledModuleMut {
             IndexKind::ModuleHandle => self.module_handles.len(),
             IndexKind::StructHandle => self.struct_handles.len(),
             IndexKind::FunctionHandle => self.function_handles.len(),
+            IndexKind::FieldHandle => self.field_handles.len(),
+            IndexKind::StructDefInstantiation => self.struct_def_instantiations.len(),
+            IndexKind::FunctionInstantiation => self.function_instantiations.len(),
+            IndexKind::FieldInstantiation => self.field_instantiations.len(),
             IndexKind::StructDefinition => self.struct_defs.len(),
-            IndexKind::FieldDefinition => self.field_defs.len(),
             IndexKind::FunctionDefinition => self.function_defs.len(),
-            IndexKind::TypeSignature => self.type_signatures.len(),
-            IndexKind::FunctionSignature => self.function_signatures.len(),
-            IndexKind::LocalsSignature => self.locals_signatures.len(),
+            IndexKind::Signature => self.signatures.len(),
             IndexKind::Identifier => self.identifiers.len(),
-            IndexKind::ByteArrayPool => self.byte_array_pool.len(),
-            IndexKind::AddressPool => self.address_pool.len(),
+            IndexKind::AddressIdentifier => self.address_identifiers.len(),
+            IndexKind::ConstantPool => self.constant_pool.len(),
             // XXX these two don't seem to belong here
             other @ IndexKind::LocalPool
             | other @ IndexKind::CodeDefinition
-            | other @ IndexKind::TypeParameter => {
-                unreachable!("invalid kind for count: {:?}", other)
-            }
+            | other @ IndexKind::FieldDefinition
+            | other @ IndexKind::TypeParameter
+            | other @ IndexKind::MemberCount => unreachable!("invalid kind for count: {:?}", other),
         }
     }
 
     /// Converts this instance into `CompiledModule` after verifying it for basic internal
     /// consistency. This includes bounds checks but no others.
-    pub fn freeze(self) -> Result<CompiledModule, Vec<VMStatus>> {
-        let errors = BoundsChecker::new(&self).verify();
-        if errors.is_empty() {
-            Ok(CompiledModule(self))
-        } else {
-            Err(errors)
-        }
+    pub fn freeze(self) -> VMResult<CompiledModule> {
+        BoundsChecker::new(&self).verify()?;
+        Ok(CompiledModule(self))
     }
 }
 
 impl CompiledModule {
-    /// By convention, the index of the module being implemented is 0.
-    pub const IMPLEMENTED_MODULE_INDEX: u16 = 0;
-
     /// Returns a reference to the inner `CompiledModuleMut`.
     pub fn as_inner(&self) -> &CompiledModuleMut {
         &self.0
@@ -1680,13 +1725,21 @@ impl CompiledModule {
 
     /// Returns the number of items of a specific `IndexKind`.
     pub fn kind_count(&self, kind: IndexKind) -> usize {
+        precondition!(match kind {
+            IndexKind::LocalPool
+            | IndexKind::CodeDefinition
+            | IndexKind::FieldDefinition
+            | IndexKind::TypeParameter
+            | IndexKind::MemberCount => false,
+            _ => true,
+        });
         self.as_inner().kind_count(kind)
     }
 
     /// Returns the code key of `module_handle`
     pub fn module_id_for_handle(&self, module_handle: &ModuleHandle) -> ModuleId {
         ModuleId::new(
-            *self.address_at(module_handle.address),
+            *self.address_identifier_at(module_handle.address),
             self.identifier_at(module_handle.name).to_owned(),
         )
     }
@@ -1699,23 +1752,44 @@ impl CompiledModule {
     /// This function should only be called on an instance of CompiledModule obtained by invoking
     /// into_module on some instance of CompiledScript. This function is the inverse of
     /// into_module, i.e., script.into_module().into_script() == script.
-    pub fn into_script(self) -> CompiledScript {
+    #[deprecated(
+        note = "This function is deprecated and will be removed soon. Please do not introduce new dependencies."
+    )]
+    pub fn into_script(self, conv_info: ScriptConversionInfo) -> CompiledScript {
         let mut inner = self.into_inner();
-        let main = inner.function_defs.remove(0);
+        precondition!(!inner.function_defs.is_empty());
+        let main = inner.function_defs.pop().unwrap();
+
+        if conv_info.added_dummy_addr {
+            inner.address_identifiers.pop().unwrap();
+        }
+        if conv_info.added_dummy_sig {
+            inner.signatures.pop().unwrap();
+        }
+        if conv_info.added_self_ident {
+            inner.identifiers.pop().unwrap();
+        }
+        if conv_info.added_self_module_handle {
+            inner.module_handles.pop().unwrap();
+        }
+        let main_handle = inner.function_handles.pop().unwrap();
+
         CompiledScript(CompiledScriptMut {
             module_handles: inner.module_handles,
             struct_handles: inner.struct_handles,
             function_handles: inner.function_handles,
 
-            type_signatures: inner.type_signatures,
-            function_signatures: inner.function_signatures,
-            locals_signatures: inner.locals_signatures,
+            function_instantiations: inner.function_instantiations,
+
+            signatures: inner.signatures,
 
             identifiers: inner.identifiers,
-            byte_array_pool: inner.byte_array_pool,
-            address_pool: inner.address_pool,
+            address_identifiers: inner.address_identifiers,
+            constant_pool: inner.constant_pool,
 
-            main,
+            type_parameters: main_handle.type_parameters,
+            parameters: main_handle.parameters,
+            code: main.code.unwrap(),
         })
     }
 }
@@ -1724,20 +1798,22 @@ impl CompiledModule {
 pub fn empty_module() -> CompiledModuleMut {
     CompiledModuleMut {
         module_handles: vec![ModuleHandle {
-            address: AddressPoolIndex::new(0),
-            name: IdentifierIndex::new(0),
+            address: AddressIdentifierIndex(0),
+            name: IdentifierIndex(0),
         }],
-        address_pool: vec![AccountAddress::default()],
+        self_module_handle_idx: ModuleHandleIndex(0),
         identifiers: vec![self_module_name().to_owned()],
+        address_identifiers: vec![AccountAddress::default()],
+        constant_pool: vec![],
         function_defs: vec![],
         struct_defs: vec![],
-        field_defs: vec![],
         struct_handles: vec![],
         function_handles: vec![],
-        type_signatures: vec![],
-        function_signatures: vec![],
-        locals_signatures: vec![LocalsSignature(vec![])],
-        byte_array_pool: vec![],
+        field_handles: vec![],
+        struct_def_instantiations: vec![],
+        function_instantiations: vec![],
+        field_instantiations: vec![],
+        signatures: vec![Signature(vec![])],
     }
 }
 
@@ -1751,57 +1827,44 @@ pub fn empty_module() -> CompiledModuleMut {
 pub fn basic_test_module() -> CompiledModuleMut {
     let mut m = empty_module();
 
-    m.function_signatures.push(FunctionSignature {
-        return_types: vec![],
-        arg_types: vec![],
-        type_formals: vec![],
-    });
-
     m.function_handles.push(FunctionHandle {
-        module: ModuleHandleIndex::new(0),
-        name: IdentifierIndex::new(m.identifiers.len() as u16),
-        signature: FunctionSignatureIndex::new(0),
+        module: ModuleHandleIndex(0),
+        name: IdentifierIndex(m.identifiers.len() as u16),
+        parameters: SignatureIndex(0),
+        return_: SignatureIndex(0),
+        type_parameters: vec![],
     });
     m.identifiers
         .push(Identifier::new("foo".to_string()).unwrap());
 
     m.function_defs.push(FunctionDefinition {
-        function: FunctionHandleIndex::new(0),
-        flags: 0,
+        function: FunctionHandleIndex(0),
+        is_public: false,
         acquires_global_resources: vec![],
-        code: CodeUnit {
-            max_stack_size: 0,
-            locals: LocalsSignatureIndex::new(0),
+        code: Some(CodeUnit {
+            locals: SignatureIndex(0),
             code: vec![],
-        },
+        }),
     });
 
     m.struct_handles.push(StructHandle {
-        module: ModuleHandleIndex::new(0),
-        name: IdentifierIndex::new(m.identifiers.len() as u16),
+        module: ModuleHandleIndex(0),
+        name: IdentifierIndex(m.identifiers.len() as u16),
         is_nominal_resource: false,
-        type_formals: vec![],
+        type_parameters: vec![],
     });
     m.identifiers
         .push(Identifier::new("Bar".to_string()).unwrap());
 
     m.struct_defs.push(StructDefinition {
-        struct_handle: StructHandleIndex::new(0),
-        field_information: StructFieldInformation::Declared {
-            field_count: 1,
-            fields: FieldDefinitionIndex::new(0),
-        },
-    });
-
-    m.field_defs.push(FieldDefinition {
-        struct_: StructHandleIndex::new(0),
-        name: IdentifierIndex::new(m.identifiers.len() as u16),
-        signature: TypeSignatureIndex::new(0),
+        struct_handle: StructHandleIndex(0),
+        field_information: StructFieldInformation::Declared(vec![FieldDefinition {
+            name: IdentifierIndex(m.identifiers.len() as u16),
+            signature: TypeSignature(SignatureToken::U64),
+        }]),
     });
     m.identifiers
         .push(Identifier::new("x".to_string()).unwrap());
-
-    m.type_signatures.push(TypeSignature(SignatureToken::U64));
 
     m
 }
@@ -1812,17 +1875,14 @@ pub fn dummy_procedure_module(code: Vec<Bytecode>) -> CompiledModule {
     let mut code_unit = CodeUnit::default();
     code_unit.code = code;
     let mut fun_def = FunctionDefinition::default();
-    fun_def.code = code_unit;
+    fun_def.code = Some(code_unit);
 
-    module.function_signatures.push(FunctionSignature {
-        arg_types: vec![],
-        return_types: vec![],
-        type_formals: vec![],
-    });
     let fun_handle = FunctionHandle {
         module: ModuleHandleIndex(0),
         name: IdentifierIndex(0),
-        signature: FunctionSignatureIndex(0),
+        parameters: SignatureIndex(0),
+        return_: SignatureIndex(0),
+        type_parameters: vec![],
     };
 
     module.function_handles.push(fun_handle);
@@ -1832,47 +1892,24 @@ pub fn dummy_procedure_module(code: Vec<Bytecode>) -> CompiledModule {
 
 /// Return a simple script that contains only a return in the main()
 pub fn empty_script() -> CompiledScriptMut {
-    let default_address = AccountAddress::new([3u8; 32]);
-    let self_module_name = self_module_name().to_owned();
-    let main_name = Identifier::new("main").unwrap();
-    let void_void_sig = FunctionSignature {
-        arg_types: vec![],
-        return_types: vec![],
-        type_formals: vec![],
-    };
-    let no_args_no_locals = LocalsSignature(vec![]);
-    let self_module_handle = ModuleHandle {
-        address: AddressPoolIndex(0),
-        name: IdentifierIndex(0),
-    };
-    let main = FunctionHandle {
-        module: ModuleHandleIndex(0),
-        name: IdentifierIndex(1),
-        signature: FunctionSignatureIndex(0),
-    };
-    let code = CodeUnit {
-        max_stack_size: 1,
-        locals: LocalsSignatureIndex(0),
-        code: vec![Bytecode::Ret],
-    };
-    let main_def = FunctionDefinition {
-        function: FunctionHandleIndex(0),
-        flags: CodeUnit::PUBLIC,
-        acquires_global_resources: vec![],
-        code,
-    };
     CompiledScriptMut {
-        module_handles: vec![self_module_handle],
+        module_handles: vec![],
         struct_handles: vec![],
-        function_handles: vec![main],
+        function_handles: vec![],
 
-        type_signatures: vec![],
-        function_signatures: vec![void_void_sig],
-        locals_signatures: vec![no_args_no_locals],
+        function_instantiations: vec![],
 
-        identifiers: vec![self_module_name, main_name],
-        byte_array_pool: vec![],
-        address_pool: vec![default_address],
-        main: main_def,
+        signatures: vec![Signature(vec![])],
+
+        identifiers: vec![],
+        address_identifiers: vec![],
+        constant_pool: vec![],
+
+        type_parameters: vec![],
+        parameters: SignatureIndex(0),
+        code: CodeUnit {
+            locals: SignatureIndex(0),
+            code: vec![Bytecode::Ret],
+        },
     }
 }

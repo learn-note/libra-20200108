@@ -3,23 +3,11 @@
 
 //! Defines accessors for compiled modules.
 
-use crate::{
-    file_format::{
-        AddressPoolIndex, ByteArrayPoolIndex, CompiledModule, CompiledModuleMut, CompiledScript,
-        FieldDefinition, FieldDefinitionIndex, FunctionDefinition, FunctionDefinitionIndex,
-        FunctionHandle, FunctionHandleIndex, FunctionSignature, FunctionSignatureIndex,
-        IdentifierIndex, LocalsSignature, LocalsSignatureIndex, MemberCount, ModuleHandle,
-        ModuleHandleIndex, StructDefinition, StructDefinitionIndex, StructHandle,
-        StructHandleIndex, TypeSignature, TypeSignatureIndex,
-    },
-    internals::ModuleIndex,
-};
-use libra_types::{
-    account_address::AccountAddress,
-    byte_array::ByteArray,
+use crate::{file_format::*, internals::ModuleIndex};
+use libra_types::account_address::AccountAddress;
+use move_core_types::{
     identifier::{IdentStr, Identifier},
     language_storage::ModuleId,
-    vm_error::{StatusCode, VMStatus},
 };
 
 /// Represents accessors for a compiled module.
@@ -29,11 +17,21 @@ pub trait ModuleAccess: Sync {
     /// Returns the `CompiledModule` that will be used for accesses.
     fn as_module(&self) -> &CompiledModule;
 
+    fn self_handle_idx(&self) -> ModuleHandleIndex {
+        self.as_module().as_inner().self_module_handle_idx
+    }
+
     /// Returns the `ModuleHandle` for `self`.
     fn self_handle(&self) -> &ModuleHandle {
-        self.module_handle_at(ModuleHandleIndex::new(
-            CompiledModule::IMPLEMENTED_MODULE_INDEX,
-        ))
+        assume_preconditions!(); // invariant
+        let handle = self.module_handle_at(self.self_handle_idx());
+        assumed_postcondition!(
+            handle.address.into_index() < self.as_module().as_inner().address_identifiers.len()
+        ); // invariant
+        assumed_postcondition!(
+            handle.name.into_index() < self.as_module().as_inner().identifiers.len()
+        ); // invariant
+        handle
     }
 
     /// Returns the name of the module.
@@ -43,63 +41,89 @@ pub trait ModuleAccess: Sync {
 
     /// Returns the address of the module.
     fn address(&self) -> &AccountAddress {
-        self.address_at(self.self_handle().address)
+        self.address_identifier_at(self.self_handle().address)
     }
 
     fn module_handle_at(&self, idx: ModuleHandleIndex) -> &ModuleHandle {
-        &self.as_module().as_inner().module_handles[idx.into_index()]
+        let handle = &self.as_module().as_inner().module_handles[idx.into_index()];
+        assumed_postcondition!(
+            handle.address.into_index() < self.as_module().as_inner().address_identifiers.len()
+        ); // invariant
+        assumed_postcondition!(
+            handle.name.into_index() < self.as_module().as_inner().identifiers.len()
+        ); // invariant
+        handle
     }
 
     fn struct_handle_at(&self, idx: StructHandleIndex) -> &StructHandle {
-        &self.as_module().as_inner().struct_handles[idx.into_index()]
+        let handle = &self.as_module().as_inner().struct_handles[idx.into_index()];
+        assumed_postcondition!(
+            handle.module.into_index() < self.as_module().as_inner().module_handles.len()
+        ); // invariant
+        handle
     }
 
     fn function_handle_at(&self, idx: FunctionHandleIndex) -> &FunctionHandle {
-        &self.as_module().as_inner().function_handles[idx.into_index()]
+        let handle = &self.as_module().as_inner().function_handles[idx.into_index()];
+        assumed_postcondition!(
+            handle.parameters.into_index() < self.as_module().as_inner().signatures.len()
+        ); // invariant
+        assumed_postcondition!(
+            handle.return_.into_index() < self.as_module().as_inner().signatures.len()
+        ); // invariant
+        handle
     }
 
-    fn type_signature_at(&self, idx: TypeSignatureIndex) -> &TypeSignature {
-        &self.as_module().as_inner().type_signatures[idx.into_index()]
+    fn field_handle_at(&self, idx: FieldHandleIndex) -> &FieldHandle {
+        let handle = &self.as_module().as_inner().field_handles[idx.into_index()];
+        assumed_postcondition!(
+            handle.owner.into_index() < self.as_module().as_inner().struct_defs.len()
+        ); // invariant
+        handle
     }
 
-    fn function_signature_at(&self, idx: FunctionSignatureIndex) -> &FunctionSignature {
-        &self.as_module().as_inner().function_signatures[idx.into_index()]
+    fn struct_instantiation_at(&self, idx: StructDefInstantiationIndex) -> &StructDefInstantiation {
+        &self.as_module().as_inner().struct_def_instantiations[idx.into_index()]
     }
 
-    fn locals_signature_at(&self, idx: LocalsSignatureIndex) -> &LocalsSignature {
-        &self.as_module().as_inner().locals_signatures[idx.into_index()]
+    fn function_instantiation_at(&self, idx: FunctionInstantiationIndex) -> &FunctionInstantiation {
+        &self.as_module().as_inner().function_instantiations[idx.into_index()]
+    }
+
+    fn field_instantiation_at(&self, idx: FieldInstantiationIndex) -> &FieldInstantiation {
+        &self.as_module().as_inner().field_instantiations[idx.into_index()]
+    }
+
+    fn signature_at(&self, idx: SignatureIndex) -> &Signature {
+        &self.as_module().as_inner().signatures[idx.into_index()]
     }
 
     fn identifier_at(&self, idx: IdentifierIndex) -> &IdentStr {
         &self.as_module().as_inner().identifiers[idx.into_index()]
     }
 
-    fn byte_array_at(&self, idx: ByteArrayPoolIndex) -> &ByteArray {
-        &self.as_module().as_inner().byte_array_pool[idx.into_index()]
+    fn address_identifier_at(&self, idx: AddressIdentifierIndex) -> &AccountAddress {
+        &self.as_module().as_inner().address_identifiers[idx.into_index()]
     }
 
-    fn address_at(&self, idx: AddressPoolIndex) -> &AccountAddress {
-        &self.as_module().as_inner().address_pool[idx.into_index()]
+    fn constant_at(&self, idx: ConstantPoolIndex) -> &Constant {
+        &self.as_module().as_inner().constant_pool[idx.into_index()]
     }
 
     fn struct_def_at(&self, idx: StructDefinitionIndex) -> &StructDefinition {
         &self.as_module().as_inner().struct_defs[idx.into_index()]
     }
 
-    fn field_def_at(&self, idx: FieldDefinitionIndex) -> &FieldDefinition {
-        &self.as_module().as_inner().field_defs[idx.into_index()]
-    }
-
     fn function_def_at(&self, idx: FunctionDefinitionIndex) -> &FunctionDefinition {
-        &self.as_module().as_inner().function_defs[idx.into_index()]
+        let result = &self.as_module().as_inner().function_defs[idx.into_index()];
+        assumed_postcondition!(result.function.into_index() < self.function_handles().len()); // invariant
+        assumed_postcondition!(match &result.code {
+            Some(code) => code.locals.into_index() < self.signatures().len(),
+            None => true,
+        }); // invariant
+        result
     }
 
-    fn get_field_signature(&self, field_definition_index: FieldDefinitionIndex) -> &TypeSignature {
-        let field_definition = self.field_def_at(field_definition_index);
-        self.type_signature_at(field_definition.signature)
-    }
-
-    // XXX is a partial range required here?
     fn module_handles(&self) -> &[ModuleHandle] {
         &self.as_module().as_inner().module_handles
     }
@@ -112,36 +136,40 @@ pub trait ModuleAccess: Sync {
         &self.as_module().as_inner().function_handles
     }
 
-    fn type_signatures(&self) -> &[TypeSignature] {
-        &self.as_module().as_inner().type_signatures
+    fn field_handles(&self) -> &[FieldHandle] {
+        &self.as_module().as_inner().field_handles
     }
 
-    fn function_signatures(&self) -> &[FunctionSignature] {
-        &self.as_module().as_inner().function_signatures
+    fn struct_instantiations(&self) -> &[StructDefInstantiation] {
+        &self.as_module().as_inner().struct_def_instantiations
     }
 
-    fn locals_signatures(&self) -> &[LocalsSignature] {
-        &self.as_module().as_inner().locals_signatures
+    fn function_instantiations(&self) -> &[FunctionInstantiation] {
+        &self.as_module().as_inner().function_instantiations
     }
 
-    fn byte_array_pool(&self) -> &[ByteArray] {
-        &self.as_module().as_inner().byte_array_pool
+    fn field_instantiations(&self) -> &[FieldInstantiation] {
+        &self.as_module().as_inner().field_instantiations
     }
 
-    fn address_pool(&self) -> &[AccountAddress] {
-        &self.as_module().as_inner().address_pool
+    fn signatures(&self) -> &[Signature] {
+        &self.as_module().as_inner().signatures
+    }
+
+    fn constant_pool(&self) -> &[Constant] {
+        &self.as_module().as_inner().constant_pool
     }
 
     fn identifiers(&self) -> &[Identifier] {
         &self.as_module().as_inner().identifiers
     }
 
-    fn struct_defs(&self) -> &[StructDefinition] {
-        &self.as_module().as_inner().struct_defs
+    fn address_identifiers(&self) -> &[AccountAddress] {
+        &self.as_module().as_inner().address_identifiers
     }
 
-    fn field_defs(&self) -> &[FieldDefinition] {
-        &self.as_module().as_inner().field_defs
+    fn struct_defs(&self) -> &[StructDefinition] {
+        &self.as_module().as_inner().struct_defs
     }
 
     fn function_defs(&self) -> &[FunctionDefinition] {
@@ -155,28 +183,6 @@ pub trait ModuleAccess: Sync {
     fn self_id(&self) -> ModuleId {
         self.as_module().self_id()
     }
-
-    fn field_def_range(
-        &self,
-        field_count: MemberCount,
-        first_field: FieldDefinitionIndex,
-    ) -> &[FieldDefinition] {
-        let first_field = first_field.0 as usize;
-        let field_count = field_count as usize;
-        // Both `first_field` and `field_count` are `u16` before being converted to usize
-        assume!(first_field <= usize::max_value() - field_count);
-        let last_field = first_field + field_count;
-        &self.as_module().as_inner().field_defs[first_field..last_field]
-    }
-
-    fn is_field_in_struct(
-        &self,
-        field_definition_index: FieldDefinitionIndex,
-        struct_handle_index: StructHandleIndex,
-    ) -> bool {
-        let field_definition = self.field_def_at(field_definition_index);
-        struct_handle_index == field_definition.struct_
-    }
 }
 
 /// Represents accessors for a compiled script.
@@ -185,13 +191,6 @@ pub trait ModuleAccess: Sync {
 pub trait ScriptAccess: Sync {
     /// Returns the `CompiledScript` that will be used for accesses.
     fn as_script(&self) -> &CompiledScript;
-
-    /// Returns the `ModuleHandle` for `self`.
-    fn self_handle(&self) -> &ModuleHandle {
-        self.module_handle_at(ModuleHandleIndex::new(
-            CompiledModule::IMPLEMENTED_MODULE_INDEX,
-        ))
-    }
 
     fn module_handle_at(&self, idx: ModuleHandleIndex) -> &ModuleHandle {
         &self.as_script().as_inner().module_handles[idx.into_index()]
@@ -205,28 +204,24 @@ pub trait ScriptAccess: Sync {
         &self.as_script().as_inner().function_handles[idx.into_index()]
     }
 
-    fn type_signature_at(&self, idx: TypeSignatureIndex) -> &TypeSignature {
-        &self.as_script().as_inner().type_signatures[idx.into_index()]
-    }
-
-    fn function_signature_at(&self, idx: FunctionSignatureIndex) -> &FunctionSignature {
-        &self.as_script().as_inner().function_signatures[idx.into_index()]
-    }
-
-    fn locals_signature_at(&self, idx: LocalsSignatureIndex) -> &LocalsSignature {
-        &self.as_script().as_inner().locals_signatures[idx.into_index()]
+    fn signature_at(&self, idx: SignatureIndex) -> &Signature {
+        &self.as_script().as_inner().signatures[idx.into_index()]
     }
 
     fn identifier_at(&self, idx: IdentifierIndex) -> &IdentStr {
         &self.as_script().as_inner().identifiers[idx.into_index()]
     }
 
-    fn byte_array_at(&self, idx: ByteArrayPoolIndex) -> &ByteArray {
-        &self.as_script().as_inner().byte_array_pool[idx.into_index()]
+    fn address_identifier_at(&self, idx: AddressIdentifierIndex) -> &AccountAddress {
+        &self.as_script().as_inner().address_identifiers[idx.into_index()]
     }
 
-    fn address_at(&self, idx: AddressPoolIndex) -> &AccountAddress {
-        &self.as_script().as_inner().address_pool[idx.into_index()]
+    fn constant_at(&self, idx: ConstantPoolIndex) -> &Constant {
+        &self.as_script().as_inner().constant_pool[idx.into_index()]
+    }
+
+    fn function_instantiation_at(&self, idx: FunctionInstantiationIndex) -> &FunctionInstantiation {
+        &self.as_script().as_inner().function_instantiations[idx.into_index()]
     }
 
     fn module_handles(&self) -> &[ModuleHandle] {
@@ -241,32 +236,28 @@ pub trait ScriptAccess: Sync {
         &self.as_script().as_inner().function_handles
     }
 
-    fn type_signatures(&self) -> &[TypeSignature] {
-        &self.as_script().as_inner().type_signatures
+    fn function_instantiations(&self) -> &[FunctionInstantiation] {
+        &self.as_script().as_inner().function_instantiations
     }
 
-    fn function_signatures(&self) -> &[FunctionSignature] {
-        &self.as_script().as_inner().function_signatures
+    fn signatures(&self) -> &[Signature] {
+        &self.as_script().as_inner().signatures
     }
 
-    fn locals_signatures(&self) -> &[LocalsSignature] {
-        &self.as_script().as_inner().locals_signatures
-    }
-
-    fn byte_array_pool(&self) -> &[ByteArray] {
-        &self.as_script().as_inner().byte_array_pool
-    }
-
-    fn address_pool(&self) -> &[AccountAddress] {
-        &self.as_script().as_inner().address_pool
+    fn constant_pool(&self) -> &[Constant] {
+        &self.as_script().as_inner().constant_pool
     }
 
     fn identifiers(&self) -> &[Identifier] {
         &self.as_script().as_inner().identifiers
     }
 
-    fn main(&self) -> &FunctionDefinition {
-        &self.as_script().as_inner().main
+    fn address_identifiers(&self) -> &[AccountAddress] {
+        &self.as_script().as_inner().address_identifiers
+    }
+
+    fn code(&self) -> &CodeUnit {
+        &self.as_script().as_inner().code
     }
 }
 
@@ -279,33 +270,5 @@ impl ModuleAccess for CompiledModule {
 impl ScriptAccess for CompiledScript {
     fn as_script(&self) -> &CompiledScript {
         self
-    }
-}
-
-impl CompiledModuleMut {
-    #[inline]
-    pub(crate) fn check_field_range(
-        &self,
-        field_count: MemberCount,
-        first_field: FieldDefinitionIndex,
-    ) -> Option<VMStatus> {
-        let first_field = first_field.into_index();
-        let field_count = field_count as usize;
-        // Both first_field and field_count are u16 so this is guaranteed to not overflow.
-        // Note that last_field is exclusive, i.e. fields are in the range
-        // [first_field, last_field).
-        let last_field = first_field + field_count;
-        if last_field > self.field_defs.len() {
-            let msg = format!(
-                "Field definition range [{},{}) out of range for {}",
-                first_field,
-                last_field,
-                self.field_defs.len()
-            );
-            let status = VMStatus::new(StatusCode::RANGE_OUT_OF_BOUNDS).with_message(msg);
-            Some(status)
-        } else {
-            None
-        }
     }
 }

@@ -22,12 +22,14 @@ def create_client():
         ac_hosts = os.environ['AC_HOST'].split(',')
         ac_host = random.choice(ac_hosts)
         ac_port = os.environ['AC_PORT']
+        url = "http://{}:{}".format(ac_host, ac_port)
+        waypoint = open("/opt/libra/etc/waypoint.txt", "r").readline()
 
-        print("Connecting to ac on: {}:{}".format(ac_host, ac_port))
-        cmd = "/opt/libra/bin/cli --host {} --port {} -m {}".format(
-            ac_host,
-            ac_port,
-            "/opt/libra/etc/mint.key")
+        print("Connecting to ac on: {}".format(url))
+        cmd = "/opt/libra/bin/cli --url {} -m {} --waypoint {}".format(
+            url,
+            "/opt/libra/etc/mint.key",
+            waypoint)
 
         application.client = pexpect.spawn(cmd)
         application.client.delaybeforesend = 0.1
@@ -42,11 +44,11 @@ create_client()
 
 @application.route("/", methods=('POST',))
 def send_transaction():
-    address = flask.request.args['address']
+    auth_key = flask.request.args['auth_key']
 
-    # Return immediately if address is invalid
-    if re.match('^[a-f0-9]{64}$', address) is None:
-        return 'Malformed address', 400
+    # Return immediately if auth_key is invalid
+    if re.match('^[a-f0-9]{64}$', auth_key) is None:
+        return 'Malformed auth_key', 400
 
     try:
         amount = decimal.Decimal(flask.request.args['amount'])
@@ -54,12 +56,14 @@ def send_transaction():
         return 'Bad amount', 400
 
     if amount > MAX_MINT:
-        return 'Exceeded max amount of {}'.format(MAX_MINT / (10 ** 6)), 400
+        return 'Exceeded max amount of {}'.format(MAX_MINT), 400
+
+    currency_code = flask.request.args['currency_code']
 
     try:
         create_client()
         application.client.sendline(
-            "a m {} {}".format(address, amount / (10 ** 6)))
+            "a m {} {} {} use_base_units".format(auth_key, amount, currency_code))
         application.client.expect("Mint request submitted", timeout=2)
 
         application.client.sendline("a la")

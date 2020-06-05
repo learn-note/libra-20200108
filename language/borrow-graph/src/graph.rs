@@ -1,8 +1,10 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::paths::{self, Path, PathSlice};
-use crate::references::*;
+use crate::{
+    paths::{self, Path, PathSlice},
+    references::*,
+};
 use mirai_annotations::{debug_checked_postcondition, debug_checked_precondition};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // Definitions
 //**************************************************************************************************
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BorrowGraph<Loc: Copy, Lbl: Clone + Ord>(BTreeMap<RefID, Ref<Loc, Lbl>>);
 
 //**************************************************************************************************
@@ -35,7 +37,7 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
         assert!(self.0.insert(id, Ref::new(mutable)).is_none(), "{}", id.0)
     }
 
-    /// Return the refrences borrowing the `id` reference
+    /// Return the references borrowing the `id` reference
     /// The borrows are collected by first label in the borrow edge
     /// `BTreeMap<RefID, Loc>` represents all of the "full" or "epsilon" borrows (non field borrows)
     /// `BTreeMap<Lbl, BTreeMap<RefID, Loc>>)` represents the field borrows, collected over the
@@ -49,7 +51,6 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
         let mut field_borrows: BTreeMap<Lbl, BTreeMap<RefID, Loc>> = BTreeMap::new();
         for (borrower, edges) in &borrowed_by.0 {
             let borrower = *borrower;
-            let edges: &BTreeSet<BorrowEdge<Loc, Lbl>> = edges;
             for edge in edges {
                 match edge.path.get(0) {
                     None => full_borrows.insert(borrower, edge.loc),
@@ -61,6 +62,40 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
             }
         }
         (full_borrows, field_borrows)
+    }
+
+    /// Return the edges between parent and child
+    pub fn between_edges(&self, parent: RefID, child: RefID) -> Vec<(Loc, Path<Lbl>, bool)> {
+        let edges = &self.0.get(&parent).unwrap().borrowed_by.0[&child];
+        edges
+            .iter()
+            .map(|edge| (edge.loc, edge.path.clone(), edge.strong))
+            .collect()
+    }
+
+    /// Return the outgoing edges from id
+    pub fn out_edges(&self, id: RefID) -> Vec<(Loc, Path<Lbl>, bool, RefID)> {
+        let mut returned_edges = vec![];
+        let borrowed_by = &self.0.get(&id).unwrap().borrowed_by;
+        for (borrower, edges) in &borrowed_by.0 {
+            let borrower = *borrower;
+            for edge in edges {
+                returned_edges.push((edge.loc, edge.path.clone(), edge.strong, borrower));
+            }
+        }
+        returned_edges
+    }
+
+    /// Return the incoming edges into id
+    pub fn in_edges(&self, id: RefID) -> Vec<(Loc, RefID, Path<Lbl>, bool)> {
+        let mut returned_edges = vec![];
+        let borrows_from = &self.0.get(&id).unwrap().borrows_from;
+        for src in borrows_from {
+            for edge in self.between_edges(*src, id) {
+                returned_edges.push((edge.0, *src, edge.1, edge.2));
+            }
+        }
+        returned_edges
     }
 
     //**********************************************************************************************

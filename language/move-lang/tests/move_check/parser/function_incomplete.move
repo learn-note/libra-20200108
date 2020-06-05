@@ -1,2 +1,4 @@
-main() {
+script {
+fun main() {
 // }
+//}

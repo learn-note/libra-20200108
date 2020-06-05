@@ -1,2 +1,4 @@
-public main() {
+script {
+public fun main() {
+}
 }

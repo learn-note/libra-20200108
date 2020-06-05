@@ -7,7 +7,7 @@ use proptest::{collection::vec, prelude::*};
 use schemadb::{
     define_schema,
     schema::{KeyCodec, Schema, ValueCodec},
-    ColumnFamilyOptions, ColumnFamilyOptionsMap, SchemaBatch, DB, DEFAULT_CF_NAME,
+    ColumnFamilyName, SchemaBatch, DB, DEFAULT_CF_NAME,
 };
 
 // Creating two schemas that share exactly the same structure but are stored in different column
@@ -71,22 +71,20 @@ impl ValueCodec<TestSchema2> for TestField {
     }
 }
 
-fn open_db(dir: &libra_temppath::TempPath) -> DB {
-    let cf_opts_map: ColumnFamilyOptionsMap = [
-        (DEFAULT_CF_NAME, ColumnFamilyOptions::default()),
-        (
-            TestSchema1::COLUMN_FAMILY_NAME,
-            ColumnFamilyOptions::default(),
-        ),
-        (
-            TestSchema2::COLUMN_FAMILY_NAME,
-            ColumnFamilyOptions::default(),
-        ),
+fn get_column_families() -> Vec<ColumnFamilyName> {
+    vec![
+        DEFAULT_CF_NAME,
+        TestSchema1::COLUMN_FAMILY_NAME,
+        TestSchema2::COLUMN_FAMILY_NAME,
     ]
-    .iter()
-    .cloned()
-    .collect();
-    DB::open(&dir.path(), cf_opts_map).expect("Failed to open DB.")
+}
+
+fn open_db(dir: &libra_temppath::TempPath) -> DB {
+    DB::open(&dir.path(), "test", get_column_families()).expect("Failed to open DB.")
+}
+
+fn open_db_read_only(dir: &libra_temppath::TempPath) -> DB {
+    DB::open_readonly(&dir.path(), "test", get_column_families()).expect("Failed to open DB.")
 }
 
 struct TestDB {
@@ -166,15 +164,15 @@ proptest! {
         for i in 0..100u32 {
             db.put::<TestSchema1>(&TestField(i), &TestField(i)).unwrap();
         }
-        let mut should_exist = [true; 100];
+        let mut should_exist_vec = [true; 100];
         for (begin, end) in ranges_to_delete {
             db.range_delete::<TestSchema1, TestField>(&TestField(begin), &TestField(end)).unwrap();
             for i in begin..end {
-                should_exist[i as usize] = false;
+                should_exist_vec[i as usize] = false;
             }
         }
 
-        for (i, should_exist) in should_exist.iter().enumerate() {
+        for (i, should_exist) in should_exist_vec.iter().enumerate() {
             assert_eq!(
                 db.get::<TestSchema1>(&TestField(i as u32)).unwrap().is_some(),
                 *should_exist,
@@ -302,6 +300,23 @@ fn test_reopen() {
 }
 
 #[test]
+fn test_open_read_only() {
+    let tmpdir = libra_temppath::TempPath::new();
+    {
+        let db = open_db(&tmpdir);
+        db.put::<TestSchema1>(&TestField(0), &TestField(0)).unwrap();
+    }
+    {
+        let db = open_db_read_only(&tmpdir);
+        assert_eq!(
+            db.get::<TestSchema1>(&TestField(0)).unwrap(),
+            Some(TestField(0)),
+        );
+        assert!(db.put::<TestSchema1>(&TestField(1), &TestField(1)).is_err());
+    }
+}
+
+#[test]
 fn test_report_size() {
     let db = TestDB::new();
 
@@ -316,7 +331,7 @@ fn test_report_size() {
         db.write_schemas(db_batch).unwrap();
     }
 
-    db.flush_all(/* sync = */ true).unwrap();
+    db.flush_all().unwrap();
 
     let cf_sizes = db.get_approximate_sizes_cf().unwrap();
     assert!(*cf_sizes.get("TestCF1").unwrap() > 0);

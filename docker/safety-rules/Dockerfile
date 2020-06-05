@@ -16,6 +16,7 @@ FROM toolchain AS builder
 
 COPY . /libra
 
+ENV RUSTFLAGS "-Ctarget-cpu=skylake -Ctarget-feature=+aes,+sse2,+sse4.1,+ssse3"
 RUN cargo build --release -p libra-node -p cli -p config-builder -p safety-rules && cd target/release && rm -r build deps incremental
 RUN strip /libra/target/release/config-builder
 
@@ -30,7 +31,7 @@ COPY --from=builder /libra/target/release/safety-rules /opt/libra/bin
 COPY --from=builder /libra/target/release/config-builder /opt/libra/bin
 
 ENV RUST_BACKTRACE 1
-CMD /opt/libra/bin/safety-rules
+CMD /docker-run-dynamic.sh
 
 ARG BUILD_DATE
 ARG GIT_REV

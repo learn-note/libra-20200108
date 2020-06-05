@@ -19,14 +19,14 @@ pub enum NetworkErrorKind {
     #[error("IO error")]
     IoError,
 
+    #[error("Lcs error")]
+    LcsError,
+
     #[error("Error parsing protobuf message")]
     ProtobufParseError,
 
     #[error("Invalid signature error")]
     SignatureError,
-
-    #[error("Failed to parse multiaddrs")]
-    MultiaddrError,
 
     #[error("Error sending on mpsc channel")]
     MpscSendError,
@@ -75,34 +75,18 @@ impl From<io::Error> for NetworkError {
     }
 }
 
+impl From<lcs::Error> for NetworkError {
+    fn from(err: lcs::Error) -> NetworkError {
+        anyhow::Error::new(err)
+            .context(NetworkErrorKind::LcsError)
+            .into()
+    }
+}
+
 impl From<VerifyError> for NetworkError {
     fn from(err: VerifyError) -> NetworkError {
         anyhow::Error::new(err)
             .context(NetworkErrorKind::SignatureError)
-            .into()
-    }
-}
-
-impl From<prost::EncodeError> for NetworkError {
-    fn from(err: prost::EncodeError) -> NetworkError {
-        anyhow::Error::new(err)
-            .context(NetworkErrorKind::ProtobufParseError)
-            .into()
-    }
-}
-
-impl From<prost::DecodeError> for NetworkError {
-    fn from(err: prost::DecodeError) -> NetworkError {
-        anyhow::Error::new(err)
-            .context(NetworkErrorKind::ProtobufParseError)
-            .into()
-    }
-}
-
-impl From<parity_multiaddr::Error> for NetworkError {
-    fn from(err: parity_multiaddr::Error) -> NetworkError {
-        anyhow::Error::new(err)
-            .context(NetworkErrorKind::MultiaddrError)
             .into()
     }
 }

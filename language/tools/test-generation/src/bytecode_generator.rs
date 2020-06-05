@@ -8,15 +8,18 @@ use crate::{
         NEGATE_PRECONDITIONS, NEGATION_PROBABILITY, VALUE_STACK_LIMIT,
     },
     control_flow_graph::CFG,
-    summaries,
+    substitute, summaries,
 };
+use libra_logger::{debug, error, warn};
 use rand::{rngs::StdRng, Rng};
-use slog_scope::{debug, error, warn};
-use vm::access::ModuleAccess;
-use vm::file_format::{
-    AddressPoolIndex, ByteArrayPoolIndex, Bytecode, CodeOffset, CompiledModuleMut,
-    FieldDefinitionIndex, FunctionHandleIndex, FunctionSignature, LocalIndex, LocalsSignatureIndex,
-    SignatureToken, StructDefinitionIndex, StructFieldInformation, TableIndex,
+use vm::{
+    access::ModuleAccess,
+    file_format::{
+        Bytecode, CodeOffset, CompiledModuleMut, ConstantPoolIndex, FieldHandleIndex,
+        FieldInstantiationIndex, FunctionHandle, FunctionHandleIndex, FunctionInstantiation,
+        FunctionInstantiationIndex, LocalIndex, SignatureToken, StructDefInstantiation,
+        StructDefInstantiationIndex, StructDefinitionIndex, StructFieldInformation, TableIndex,
+    },
 };
 
 /// This type represents bytecode instructions that take a `LocalIndex`
@@ -35,21 +38,25 @@ type U64ToBytecode = fn(u64) -> Bytecode;
 type U128ToBytecode = fn(u128) -> Bytecode;
 
 /// This type represents bytecode instructions that take a `AddressPoolIndex`
-type AddressPoolIndexToBytecode = fn(AddressPoolIndex) -> Bytecode;
-
-/// This type represents bytecode instructions that take a `ByteArrayPoolIndex`
-type ByteArrayPoolIndexToBytecode = fn(ByteArrayPoolIndex) -> Bytecode;
+type ConstantPoolIndexToBytecode = fn(ConstantPoolIndex) -> Bytecode;
 
 /// This type represents bytecode instructions that take a `StructDefinitionIndex`
-/// and a `LocalsSignatureIndex`
-type StructAndLocalIndexToBytecode = fn(StructDefinitionIndex, LocalsSignatureIndex) -> Bytecode;
+type StructIndexToBytecode = fn(StructDefinitionIndex) -> Bytecode;
 
-/// This type represents bytecode instructions that take a `FieldDefinitionIndex``
-type FieldDefinitionIndexToBytecode = fn(FieldDefinitionIndex) -> Bytecode;
+/// This type represents bytecode instructions that take a `FieldHandleIndex`
+type FieldHandleIndexToBytecode = fn(FieldHandleIndex) -> Bytecode;
 
 /// This type represents bytecode instructions that take a `FunctionHandleIndex`
-/// and a `LocalsSignatureIndex`
-type FunctionAndLocalIndexToBytecode = fn(FunctionHandleIndex, LocalsSignatureIndex) -> Bytecode;
+type FunctionIndexToBytecode = fn(FunctionHandleIndex) -> Bytecode;
+
+/// This type represents bytecode instructions that take a `StructDefInstantiationIndex`
+type StructInstIndexToBytecode = fn(StructDefInstantiationIndex) -> Bytecode;
+
+/// This type represents bytecode instructions that take a `FieldInstantiationIndex`
+type FieldInstIndexToBytecode = fn(FieldInstantiationIndex) -> Bytecode;
+
+/// This type represents bytecode instructions that take a `FunctionInstantiationIndex`
+type FunctionInstIndexToBytecode = fn(FunctionInstantiationIndex) -> Bytecode;
 
 /// There are six types of bytecode instructions
 #[derive(Debug, Clone)]
@@ -72,20 +79,26 @@ enum BytecodeType {
     /// Instructions that take a `u128`
     U128(U128ToBytecode),
 
-    /// Instructions that take an `AddressPoolIndex`
-    AddressPoolIndex(AddressPoolIndexToBytecode),
+    /// Instructions that take an `ConstantPoolIndex`
+    ConstantPoolIndex(ConstantPoolIndexToBytecode),
 
-    /// Instructions that take a `ByteArrayPoolIndex`
-    ByteArrayPoolIndex(ByteArrayPoolIndexToBytecode),
+    /// Instructions that take a `StructDefinitionIndex`
+    StructIndex(StructIndexToBytecode),
 
-    /// Instructions that take a `StructDefinitionIndex` and a `LocalsSignatureIndex`
-    StructAndLocalIndex(StructAndLocalIndexToBytecode),
+    /// Instructions that take a `FieldHandleIndex`
+    FieldHandleIndex(FieldHandleIndexToBytecode),
 
-    /// Instructions that take a `FieldDefinitionIndex`
-    FieldDefinitionIndex(FieldDefinitionIndexToBytecode),
+    /// Instructions that take a `FunctionHandleIndex`
+    FunctionIndex(FunctionIndexToBytecode),
 
-    /// Instructions that take a `FunctionHandleIndex` and a `LocalsSignatureIndex`
-    FunctionAndLocalIndex(FunctionAndLocalIndexToBytecode),
+    /// Instructions that take a `StructInstantiationIndex`
+    StructInstantiationIndex(StructInstIndexToBytecode),
+
+    /// Instructions that take a `FieldInstantiationIndex`
+    FieldInstantiationIndex(FieldInstIndexToBytecode),
+
+    /// Instructions that take a `FunctionInstantiationIndex`
+    FunctionInstantiationIndex(FunctionInstIndexToBytecode),
 }
 
 /// Abstraction for change to the stack size
@@ -158,14 +171,10 @@ impl<'a> BytecodeGenerator<'a> {
             (StackEffect::Nop, BytecodeType::NoArg(Bytecode::CastU128)),
             (
                 StackEffect::Add,
-                BytecodeType::AddressPoolIndex(Bytecode::LdAddr),
+                BytecodeType::ConstantPoolIndex(Bytecode::LdConst),
             ),
             (StackEffect::Add, BytecodeType::NoArg(Bytecode::LdTrue)),
             (StackEffect::Add, BytecodeType::NoArg(Bytecode::LdFalse)),
-            (
-                StackEffect::Add,
-                BytecodeType::ByteArrayPoolIndex(Bytecode::LdByteArray),
-            ),
             (
                 StackEffect::Add,
                 BytecodeType::LocalIndex(Bytecode::CopyLoc),
@@ -205,63 +214,84 @@ impl<'a> BytecodeGenerator<'a> {
             (StackEffect::Sub, BytecodeType::NoArg(Bytecode::Ge)),
             (
                 StackEffect::Add,
-                BytecodeType::NoArg(Bytecode::GetTxnGasUnitPrice),
-            ),
-            (
-                StackEffect::Add,
-                BytecodeType::NoArg(Bytecode::GetTxnMaxGasUnits),
-            ),
-            (
-                StackEffect::Add,
-                BytecodeType::NoArg(Bytecode::GetTxnSequenceNumber),
-            ),
-            (
-                StackEffect::Add,
                 BytecodeType::NoArg(Bytecode::GetTxnSenderAddress),
             ),
+            (StackEffect::Nop, BytecodeType::StructIndex(Bytecode::Pack)),
+            (
+                StackEffect::Nop,
+                BytecodeType::StructInstantiationIndex(Bytecode::PackGeneric),
+            ),
+            (
+                StackEffect::Nop,
+                BytecodeType::StructIndex(Bytecode::Unpack),
+            ),
+            (
+                StackEffect::Nop,
+                BytecodeType::StructInstantiationIndex(Bytecode::UnpackGeneric),
+            ),
+            (
+                StackEffect::Nop,
+                BytecodeType::StructIndex(Bytecode::Exists),
+            ),
+            (
+                StackEffect::Nop,
+                BytecodeType::StructInstantiationIndex(Bytecode::ExistsGeneric),
+            ),
             (
                 StackEffect::Add,
-                BytecodeType::NoArg(Bytecode::GetTxnPublicKey),
-            ),
-            (
-                StackEffect::Nop,
-                BytecodeType::StructAndLocalIndex(Bytecode::Pack),
-            ),
-            (
-                StackEffect::Nop,
-                BytecodeType::StructAndLocalIndex(Bytecode::Unpack),
-            ),
-            (
-                StackEffect::Nop,
-                BytecodeType::StructAndLocalIndex(Bytecode::Exists),
+                BytecodeType::StructIndex(Bytecode::MoveFrom),
             ),
             (
                 StackEffect::Add,
-                BytecodeType::StructAndLocalIndex(Bytecode::MoveFrom),
+                BytecodeType::StructInstantiationIndex(Bytecode::MoveFromGeneric),
             ),
             (
                 StackEffect::Sub,
-                BytecodeType::StructAndLocalIndex(Bytecode::MoveToSender),
+                BytecodeType::StructIndex(Bytecode::MoveToSender),
+            ),
+            (
+                StackEffect::Sub,
+                BytecodeType::StructInstantiationIndex(Bytecode::MoveToSenderGeneric),
             ),
             (
                 StackEffect::Nop,
-                BytecodeType::StructAndLocalIndex(Bytecode::MutBorrowGlobal),
+                BytecodeType::StructIndex(Bytecode::MutBorrowGlobal),
             ),
             (
                 StackEffect::Nop,
-                BytecodeType::StructAndLocalIndex(Bytecode::ImmBorrowGlobal),
+                BytecodeType::StructInstantiationIndex(Bytecode::MutBorrowGlobalGeneric),
             ),
             (
                 StackEffect::Nop,
-                BytecodeType::FieldDefinitionIndex(Bytecode::MutBorrowField),
+                BytecodeType::StructIndex(Bytecode::ImmBorrowGlobal),
             ),
             (
                 StackEffect::Nop,
-                BytecodeType::FieldDefinitionIndex(Bytecode::ImmBorrowField),
+                BytecodeType::StructInstantiationIndex(Bytecode::ImmBorrowGlobalGeneric),
             ),
             (
                 StackEffect::Nop,
-                BytecodeType::FunctionAndLocalIndex(Bytecode::Call),
+                BytecodeType::FieldHandleIndex(Bytecode::MutBorrowField),
+            ),
+            (
+                StackEffect::Nop,
+                BytecodeType::FieldInstantiationIndex(Bytecode::MutBorrowFieldGeneric),
+            ),
+            (
+                StackEffect::Nop,
+                BytecodeType::FieldHandleIndex(Bytecode::ImmBorrowField),
+            ),
+            (
+                StackEffect::Nop,
+                BytecodeType::FieldInstantiationIndex(Bytecode::ImmBorrowFieldGeneric),
+            ),
+            (
+                StackEffect::Nop,
+                BytecodeType::FunctionIndex(Bytecode::Call),
+            ),
+            (
+                StackEffect::Nop,
+                BytecodeType::FunctionInstantiationIndex(Bytecode::CallGeneric),
             ),
             (StackEffect::Nop, BytecodeType::CodeOffset(Bytecode::Branch)),
             (StackEffect::Sub, BytecodeType::CodeOffset(Bytecode::BrTrue)),
@@ -358,32 +388,22 @@ impl<'a> BytecodeGenerator<'a> {
                     // Generate a random u128 constant to load
                     Some(instruction(self.rng.gen_range(0, u128::max_value())))
                 }
-                BytecodeType::AddressPoolIndex(instruction) => {
+                BytecodeType::ConstantPoolIndex(instruction) => {
                     // Select a random address from the module's address pool
-                    Self::index_or_none(&module.address_pool, &mut self.rng)
-                        .map(|x| instruction(AddressPoolIndex::new(x)))
+                    Self::index_or_none(&module.constant_pool, &mut self.rng)
+                        .map(|x| instruction(ConstantPoolIndex::new(x)))
                 }
-                BytecodeType::ByteArrayPoolIndex(instruction) => {
-                    // Select a random byte array from the module's byte array pool
-                    Self::index_or_none(&module.byte_array_pool, &mut self.rng)
-                        .map(|x| instruction(ByteArrayPoolIndex::new(x)))
-                }
-                BytecodeType::StructAndLocalIndex(instruction) => {
+                BytecodeType::StructIndex(instruction) => {
                     // Select a random struct definition and local signature
-                    Self::index_or_none(&module.struct_defs, &mut self.rng).map(|x| {
-                        instruction(
-                            StructDefinitionIndex::new(x),
-                            // Set 0 as the index. This will be filled in/changed later on.
-                            LocalsSignatureIndex::new(0),
-                        )
-                    })
+                    Self::index_or_none(&module.struct_defs, &mut self.rng)
+                        .map(|x| instruction(StructDefinitionIndex::new(x)))
                 }
-                BytecodeType::FieldDefinitionIndex(instruction) => {
+                BytecodeType::FieldHandleIndex(instruction) => {
                     // Select a field definition from the module's field definitions
-                    Self::index_or_none(&module.field_defs, &mut self.rng)
-                        .map(|x| instruction(FieldDefinitionIndex::new(x)))
+                    Self::index_or_none(&module.field_handles, &mut self.rng)
+                        .map(|x| instruction(FieldHandleIndex::new(x)))
                 }
-                BytecodeType::FunctionAndLocalIndex(instruction) => {
+                BytecodeType::FunctionIndex(instruction) => {
                     // Select a random function handle and local signature
                     let callable_fns = &state.call_graph.can_call(fn_context.function_handle_index);
                     Self::index_or_none(callable_fns, &mut self.rng)
@@ -394,13 +414,22 @@ impl<'a> BytecodeGenerator<'a> {
                                 callable_fns[handle_idx as usize],
                             )
                         })
-                        .map(|handle| {
-                            instruction(
-                                handle,
-                                // Set 0 as the signature index. This index will be filled in/changed later
-                                LocalsSignatureIndex::new(0),
-                            )
-                        })
+                        .map(|handle| instruction(handle))
+                }
+                BytecodeType::StructInstantiationIndex(instruction) => {
+                    // Select a field definition from the module's field definitions
+                    Self::index_or_none(&module.struct_def_instantiations, &mut self.rng)
+                        .map(|x| instruction(StructDefInstantiationIndex::new(x)))
+                }
+                BytecodeType::FunctionInstantiationIndex(instruction) => {
+                    // Select a field definition from the module's field definitions
+                    Self::index_or_none(&module.function_instantiations, &mut self.rng)
+                        .map(|x| instruction(FunctionInstantiationIndex::new(x)))
+                }
+                BytecodeType::FieldInstantiationIndex(instruction) => {
+                    // Select a field definition from the module's field definitions
+                    Self::index_or_none(&module.field_instantiations, &mut self.rng)
+                        .map(|x| instruction(FieldInstantiationIndex::new(x)))
                 }
             };
             if let Some(instruction) = instruction {
@@ -510,10 +539,27 @@ impl<'a> BytecodeGenerator<'a> {
         };
         match summary.effects {
             summaries::Effects::TyParams(instantiation, effect, instantiation_application) => {
-                let instantiation = instantiation(&state);
+                let (struct_idx, instantiation) = instantiation(&state);
                 let index = state.module.add_instantiation(instantiation);
-                let effects = effect(index);
-                let instruction = instantiation_application(index);
+                let struct_inst = StructDefInstantiation {
+                    def: struct_idx,
+                    type_parameters: index,
+                };
+                let str_inst_idx = state.module.add_struct_instantiation(struct_inst);
+                let effects = effect(str_inst_idx);
+                let instruction = instantiation_application(str_inst_idx);
+                (apply_effects(state, effects), instruction)
+            }
+            summaries::Effects::TyParamsCall(instantiation, effect, instantiation_application) => {
+                let (fh_idx, instantiation) = instantiation(&state);
+                let index = state.module.add_instantiation(instantiation);
+                let func_inst = FunctionInstantiation {
+                    handle: fh_idx,
+                    type_parameters: index,
+                };
+                let func_inst_idx = state.module.add_function_instantiation(func_inst);
+                let effects = effect(func_inst_idx);
+                let instruction = instantiation_application(func_inst_idx);
                 (apply_effects(state, effects), instruction)
             }
             summaries::Effects::NoTyParams(effects) => (apply_effects(state, effects), instruction),
@@ -540,7 +586,7 @@ impl<'a> BytecodeGenerator<'a> {
         let instruction = step.1;
         debug!("Affected: {}", state);
         debug!("Actual instr: {:?}", instruction);
-        if let Bytecode::Call(index, _) = instruction {
+        if let Bytecode::Call(index) = instruction {
             state
                 .call_graph
                 .add_call(fn_context.function_handle_index, index);
@@ -560,8 +606,8 @@ impl<'a> BytecodeGenerator<'a> {
         abstract_state_out: AbstractState,
         module: &CompiledModuleMut,
     ) -> Option<(Vec<Bytecode>, AbstractState)> {
-        debug!("Abstract state in: {}", abstract_state_in.clone());
-        debug!("Abstract state out: {}", abstract_state_out.clone());
+        debug!("Abstract state in: {}", abstract_state_in);
+        debug!("Abstract state out: {}", abstract_state_out);
         let mut bytecode: Vec<Bytecode> = Vec::new();
         let mut state = abstract_state_in.clone();
         // Generate block body
@@ -676,7 +722,7 @@ impl<'a> BytecodeGenerator<'a> {
         &mut self,
         fn_context: &mut FunctionGenerationContext,
         locals: &[SignatureToken],
-        signature: &FunctionSignature,
+        fh: &FunctionHandle,
         acquires_global_resources: &[StructDefinitionIndex],
         module: &mut CompiledModuleMut,
         call_graph: &mut CallGraph,
@@ -685,7 +731,12 @@ impl<'a> BytecodeGenerator<'a> {
         // The number of basic blocks must be at least one based on the
         // generation range.
         assume!(number_of_blocks > 0);
-        let mut cfg = CFG::new(&mut self.rng, locals, signature, number_of_blocks);
+        let mut cfg = CFG::new(
+            &mut self.rng,
+            locals,
+            &module.signatures[fh.parameters.0 as usize],
+            number_of_blocks,
+        );
         let cfg_copy = cfg.clone();
         for (block_id, block) in cfg.get_basic_blocks_mut().iter_mut() {
             debug!(
@@ -695,14 +746,14 @@ impl<'a> BytecodeGenerator<'a> {
             let state1 = AbstractState::from_locals(
                 module.clone(),
                 block.get_locals_in().clone(),
-                signature.type_formals.clone(),
+                fh.type_parameters.clone(),
                 acquires_global_resources.to_vec(),
                 call_graph.clone(),
             );
             let state2 = AbstractState::from_locals(
                 module.clone(),
                 block.get_locals_out().clone(),
-                signature.type_formals.clone(),
+                fh.type_parameters.clone(),
                 acquires_global_resources.to_vec(),
                 call_graph.clone(),
             );
@@ -747,7 +798,7 @@ impl<'a> BytecodeGenerator<'a> {
                     )?
                 } else if cfg_copy.num_children(*block_id) == 0 {
                     // Return: Add return types to last block
-                    for token_type in signature.return_types.iter() {
+                    for token_type in module.signatures[fh.return_.0 as usize].0.iter() {
                         let next_instructions =
                             Self::inhabit_with_bytecode_seq(&mut state_f.module, &token_type);
                         debug!(
@@ -788,25 +839,24 @@ impl<'a> BytecodeGenerator<'a> {
         let mut fdefs = module.function_defs.clone();
         let mut call_graph = CallGraph::new(module.function_handles.len());
         for fdef in fdefs.iter_mut() {
-            let f_handle = &module.function_handles[fdef.function.0 as usize].clone();
-            let func_sig = module.function_signatures[f_handle.signature.0 as usize].clone();
-            let locals_sigs = module.locals_signatures[fdef.code.locals.0 as usize]
-                .0
-                .clone();
-            let mut fn_context = FunctionGenerationContext::new(
-                fdef.function,
-                call_graph.max_calling_depth(fdef.function),
-                locals_sigs.len(),
-                0,
-            );
-            fdef.code.code = self.generate(
-                &mut fn_context,
-                &locals_sigs,
-                &func_sig,
-                &fdef.acquires_global_resources,
-                &mut module,
-                &mut call_graph,
-            )?;
+            if let Some(code) = &mut fdef.code {
+                let f_handle = &module.function_handles[fdef.function.0 as usize].clone();
+                let locals_sigs = module.signatures[code.locals.0 as usize].0.clone();
+                let mut fn_context = FunctionGenerationContext::new(
+                    fdef.function,
+                    call_graph.max_calling_depth(fdef.function),
+                    locals_sigs.len(),
+                    0,
+                );
+                code.code = self.generate(
+                    &mut fn_context,
+                    &locals_sigs,
+                    &f_handle,
+                    &fdef.acquires_global_resources,
+                    &mut module,
+                    &mut call_graph,
+                )?;
+            }
         }
         module.function_defs = fdefs;
         Some(module)
@@ -820,13 +870,12 @@ impl<'a> BytecodeGenerator<'a> {
         token: &SignatureToken,
     ) -> Vec<Bytecode> {
         match token {
-            SignatureToken::Address => vec![Bytecode::LdAddr(AddressPoolIndex::new(0))],
+            SignatureToken::Address => vec![Bytecode::LdConst(ConstantPoolIndex(0))],
             SignatureToken::U64 => vec![Bytecode::LdU64(0)],
             SignatureToken::U8 => vec![Bytecode::LdU8(0)],
             SignatureToken::U128 => vec![Bytecode::LdU128(0)],
             SignatureToken::Bool => vec![Bytecode::LdFalse],
-            SignatureToken::ByteArray => vec![Bytecode::LdByteArray(ByteArrayPoolIndex::new(0))],
-            SignatureToken::Struct(handle_idx, instantiation) => {
+            SignatureToken::Struct(handle_idx) => {
                 let struct_def_idx = module
                     .module
                     .struct_defs()
@@ -838,30 +887,55 @@ impl<'a> BytecodeGenerator<'a> {
                 let struct_def = module
                     .module
                     .struct_def_at(StructDefinitionIndex(struct_def_idx as TableIndex));
-                let (num_fields, index) = match struct_def.field_information {
+                let fields = match &struct_def.field_information {
                     StructFieldInformation::Native => panic!("Can't inhabit native structs"),
-                    StructFieldInformation::Declared {
-                        field_count,
-                        fields,
-                    } => (field_count, fields.0),
+                    StructFieldInformation::Declared(fields) => fields.clone(),
                 };
-                let fields = module
-                    .module
-                    .field_def_range(num_fields, FieldDefinitionIndex(index))
-                    .to_vec();
                 let mut bytecodes: Vec<Bytecode> = fields
                     .iter()
                     .flat_map(|field| {
-                        let field_sig_tok = &module.module.type_signature_at(field.signature).0;
-                        let reified_field_sig_tok = field_sig_tok.substitute(&instantiation);
+                        let field_sig_tok = &field.signature.0;
+                        Self::inhabit_with_bytecode_seq(module, &field_sig_tok)
+                    })
+                    .collect();
+                bytecodes.push(Bytecode::Pack(StructDefinitionIndex(
+                    struct_def_idx as TableIndex,
+                )));
+                bytecodes
+            }
+            SignatureToken::StructInstantiation(handle_idx, instantiation) => {
+                let struct_def_idx = module
+                    .module
+                    .struct_defs()
+                    .iter()
+                    .position(|struct_def| struct_def.struct_handle == *handle_idx)
+                    .expect(
+                        "struct def should exist for every struct handle in the test generator",
+                    );
+                let struct_def = module
+                    .module
+                    .struct_def_at(StructDefinitionIndex(struct_def_idx as TableIndex));
+                let fields = match &struct_def.field_information {
+                    StructFieldInformation::Native => panic!("Can't inhabit native structs"),
+                    StructFieldInformation::Declared(fields) => fields.clone(),
+                };
+                let mut bytecodes: Vec<Bytecode> = fields
+                    .iter()
+                    .flat_map(|field| {
+                        let field_sig_tok = &field.signature.0;
+                        let reified_field_sig_tok = substitute(field_sig_tok, &instantiation);
                         Self::inhabit_with_bytecode_seq(module, &reified_field_sig_tok)
                     })
                     .collect();
                 let instantiation_index = module.add_instantiation(instantiation.clone());
-                bytecodes.push(Bytecode::Pack(
-                    StructDefinitionIndex(struct_def_idx as TableIndex),
-                    instantiation_index,
-                ));
+                let struct_inst = StructDefInstantiation {
+                    def: StructDefinitionIndex(struct_def_idx as TableIndex),
+                    type_parameters: instantiation_index,
+                };
+                let si_idx = module.add_struct_instantiation(struct_inst);
+                bytecodes.push(Bytecode::PackGeneric(StructDefInstantiationIndex(
+                    si_idx.0 as TableIndex,
+                )));
                 bytecodes
             }
             _ => unimplemented!("Unsupported inhabitation. Type: {:#?}", token),

@@ -2,40 +2,39 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{counters, state_replication::StateComputer};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Error, Result};
 use consensus_types::block::Block;
-use consensus_types::executed_block::ExecutedBlock;
-use executor::{ExecutedTrees, Executor, ProcessedVMOutput};
+use executor_types::{BlockExecutor, StateComputeResult};
+use libra_crypto::HashValue;
 use libra_logger::prelude::*;
-use libra_types::crypto_proxies::ValidatorChangeProof;
-use libra_types::{
-    crypto_proxies::LedgerInfoWithSignatures,
-    transaction::{SignedTransaction, Transaction},
-};
+use libra_types::{ledger_info::LedgerInfoWithSignatures, transaction::Transaction};
 use state_synchronizer::StateSyncClient;
 use std::{
+    boxed::Box,
     convert::TryFrom,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use vm_runtime::LibraVM;
 
 /// Basic communication with the Execution module;
 /// implements StateComputer traits.
 pub struct ExecutionProxy {
-    executor: Arc<Executor<LibraVM>>,
+    execution_correctness_client: Mutex<Box<dyn BlockExecutor + Send + Sync>>,
     synchronizer: Arc<StateSyncClient>,
 }
 
 impl ExecutionProxy {
-    pub fn new(executor: Arc<Executor<LibraVM>>, synchronizer: Arc<StateSyncClient>) -> Self {
+    pub fn new(
+        execution_correctness_client: Box<dyn BlockExecutor + Send + Sync>,
+        synchronizer: Arc<StateSyncClient>,
+    ) -> Self {
         Self {
-            executor,
+            execution_correctness_client: Mutex::new(execution_correctness_client),
             synchronizer,
         }
     }
 
-    fn transactions_from_block(block: &Block<Vec<SignedTransaction>>) -> Vec<Transaction> {
+    fn transactions_from_block(block: &Block) -> Vec<Transaction> {
         let mut transactions = vec![Transaction::BlockMetadata(block.into())];
         transactions.extend(
             block
@@ -50,17 +49,13 @@ impl ExecutionProxy {
 
 #[async_trait::async_trait]
 impl StateComputer for ExecutionProxy {
-    type Payload = Vec<SignedTransaction>;
-
     fn compute(
         &self,
         // The block to be executed.
-        block: &Block<Self::Payload>,
-        // The executed trees after executing the parent block.
-        parent_executed_trees: &ExecutedTrees,
-        // The last committed trees.
-        committed_trees: &ExecutedTrees,
-    ) -> Result<ProcessedVMOutput> {
+        block: &Block,
+        // The parent block id.
+        parent_block_id: HashValue,
+    ) -> Result<StateComputeResult> {
         let pre_execution_instant = Instant::now();
         debug!(
             "Executing block {:x}. Parent: {:x}.",
@@ -69,15 +64,17 @@ impl StateComputer for ExecutionProxy {
         );
 
         // TODO: figure out error handling for the prologue txn
-        self.executor
+        self.execution_correctness_client
+            .lock()
+            .unwrap()
             .execute_block(
-                Self::transactions_from_block(block),
-                parent_executed_trees,
-                committed_trees,
+                (block.id(), Self::transactions_from_block(block)),
+                parent_block_id,
             )
-            .and_then(|output| {
+            .map_err(Error::from)
+            .and_then(|result| {
                 let execution_duration = pre_execution_instant.elapsed();
-                let num_txns = output.transaction_data().len();
+                let num_txns = result.transaction_info_hashes().len();
                 ensure!(num_txns > 0, "metadata txn failed to execute");
                 counters::BLOCK_EXECUTION_DURATION_S.observe_duration(execution_duration);
                 if let Ok(nanos_per_txn) =
@@ -88,36 +85,32 @@ impl StateComputer for ExecutionProxy {
                     counters::TXN_EXECUTION_DURATION_S
                         .observe_duration(Duration::from_nanos(nanos_per_txn));
                 }
-                Ok(output)
+                Ok(result)
             })
     }
 
     /// Send a successful commit. A future is fulfilled when the state is finalized.
     async fn commit(
         &self,
-        blocks: Vec<&ExecutedBlock<Self::Payload>>,
+        block_ids: Vec<HashValue>,
         finality_proof: LedgerInfoWithSignatures,
-        committed_trees: &ExecutedTrees,
     ) -> Result<()> {
         let version = finality_proof.ledger_info().version();
         counters::LAST_COMMITTED_VERSION.set(version as i64);
 
         let pre_commit_instant = Instant::now();
 
-        let committable_blocks = blocks
-            .into_iter()
-            .map(|executed_block| {
-                (
-                    Self::transactions_from_block(executed_block.block()),
-                    Arc::clone(executed_block.output()),
-                )
-            })
-            .collect();
-
-        self.executor
-            .commit_blocks(committable_blocks, finality_proof, committed_trees)?;
+        let (committed_txns, reconfig_events) = self
+            .execution_correctness_client
+            .lock()
+            .unwrap()
+            .commit_blocks(block_ids, finality_proof)?;
         counters::BLOCK_COMMIT_DURATION_S.observe_duration(pre_commit_instant.elapsed());
-        if let Err(e) = self.synchronizer.commit().await {
+        if let Err(e) = self
+            .synchronizer
+            .commit(committed_txns, reconfig_events)
+            .await
+        {
             error!("failed to notify state synchronizer: {:?}", e);
         }
         Ok(())
@@ -126,16 +119,15 @@ impl StateComputer for ExecutionProxy {
     /// Synchronize to a commit that not present locally.
     async fn sync_to(&self, target: LedgerInfoWithSignatures) -> Result<()> {
         counters::STATE_SYNC_COUNT.inc();
-        self.synchronizer.sync_to(target).await
-    }
-
-    async fn get_epoch_proof(
-        &self,
-        start_epoch: u64,
-        end_epoch: u64,
-    ) -> Result<ValidatorChangeProof> {
-        self.synchronizer
-            .get_epoch_proof(start_epoch, end_epoch)
-            .await
+        // Here to start to do state synchronization where ChunkExecutor inside will
+        // process chunks and commit to Storage. However, after block execution and
+        // commitments, the the sync state of ChunkExecutor may be not up to date so
+        // it is required to reset the cache of ChunkExecutor in StateSynchronizer
+        // when requested to sync.
+        let res = self.synchronizer.sync_to(target).await;
+        // Similarily, after the state synchronization, we have to reset the cache
+        // of BlockExecutor to guarantee the latest committed state is up to date.
+        self.execution_correctness_client.lock().unwrap().reset()?;
+        res
     }
 }

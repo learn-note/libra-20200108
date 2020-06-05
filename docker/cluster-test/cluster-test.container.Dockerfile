@@ -7,7 +7,8 @@
 ## - To comment must use double ##, single # will be treated as pre-processor command
 ## -
 FROM debian:buster
-RUN apt-get update && apt-get install -y openssh-client
+RUN apt-get update && apt-get install -y openssh-client wget
+RUN cd /usr/local/bin && wget "https://storage.googleapis.com/kubernetes-release/release/v1.17.0/bin/linux/amd64/kubectl" -O kubectl && chmod +x kubectl
 RUN mkdir /etc/cluster-test
 WORKDIR /etc/cluster-test
 COPY cluster_test_docker_builder_cluster_test /usr/local/bin/cluster-test

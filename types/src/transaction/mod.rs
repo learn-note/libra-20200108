@@ -3,32 +3,37 @@
 
 use crate::{
     account_address::AccountAddress,
+    account_config::LBR_NAME,
     account_state_blob::AccountStateBlob,
     block_metadata::BlockMetadata,
     contract_event::ContractEvent,
     ledger_info::LedgerInfo,
-    proof::{accumulator::InMemoryAccumulator, TransactionListProof, TransactionProof},
+    proof::{accumulator::InMemoryAccumulator, TransactionInfoWithProof, TransactionListProof},
+    transaction::authenticator::TransactionAuthenticator,
     vm_error::{StatusCode, StatusType, VMStatus},
     write_set::WriteSet,
 };
 use anyhow::{ensure, format_err, Error, Result};
 use libra_crypto::{
     ed25519::*,
-    hash::{CryptoHash, CryptoHasher, EventAccumulatorHasher},
-    traits::*,
+    hash::{CryptoHash, EventAccumulatorHasher},
+    multi_ed25519::{MultiEd25519PublicKey, MultiEd25519Signature},
+    traits::SigningKey,
     HashValue,
 };
-use libra_crypto_derive::CryptoHasher;
+use libra_crypto_derive::{CryptoHasher, LCSCryptoHash};
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{de, ser, Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    convert::{TryFrom, TryInto},
+    convert::TryFrom,
     fmt,
+    fmt::{Display, Formatter},
     time::Duration,
 };
 
+pub mod authenticator;
 mod change_set;
 pub mod helpers;
 mod module;
@@ -40,14 +45,17 @@ pub use module::Module;
 pub use script::{Script, SCRIPT_HASH_LENGTH};
 
 use std::ops::Deref;
-pub use transaction_argument::{parse_as_transaction_argument, TransactionArgument};
+pub use transaction_argument::{parse_transaction_argument, TransactionArgument};
 
 pub type Version = u64; // Height - also used for MVCC in StateDB
+
+// In StateDB, things readable by the genesis transaction are under this version.
+pub const PRE_GENESIS_VERSION: Version = u64::max_value();
 
 pub const MAX_TRANSACTION_SIZE_IN_BYTES: usize = 4096;
 
 /// RawTransaction is the portion of a transaction that a client signs
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize, CryptoHasher, LCSCryptoHash)]
 pub struct RawTransaction {
     /// Sender's address.
     sender: AccountAddress,
@@ -60,6 +68,9 @@ pub struct RawTransaction {
     max_gas_amount: u64,
     // Maximal price can be paid per gas.
     gas_unit_price: u64,
+
+    gas_currency_code: String,
+
     // Expiration time for this transaction.  If storage is queried and
     // the time returned is greater than or equal to this time and this
     // transaction has not been included, you can be certain that it will
@@ -113,6 +124,7 @@ impl RawTransaction {
         payload: TransactionPayload,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
         expiration_time: Duration,
     ) -> Self {
         RawTransaction {
@@ -121,6 +133,7 @@ impl RawTransaction {
             payload,
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
             expiration_time,
         }
     }
@@ -134,6 +147,7 @@ impl RawTransaction {
         script: Script,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
         expiration_time: Duration,
     ) -> Self {
         RawTransaction {
@@ -142,6 +156,7 @@ impl RawTransaction {
             payload: TransactionPayload::Script(script),
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
             expiration_time,
         }
     }
@@ -156,6 +171,7 @@ impl RawTransaction {
         module: Module,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
         expiration_time: Duration,
     ) -> Self {
         RawTransaction {
@@ -164,6 +180,7 @@ impl RawTransaction {
             payload: TransactionPayload::Module(module),
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
             expiration_time,
         }
     }
@@ -180,6 +197,7 @@ impl RawTransaction {
             // Since write-set transactions bypass the VM, these fields aren't relevant.
             max_gas_amount: 0,
             gas_unit_price: 0,
+            gas_currency_code: LBR_NAME.to_owned(),
             // Write-set transactions are special and important and shouldn't expire.
             expiration_time: Duration::new(u64::max_value(), 0),
         }
@@ -197,6 +215,7 @@ impl RawTransaction {
             // Since write-set transactions bypass the VM, these fields aren't relevant.
             max_gas_amount: 0,
             gas_unit_price: 0,
+            gas_currency_code: LBR_NAME.to_owned(),
             // Write-set transactions are special and important and shouldn't expire.
             expiration_time: Duration::new(u64::max_value(), 0),
         }
@@ -215,6 +234,18 @@ impl RawTransaction {
         Ok(SignatureCheckedTransaction(SignedTransaction::new(
             self, public_key, signature,
         )))
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn multi_sign_for_testing(
+        self,
+        private_key: &Ed25519PrivateKey,
+        public_key: Ed25519PublicKey,
+    ) -> Result<SignatureCheckedTransaction> {
+        let signature = private_key.sign_message(&self.hash());
+        Ok(SignatureCheckedTransaction(
+            SignedTransaction::new_multisig(self, public_key.into(), signature.into()),
+        ))
     }
 
     pub fn into_payload(self) -> TransactionPayload {
@@ -248,6 +279,7 @@ impl RawTransaction {
              \t}}, \n\
              \tmax_gas_amount: {}, \n\
              \tgas_unit_price: {}, \n\
+             \tgas_currency_code: {}, \n\
              \texpiration_time: {:#?}, \n\
              }}",
             self.sender,
@@ -256,26 +288,13 @@ impl RawTransaction {
             f_args,
             self.max_gas_amount,
             self.gas_unit_price,
+            self.gas_currency_code,
             self.expiration_time,
         )
     }
     /// Return the sender of this transaction.
     pub fn sender(&self) -> AccountAddress {
         self.sender
-    }
-}
-
-impl CryptoHash for RawTransaction {
-    type Hasher = RawTransactionHasher;
-
-    fn hash(&self) -> HashValue {
-        let mut state = Self::Hasher::default();
-        state.write(
-            lcs::to_bytes(self)
-                .expect("Failed to serialize RawTransaction")
-                .as_slice(),
-        );
-        state.finish()
     }
 }
 
@@ -299,17 +318,13 @@ pub enum TransactionPayload {
 /// **IMPORTANT:** The signature of a `SignedTransaction` is not guaranteed to be verified. For a
 /// transaction whose signature is statically guaranteed to be verified, see
 /// [`SignatureCheckedTransaction`].
-#[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize, CryptoHasher)]
+#[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct SignedTransaction {
     /// The raw transaction
     raw_txn: RawTransaction,
 
-    /// Sender's public key. When checking the signature, we first need to check whether this key
-    /// is indeed the pre-image of the pubkey hash stored under sender's account.
-    public_key: Ed25519PublicKey,
-
-    /// Signature of the transaction that correspond to the public key
-    signature: Ed25519Signature,
+    /// Public key and signature to authenticate
+    authenticator: TransactionAuthenticator,
 }
 
 /// A transaction for which the signature has been verified. Created by
@@ -343,11 +358,10 @@ impl fmt::Debug for SignedTransaction {
             f,
             "SignedTransaction {{ \n \
              {{ raw_txn: {:#?}, \n \
-             public_key: {:#?}, \n \
-             signature: {:#?}, \n \
+             authenticator: {:#?}, \n \
              }} \n \
              }}",
-            self.raw_txn, self.public_key, self.signature,
+            self.raw_txn, self.authenticator
         )
     }
 }
@@ -358,19 +372,27 @@ impl SignedTransaction {
         public_key: Ed25519PublicKey,
         signature: Ed25519Signature,
     ) -> SignedTransaction {
+        let authenticator = TransactionAuthenticator::ed25519(public_key, signature);
         SignedTransaction {
             raw_txn,
-            public_key,
-            signature,
+            authenticator,
         }
     }
 
-    pub fn public_key(&self) -> Ed25519PublicKey {
-        self.public_key.clone()
+    pub fn new_multisig(
+        raw_txn: RawTransaction,
+        public_key: MultiEd25519PublicKey,
+        signature: MultiEd25519Signature,
+    ) -> SignedTransaction {
+        let authenticator = TransactionAuthenticator::multi_ed25519(public_key, signature);
+        SignedTransaction {
+            raw_txn,
+            authenticator,
+        }
     }
 
-    pub fn signature(&self) -> Ed25519Signature {
-        self.signature.clone()
+    pub fn authenticator(&self) -> TransactionAuthenticator {
+        self.authenticator.clone()
     }
 
     pub fn sender(&self) -> AccountAddress {
@@ -397,6 +419,10 @@ impl SignedTransaction {
         self.raw_txn.gas_unit_price
     }
 
+    pub fn gas_currency_code(&self) -> &str {
+        &self.raw_txn.gas_currency_code
+    }
+
     pub fn expiration_time(&self) -> Duration {
         self.raw_txn.expiration_time
     }
@@ -410,8 +436,7 @@ impl SignedTransaction {
     /// Checks that the signature of given transaction. Returns `Ok(SignatureCheckedTransaction)` if
     /// the signature is valid.
     pub fn check_signature(self) -> Result<SignatureCheckedTransaction> {
-        self.public_key
-            .verify_signature(&self.raw_txn.hash(), &self.signature)?;
+        self.authenticator.verify_signature(&self.raw_txn.hash())?;
         Ok(SignatureCheckedTransaction(self))
     }
 
@@ -419,47 +444,37 @@ impl SignedTransaction {
         format!(
             "SignedTransaction {{ \n \
              raw_txn: {}, \n \
-             public_key: {:#?}, \n \
-             signature: {:#?}, \n \
+             authenticator: {:#?}, \n \
              }}",
             self.raw_txn.format_for_client(get_transaction_name),
-            self.public_key,
-            self.signature,
+            self.authenticator
         )
     }
 }
 
-impl TryFrom<crate::proto::types::SignedTransaction> for SignedTransaction {
-    type Error = Error;
-
-    fn try_from(txn: crate::proto::types::SignedTransaction) -> Result<Self> {
-        lcs::from_bytes(&txn.txn_bytes).map_err(Into::into)
-    }
-}
-
-impl From<SignedTransaction> for crate::proto::types::SignedTransaction {
-    fn from(txn: SignedTransaction) -> Self {
-        let txn_bytes = lcs::to_bytes(&txn).expect("Unable to serialize SignedTransaction");
-        Self { txn_bytes }
-    }
-}
-
-impl From<SignatureCheckedTransaction> for crate::proto::types::SignedTransaction {
-    fn from(txn: SignatureCheckedTransaction) -> Self {
-        txn.0.into()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct TransactionWithProof {
     pub version: Version,
     pub transaction: Transaction,
     pub events: Option<Vec<ContractEvent>>,
-    pub proof: TransactionProof,
+    pub proof: TransactionInfoWithProof,
 }
 
 impl TransactionWithProof {
+    pub fn new(
+        version: Version,
+        transaction: Transaction,
+        events: Option<Vec<ContractEvent>>,
+        proof: TransactionInfoWithProof,
+    ) -> Self {
+        Self {
+            version,
+            transaction,
+            events,
+            proof,
+        }
+    }
     /// Verifies the transaction with the proof, both carried by `self`.
     ///
     /// A few things are ensured if no error is raised:
@@ -497,84 +512,61 @@ impl TransactionWithProof {
             sequence_number,
         );
 
-        let events_root_hash = self.events.as_ref().map(|events| {
+        let txn_hash = self.transaction.hash();
+        ensure!(
+            txn_hash == self.proof.transaction_info().transaction_hash,
+            "Transaction hash ({}) not expected ({}).",
+            txn_hash,
+            self.proof.transaction_info().transaction_hash,
+        );
+
+        if let Some(events) = &self.events {
             let event_hashes: Vec<_> = events.iter().map(ContractEvent::hash).collect();
-            InMemoryAccumulator::<EventAccumulatorHasher>::from_leaves(&event_hashes).root_hash()
-        });
-        self.proof.verify(
-            ledger_info,
-            self.transaction.hash(),
-            events_root_hash,
-            version,
-        )
-    }
-}
-
-impl TryFrom<crate::proto::types::TransactionWithProof> for TransactionWithProof {
-    type Error = Error;
-
-    fn try_from(mut proto: crate::proto::types::TransactionWithProof) -> Result<Self> {
-        let version = proto.version;
-        let transaction = proto
-            .transaction
-            .ok_or_else(|| format_err!("Missing transaction"))?
-            .try_into()?;
-        let proof = proto
-            .proof
-            .ok_or_else(|| format_err!("Missing proof"))?
-            .try_into()?;
-        let events = proto
-            .events
-            .take()
-            .map(|list| {
-                list.events
-                    .into_iter()
-                    .map(ContractEvent::try_from)
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?;
-
-        Ok(Self {
-            version,
-            transaction,
-            proof,
-            events,
-        })
-    }
-}
-
-impl From<TransactionWithProof> for crate::proto::types::TransactionWithProof {
-    fn from(mut txn: TransactionWithProof) -> Self {
-        Self {
-            version: txn.version,
-            transaction: Some(txn.transaction.into()),
-            proof: Some(txn.proof.into()),
-            events: txn
-                .events
-                .take()
-                .map(|list| crate::proto::types::EventsList {
-                    events: list.into_iter().map(ContractEvent::into).collect(),
-                }),
+            let event_root_hash =
+                InMemoryAccumulator::<EventAccumulatorHasher>::from_leaves(&event_hashes[..])
+                    .root_hash();
+            ensure!(
+                event_root_hash == self.proof.transaction_info().event_root_hash,
+                "Event root hash ({}) not expected ({}).",
+                event_root_hash,
+                self.proof.transaction_info().event_root_hash,
+            );
         }
+
+        self.proof.verify(ledger_info, version)
     }
 }
 
 /// The status of executing a transaction. The VM decides whether or not we should `Keep` the
 /// transaction output or `Discard` it based upon the execution of the transaction. We wrap these
 /// decisions around a `VMStatus` that provides more detail on the final execution state of the VM.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TransactionStatus {
     /// Discard the transaction output
     Discard(VMStatus),
 
     /// Keep the transaction output
     Keep(VMStatus),
+
+    /// Retry the transaction because it is after a ValidatorSetChange txn
+    Retry,
 }
 
 impl TransactionStatus {
-    pub fn vm_status(&self) -> &VMStatus {
+    pub fn vm_status(&self) -> VMStatus {
         match self {
-            TransactionStatus::Discard(vm_status) | TransactionStatus::Keep(vm_status) => vm_status,
+            TransactionStatus::Discard(vm_status) | TransactionStatus::Keep(vm_status) => {
+                vm_status.clone()
+            }
+            TransactionStatus::Retry => VMStatus::new(StatusCode::UNKNOWN_VALIDATION_STATUS),
+        }
+    }
+
+    pub fn is_discarded(&self) -> bool {
+        match self {
+            TransactionStatus::Discard(_) => true,
+            TransactionStatus::Keep(_) => false,
+            TransactionStatus::Retry => true,
         }
     }
 }
@@ -603,6 +595,36 @@ impl From<VMStatus> for TransactionStatus {
         } else {
             TransactionStatus::Keep(vm_status)
         }
+    }
+}
+
+/// The result of running the transaction through the VM validator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VMValidatorResult {
+    status: Option<VMStatus>,
+    score: u64,
+    is_governance_txn: bool,
+}
+
+impl VMValidatorResult {
+    pub fn new(status: Option<VMStatus>, score: u64, is_governance_txn: bool) -> Self {
+        Self {
+            status,
+            score,
+            is_governance_txn,
+        }
+    }
+
+    pub fn status(&self) -> Option<VMStatus> {
+        self.status.clone()
+    }
+
+    pub fn score(&self) -> u64 {
+        self.score
+    }
+
+    pub fn is_governance_txn(&self) -> bool {
+        self.is_governance_txn
     }
 }
 
@@ -654,41 +676,9 @@ impl TransactionOutput {
     }
 }
 
-impl TryFrom<crate::proto::types::TransactionInfo> for TransactionInfo {
-    type Error = Error;
-
-    fn try_from(proto_txn_info: crate::proto::types::TransactionInfo) -> Result<Self> {
-        let transaction_hash = HashValue::from_slice(&proto_txn_info.transaction_hash)?;
-        let state_root_hash = HashValue::from_slice(&proto_txn_info.state_root_hash)?;
-        let event_root_hash = HashValue::from_slice(&proto_txn_info.event_root_hash)?;
-        let gas_used = proto_txn_info.gas_used;
-        let major_status =
-            StatusCode::try_from(proto_txn_info.major_status).unwrap_or(StatusCode::UNKNOWN_STATUS);
-        Ok(TransactionInfo::new(
-            transaction_hash,
-            state_root_hash,
-            event_root_hash,
-            gas_used,
-            major_status,
-        ))
-    }
-}
-
-impl From<TransactionInfo> for crate::proto::types::TransactionInfo {
-    fn from(txn_info: TransactionInfo) -> Self {
-        Self {
-            transaction_hash: txn_info.transaction_hash.to_vec(),
-            state_root_hash: txn_info.state_root_hash.to_vec(),
-            event_root_hash: txn_info.event_root_hash.to_vec(),
-            gas_used: txn_info.gas_used,
-            major_status: txn_info.major_status.into(),
-        }
-    }
-}
-
 /// `TransactionInfo` is the object we store in the transaction accumulator. It consists of the
 /// transaction as well as the execution result of this transaction.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
+#[derive(Clone, CryptoHasher, LCSCryptoHash, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct TransactionInfo {
     /// The hash of this transaction.
@@ -756,17 +746,17 @@ impl TransactionInfo {
     }
 }
 
-impl CryptoHash for TransactionInfo {
-    type Hasher = TransactionInfoHasher;
-
-    fn hash(&self) -> HashValue {
-        let mut state = Self::Hasher::default();
-        state.write(&lcs::to_bytes(self).expect("Serialization should work."));
-        state.finish()
+impl Display for TransactionInfo {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "TransactionInfo: [txn_hash: {}, state_root_hash: {}, event_root_hash: {}, gas_used: {}, major_status: {:?}]",
+            self.transaction_hash(), self.state_root_hash(), self.event_root_hash(), self.gas_used(), self.major_status(),
+        )
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct TransactionToCommit {
     transaction: Transaction,
     account_states: HashMap<AccountAddress, AccountStateBlob>,
@@ -810,67 +800,6 @@ impl TransactionToCommit {
 
     pub fn major_status(&self) -> StatusCode {
         self.major_status
-    }
-}
-
-impl TryFrom<crate::proto::types::TransactionToCommit> for TransactionToCommit {
-    type Error = Error;
-
-    fn try_from(proto: crate::proto::types::TransactionToCommit) -> Result<Self> {
-        let transaction = proto
-            .transaction
-            .ok_or_else(|| format_err!("Missing signed_transaction"))?
-            .try_into()?;
-        let num_account_states = proto.account_states.len();
-        let account_states = proto
-            .account_states
-            .into_iter()
-            .map(|x| {
-                Ok((
-                    AccountAddress::try_from(x.address)?,
-                    AccountStateBlob::from(x.blob),
-                ))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        ensure!(
-            account_states.len() == num_account_states,
-            "account_states should have no duplication."
-        );
-        let events = proto
-            .events
-            .into_iter()
-            .map(ContractEvent::try_from)
-            .collect::<Result<Vec<_>>>()?;
-        let gas_used = proto.gas_used;
-        let major_status =
-            StatusCode::try_from(proto.major_status).unwrap_or(StatusCode::UNKNOWN_STATUS);
-
-        Ok(TransactionToCommit {
-            transaction,
-            account_states,
-            events,
-            gas_used,
-            major_status,
-        })
-    }
-}
-
-impl From<TransactionToCommit> for crate::proto::types::TransactionToCommit {
-    fn from(txn: TransactionToCommit) -> Self {
-        Self {
-            transaction: Some(txn.transaction.into()),
-            account_states: txn
-                .account_states
-                .into_iter()
-                .map(|(address, blob)| crate::proto::types::AccountState {
-                    address: address.as_ref().to_vec(),
-                    blob: blob.into(),
-                })
-                .collect(),
-            events: txn.events.into_iter().map(Into::into).collect(),
-            gas_used: txn.gas_used,
-            major_status: txn.major_status.into(),
-        }
     }
 }
 
@@ -974,78 +903,6 @@ impl TransactionListWithProof {
     }
 }
 
-impl TryFrom<crate::proto::types::TransactionListWithProof> for TransactionListWithProof {
-    type Error = Error;
-
-    fn try_from(mut proto: crate::proto::types::TransactionListWithProof) -> Result<Self> {
-        let transactions = proto
-            .transactions
-            .into_iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<_>>>()?;
-
-        let events = proto
-            .events_for_versions
-            .take() // Option<EventsForVersions>
-            .map(|events_for_versions| {
-                // EventsForVersion
-                events_for_versions
-                    .events_for_version
-                    .into_iter()
-                    .map(|events_for_version| {
-                        events_for_version
-                            .events
-                            .into_iter()
-                            .map(ContractEvent::try_from)
-                            .collect::<Result<Vec<_>>>()
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?;
-
-        let first_transaction_version = proto.first_transaction_version;
-
-        let proof = proto
-            .proof
-            .ok_or_else(|| format_err!("Missing proof."))?
-            .try_into()?;
-
-        Ok(Self::new(
-            transactions,
-            events,
-            first_transaction_version,
-            proof,
-        ))
-    }
-}
-
-impl From<TransactionListWithProof> for crate::proto::types::TransactionListWithProof {
-    fn from(txn: TransactionListWithProof) -> Self {
-        let transactions = txn.transactions.into_iter().map(Into::into).collect();
-
-        let events_for_versions =
-            txn.events
-                .map(|all_events| crate::proto::types::EventsForVersions {
-                    events_for_version: all_events
-                        .into_iter()
-                        .map(|events_for_version| crate::proto::types::EventsList {
-                            events: events_for_version
-                                .into_iter()
-                                .map(ContractEvent::into)
-                                .collect::<Vec<_>>(),
-                        })
-                        .collect::<Vec<_>>(),
-                });
-
-        Self {
-            transactions,
-            events_for_versions,
-            first_transaction_version: txn.first_transaction_version,
-            proof: Some(txn.proof.into()),
-        }
-    }
-}
-
 /// `Transaction` will be the transaction type used internally in the libra node to represent the
 /// transaction to be processed and persisted.
 ///
@@ -1053,7 +910,7 @@ impl From<TransactionListWithProof> for crate::proto::types::TransactionListWith
 /// transaction.
 #[allow(clippy::large_enum_variant)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, CryptoHasher, LCSCryptoHash)]
 pub enum Transaction {
     /// Transaction submitted by the user. e.g: P2P payment transaction, publishing module
     /// transaction, etc.
@@ -1063,7 +920,7 @@ pub enum Transaction {
 
     /// Transaction that applies a WriteSet to the current storage. This should be used for ONLY for
     /// genesis right now.
-    WriteSet(ChangeSet),
+    WaypointWriteSet(ChangeSet),
 
     /// Transaction to update the block metadata resource at the beginning of a block.
     BlockMetadata(BlockMetadata),
@@ -1083,35 +940,10 @@ impl Transaction {
                 user_txn.format_for_client(get_transaction_name)
             }
             // TODO: display proper information for client
-            Transaction::WriteSet(_write_set) => String::from("genesis"),
+            Transaction::WaypointWriteSet(_write_set) => String::from("genesis"),
             // TODO: display proper information for client
             Transaction::BlockMetadata(_block_metadata) => String::from("block_metadata"),
         }
-    }
-}
-
-impl CryptoHash for Transaction {
-    type Hasher = TransactionHasher;
-
-    fn hash(&self) -> HashValue {
-        let mut state = Self::Hasher::default();
-        state.write(&lcs::to_bytes(self).expect("Failed to serialize Transaction."));
-        state.finish()
-    }
-}
-
-impl TryFrom<crate::proto::types::Transaction> for Transaction {
-    type Error = Error;
-
-    fn try_from(proto: crate::proto::types::Transaction) -> Result<Self> {
-        lcs::from_bytes(&proto.transaction).map_err(Into::into)
-    }
-}
-
-impl From<Transaction> for crate::proto::types::Transaction {
-    fn from(txn: Transaction) -> Self {
-        let bytes = lcs::to_bytes(&txn).expect("Serialization should not fail.");
-        Self { transaction: bytes }
     }
 }
 

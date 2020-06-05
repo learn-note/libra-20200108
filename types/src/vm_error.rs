@@ -3,13 +3,12 @@
 
 #![allow(clippy::unit_arg)]
 
-use anyhow::{Error, Result};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
+use anyhow::Result;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest::prelude::*;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use serde::{de, ser};
+use serde::{de, ser, Deserialize, Serialize};
 use std::{convert::TryFrom, fmt};
 
 /// The minimum status code for validation statuses
@@ -44,7 +43,7 @@ pub static EXECUTION_STATUS_MAX_CODE: u64 = 4999;
 
 /// A `VMStatus` is represented as a required major status that is semantic coupled with with
 /// an optional sub status and message.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct VMStatus {
@@ -199,59 +198,8 @@ impl VMStatus {
     }
 }
 
-//***********************************
-// Decoding/Encoding to Protobuffers
-//***********************************
-impl TryFrom<crate::proto::types::VmStatus> for VMStatus {
-    type Error = Error;
-
-    fn try_from(proto: crate::proto::types::VmStatus) -> Result<Self> {
-        let mut status = VMStatus::new(
-            StatusCode::try_from(proto.major_status).unwrap_or(StatusCode::UNKNOWN_STATUS),
-        );
-
-        if proto.has_sub_status {
-            status.set_sub_status(proto.sub_status);
-        }
-
-        if proto.has_message {
-            status.set_message(proto.message);
-        }
-
-        Ok(status)
-    }
-}
-
-impl From<VMStatus> for crate::proto::types::VmStatus {
-    fn from(status: VMStatus) -> Self {
-        let mut proto_status = Self::default();
-
-        proto_status.has_sub_status = false;
-        proto_status.has_message = false;
-
-        // Set major status
-        proto_status.major_status = status.major_status.into();
-
-        // Set minor status if there is one
-        if let Some(sub_status) = status.sub_status {
-            proto_status.has_sub_status = true;
-            proto_status.sub_status = sub_status;
-        }
-
-        // Set info string
-        if let Some(string) = status.message {
-            proto_status.has_message = true;
-            proto_status.message = string;
-        }
-
-        proto_status
-    }
-}
-
 #[allow(non_camel_case_types)]
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord, IntoPrimitive, TryFromPrimitive,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 #[repr(u64)]
 /// We don't derive Arbitrary on this enum because it is too large and breaks proptest. It is
 /// written for a subset of these in proptest_types. We test conversion between this and protobuf
@@ -298,6 +246,15 @@ pub enum StatusCode {
     // Gas unit price submitted with the transaction is above the maximum
     // gas price set in the VM.
     GAS_UNIT_PRICE_ABOVE_MAX_BOUND = 16,
+    // Gas specifier submitted is either malformed (not a valid identifier),
+    // or does not refer to an accepted gas specifier
+    INVALID_GAS_SPECIFIER = 17,
+    // The sending account is frozen
+    SENDING_ACCOUNT_FROZEN = 18,
+    // Unable to deserialize the account blob
+    UNABLE_TO_DESERIALIZE_ACCOUNT = 19,
+    // The currency info was unable to be found
+    CURRENCY_INFO_DOES_NOT_EXIST = 20,
 
     // When a code module/script is published it is verified. These are the
     // possible errors that can arise from the verification process.
@@ -331,7 +288,7 @@ pub enum StatusCode {
     ABORT_TYPE_MISMATCH_ERROR = 1026,
     STLOC_TYPE_MISMATCH_ERROR = 1027,
     STLOC_UNSAFE_TO_DESTROY_ERROR = 1028,
-    RET_UNSAFE_TO_DESTROY_ERROR = 1029,
+    UNSAFE_RET_LOCAL_OR_RESOURCE_STILL_BORROWED = 1029,
     RET_TYPE_MISMATCH_ERROR = 1030,
     RET_BORROWED_MUTABLE_REFERENCE_ERROR = 1031,
     FREEZEREF_TYPE_MISMATCH_ERROR = 1032,
@@ -381,13 +338,24 @@ pub enum StatusCode {
     INVALID_ACQUIRES_RESOURCE_ANNOTATION_ERROR = 1073,
     GLOBAL_REFERENCE_ERROR = 1074,
     CONTRAINT_KIND_MISMATCH = 1075,
-    NUMBER_OF_TYPE_ACTUALS_MISMATCH = 1076,
+    NUMBER_OF_TYPE_ARGUMENTS_MISMATCH = 1076,
     LOOP_IN_INSTANTIATION_GRAPH = 1077,
     UNUSED_LOCALS_SIGNATURE = 1078,
     UNUSED_TYPE_SIGNATURE = 1079,
     /// Reported when a struct has zero fields
     ZERO_SIZED_STRUCT = 1080,
     LINKER_ERROR = 1081,
+    INVALID_CONSTANT_TYPE = 1082,
+    MALFORMED_CONSTANT_DATA = 1083,
+    EMPTY_CODE_UNIT = 1084,
+    INVALID_LOOP_SPLIT = 1085,
+    INVALID_LOOP_BREAK = 1086,
+    INVALID_LOOP_CONTINUE = 1087,
+    UNSAFE_RET_UNUSED_RESOURCES = 1088,
+    TOO_MANY_LOCALS = 1089,
+    MOVETO_TYPE_MISMATCH_ERROR = 1090,
+    MOVETO_NO_RESOURCE_ERROR = 1091,
+    GENERIC_MEMBER_OPCODE_MISMATCH = 1092,
 
     // These are errors that the VM might raise if a violation of internal
     // invariants takes place.
@@ -405,6 +373,8 @@ pub enum StatusCode {
     EVENT_KEY_MISMATCH = 2010,
     UNREACHABLE = 2011,
     VM_STARTUP_FAILURE = 2012,
+    NATIVE_FUNCTION_INTERNAL_INCONSISTENCY = 2013,
+    INVALID_CODE_CACHE = 2014,
 
     // Errors that can arise from binary decoding (deserialization)
     // Deserializtion Errors: 3000-3999
@@ -420,6 +390,15 @@ pub enum StatusCode {
     UNEXPECTED_SIGNATURE_TYPE = 3009,
     DUPLICATE_TABLE = 3010,
     VERIFIER_INVARIANT_VIOLATION = 3011,
+    UNKNOWN_NOMINAL_RESOURCE = 3012,
+    UNKNOWN_KIND = 3013,
+    UNKNOWN_NATIVE_STRUCT_FLAG = 3014,
+    BAD_ULEB_U16 = 3015,
+    BAD_ULEB_U32 = 3016,
+    BAD_U16 = 3017,
+    BAD_U32 = 3018,
+    BAD_U64 = 3019,
+    BAD_U128 = 3020,
 
     // Errors that can arise at runtime
     // Runtime Errors: 4000-4999
@@ -454,7 +433,6 @@ pub enum StatusCode {
     CALL_STACK_OVERFLOW = 4021,
     NATIVE_FUNCTION_ERROR = 4022,
     GAS_SCHEDULE_ERROR = 4023,
-    CREATE_NULL_ACCOUNT = 4024,
 
     // A reserved status to represent an unknown vm status.
     UNKNOWN_STATUS = std::u64::MAX,
@@ -495,6 +473,172 @@ impl<'de> de::Deserialize<'de> for StatusCode {
     }
 }
 
+impl TryFrom<u64> for StatusCode {
+    type Error = &'static str;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(StatusCode::UNKNOWN_VALIDATION_STATUS),
+            1 => Ok(StatusCode::INVALID_SIGNATURE),
+            2 => Ok(StatusCode::INVALID_AUTH_KEY),
+            3 => Ok(StatusCode::SEQUENCE_NUMBER_TOO_OLD),
+            4 => Ok(StatusCode::SEQUENCE_NUMBER_TOO_NEW),
+            5 => Ok(StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE),
+            6 => Ok(StatusCode::TRANSACTION_EXPIRED),
+            7 => Ok(StatusCode::SENDING_ACCOUNT_DOES_NOT_EXIST),
+            8 => Ok(StatusCode::REJECTED_WRITE_SET),
+            9 => Ok(StatusCode::INVALID_WRITE_SET),
+            10 => Ok(StatusCode::EXCEEDED_MAX_TRANSACTION_SIZE),
+            11 => Ok(StatusCode::UNKNOWN_SCRIPT),
+            12 => Ok(StatusCode::UNKNOWN_MODULE),
+            13 => Ok(StatusCode::MAX_GAS_UNITS_EXCEEDS_MAX_GAS_UNITS_BOUND),
+            14 => Ok(StatusCode::MAX_GAS_UNITS_BELOW_MIN_TRANSACTION_GAS_UNITS),
+            15 => Ok(StatusCode::GAS_UNIT_PRICE_BELOW_MIN_BOUND),
+            16 => Ok(StatusCode::GAS_UNIT_PRICE_ABOVE_MAX_BOUND),
+            1000 => Ok(StatusCode::UNKNOWN_VERIFICATION_ERROR),
+            1001 => Ok(StatusCode::INDEX_OUT_OF_BOUNDS),
+            1002 => Ok(StatusCode::RANGE_OUT_OF_BOUNDS),
+            1003 => Ok(StatusCode::INVALID_SIGNATURE_TOKEN),
+            1004 => Ok(StatusCode::INVALID_FIELD_DEF),
+            1005 => Ok(StatusCode::RECURSIVE_STRUCT_DEFINITION),
+            1006 => Ok(StatusCode::INVALID_RESOURCE_FIELD),
+            1007 => Ok(StatusCode::INVALID_FALL_THROUGH),
+            1008 => Ok(StatusCode::JOIN_FAILURE),
+            1009 => Ok(StatusCode::NEGATIVE_STACK_SIZE_WITHIN_BLOCK),
+            1010 => Ok(StatusCode::UNBALANCED_STACK),
+            1011 => Ok(StatusCode::INVALID_MAIN_FUNCTION_SIGNATURE),
+            1012 => Ok(StatusCode::DUPLICATE_ELEMENT),
+            1013 => Ok(StatusCode::INVALID_MODULE_HANDLE),
+            1014 => Ok(StatusCode::UNIMPLEMENTED_HANDLE),
+            1015 => Ok(StatusCode::INCONSISTENT_FIELDS),
+            1016 => Ok(StatusCode::UNUSED_FIELD),
+            1017 => Ok(StatusCode::LOOKUP_FAILED),
+            1018 => Ok(StatusCode::VISIBILITY_MISMATCH),
+            1019 => Ok(StatusCode::TYPE_RESOLUTION_FAILURE),
+            1020 => Ok(StatusCode::TYPE_MISMATCH),
+            1021 => Ok(StatusCode::MISSING_DEPENDENCY),
+            1022 => Ok(StatusCode::POP_REFERENCE_ERROR),
+            1023 => Ok(StatusCode::POP_RESOURCE_ERROR),
+            1024 => Ok(StatusCode::RELEASEREF_TYPE_MISMATCH_ERROR),
+            1025 => Ok(StatusCode::BR_TYPE_MISMATCH_ERROR),
+            1026 => Ok(StatusCode::ABORT_TYPE_MISMATCH_ERROR),
+            1027 => Ok(StatusCode::STLOC_TYPE_MISMATCH_ERROR),
+            1028 => Ok(StatusCode::STLOC_UNSAFE_TO_DESTROY_ERROR),
+            1029 => Ok(StatusCode::UNSAFE_RET_LOCAL_OR_RESOURCE_STILL_BORROWED),
+            1030 => Ok(StatusCode::RET_TYPE_MISMATCH_ERROR),
+            1031 => Ok(StatusCode::RET_BORROWED_MUTABLE_REFERENCE_ERROR),
+            1032 => Ok(StatusCode::FREEZEREF_TYPE_MISMATCH_ERROR),
+            1033 => Ok(StatusCode::FREEZEREF_EXISTS_MUTABLE_BORROW_ERROR),
+            1034 => Ok(StatusCode::BORROWFIELD_TYPE_MISMATCH_ERROR),
+            1035 => Ok(StatusCode::BORROWFIELD_BAD_FIELD_ERROR),
+            1036 => Ok(StatusCode::BORROWFIELD_EXISTS_MUTABLE_BORROW_ERROR),
+            1037 => Ok(StatusCode::COPYLOC_UNAVAILABLE_ERROR),
+            1038 => Ok(StatusCode::COPYLOC_RESOURCE_ERROR),
+            1039 => Ok(StatusCode::COPYLOC_EXISTS_BORROW_ERROR),
+            1040 => Ok(StatusCode::MOVELOC_UNAVAILABLE_ERROR),
+            1041 => Ok(StatusCode::MOVELOC_EXISTS_BORROW_ERROR),
+            1042 => Ok(StatusCode::BORROWLOC_REFERENCE_ERROR),
+            1043 => Ok(StatusCode::BORROWLOC_UNAVAILABLE_ERROR),
+            1044 => Ok(StatusCode::BORROWLOC_EXISTS_BORROW_ERROR),
+            1045 => Ok(StatusCode::CALL_TYPE_MISMATCH_ERROR),
+            1046 => Ok(StatusCode::CALL_BORROWED_MUTABLE_REFERENCE_ERROR),
+            1047 => Ok(StatusCode::PACK_TYPE_MISMATCH_ERROR),
+            1048 => Ok(StatusCode::UNPACK_TYPE_MISMATCH_ERROR),
+            1049 => Ok(StatusCode::READREF_TYPE_MISMATCH_ERROR),
+            1050 => Ok(StatusCode::READREF_RESOURCE_ERROR),
+            1051 => Ok(StatusCode::READREF_EXISTS_MUTABLE_BORROW_ERROR),
+            1052 => Ok(StatusCode::WRITEREF_TYPE_MISMATCH_ERROR),
+            1053 => Ok(StatusCode::WRITEREF_RESOURCE_ERROR),
+            1054 => Ok(StatusCode::WRITEREF_EXISTS_BORROW_ERROR),
+            1055 => Ok(StatusCode::WRITEREF_NO_MUTABLE_REFERENCE_ERROR),
+            1056 => Ok(StatusCode::INTEGER_OP_TYPE_MISMATCH_ERROR),
+            1057 => Ok(StatusCode::BOOLEAN_OP_TYPE_MISMATCH_ERROR),
+            1058 => Ok(StatusCode::EQUALITY_OP_TYPE_MISMATCH_ERROR),
+            1059 => Ok(StatusCode::EXISTS_RESOURCE_TYPE_MISMATCH_ERROR),
+            1060 => Ok(StatusCode::BORROWGLOBAL_TYPE_MISMATCH_ERROR),
+            1061 => Ok(StatusCode::BORROWGLOBAL_NO_RESOURCE_ERROR),
+            1062 => Ok(StatusCode::MOVEFROM_TYPE_MISMATCH_ERROR),
+            1063 => Ok(StatusCode::MOVEFROM_NO_RESOURCE_ERROR),
+            1064 => Ok(StatusCode::MOVETOSENDER_TYPE_MISMATCH_ERROR),
+            1065 => Ok(StatusCode::MOVETOSENDER_NO_RESOURCE_ERROR),
+            1066 => Ok(StatusCode::CREATEACCOUNT_TYPE_MISMATCH_ERROR),
+            1067 => Ok(StatusCode::MODULE_ADDRESS_DOES_NOT_MATCH_SENDER),
+            1068 => Ok(StatusCode::NO_MODULE_HANDLES),
+            1069 => Ok(StatusCode::POSITIVE_STACK_SIZE_AT_BLOCK_END),
+            1070 => Ok(StatusCode::MISSING_ACQUIRES_RESOURCE_ANNOTATION_ERROR),
+            1071 => Ok(StatusCode::EXTRANEOUS_ACQUIRES_RESOURCE_ANNOTATION_ERROR),
+            1072 => Ok(StatusCode::DUPLICATE_ACQUIRES_RESOURCE_ANNOTATION_ERROR),
+            1073 => Ok(StatusCode::INVALID_ACQUIRES_RESOURCE_ANNOTATION_ERROR),
+            1074 => Ok(StatusCode::GLOBAL_REFERENCE_ERROR),
+            1075 => Ok(StatusCode::CONTRAINT_KIND_MISMATCH),
+            1076 => Ok(StatusCode::NUMBER_OF_TYPE_ARGUMENTS_MISMATCH),
+            1077 => Ok(StatusCode::LOOP_IN_INSTANTIATION_GRAPH),
+            1078 => Ok(StatusCode::UNUSED_LOCALS_SIGNATURE),
+            1079 => Ok(StatusCode::UNUSED_TYPE_SIGNATURE),
+            1080 => Ok(StatusCode::ZERO_SIZED_STRUCT),
+            1081 => Ok(StatusCode::LINKER_ERROR),
+            2000 => Ok(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR),
+            2001 => Ok(StatusCode::OUT_OF_BOUNDS_INDEX),
+            2002 => Ok(StatusCode::OUT_OF_BOUNDS_RANGE),
+            2003 => Ok(StatusCode::EMPTY_VALUE_STACK),
+            2004 => Ok(StatusCode::EMPTY_CALL_STACK),
+            2005 => Ok(StatusCode::PC_OVERFLOW),
+            2006 => Ok(StatusCode::VERIFICATION_ERROR),
+            2007 => Ok(StatusCode::LOCAL_REFERENCE_ERROR),
+            2008 => Ok(StatusCode::STORAGE_ERROR),
+            2009 => Ok(StatusCode::INTERNAL_TYPE_ERROR),
+            2010 => Ok(StatusCode::EVENT_KEY_MISMATCH),
+            2011 => Ok(StatusCode::UNREACHABLE),
+            2012 => Ok(StatusCode::VM_STARTUP_FAILURE),
+            2013 => Ok(StatusCode::NATIVE_FUNCTION_INTERNAL_INCONSISTENCY),
+            3000 => Ok(StatusCode::UNKNOWN_BINARY_ERROR),
+            3001 => Ok(StatusCode::MALFORMED),
+            3002 => Ok(StatusCode::BAD_MAGIC),
+            3003 => Ok(StatusCode::UNKNOWN_VERSION),
+            3004 => Ok(StatusCode::UNKNOWN_TABLE_TYPE),
+            3005 => Ok(StatusCode::UNKNOWN_SIGNATURE_TYPE),
+            3006 => Ok(StatusCode::UNKNOWN_SERIALIZED_TYPE),
+            3007 => Ok(StatusCode::UNKNOWN_OPCODE),
+            3008 => Ok(StatusCode::BAD_HEADER_TABLE),
+            3009 => Ok(StatusCode::UNEXPECTED_SIGNATURE_TYPE),
+            3010 => Ok(StatusCode::DUPLICATE_TABLE),
+            3011 => Ok(StatusCode::VERIFIER_INVARIANT_VIOLATION),
+            4000 => Ok(StatusCode::UNKNOWN_RUNTIME_STATUS),
+            4001 => Ok(StatusCode::EXECUTED),
+            4002 => Ok(StatusCode::OUT_OF_GAS),
+            4003 => Ok(StatusCode::RESOURCE_DOES_NOT_EXIST),
+            4004 => Ok(StatusCode::RESOURCE_ALREADY_EXISTS),
+            4005 => Ok(StatusCode::EVICTED_ACCOUNT_ACCESS),
+            4006 => Ok(StatusCode::ACCOUNT_ADDRESS_ALREADY_EXISTS),
+            4007 => Ok(StatusCode::TYPE_ERROR),
+            4008 => Ok(StatusCode::MISSING_DATA),
+            4009 => Ok(StatusCode::DATA_FORMAT_ERROR),
+            4010 => Ok(StatusCode::INVALID_DATA),
+            4011 => Ok(StatusCode::REMOTE_DATA_ERROR),
+            4012 => Ok(StatusCode::CANNOT_WRITE_EXISTING_RESOURCE),
+            4013 => Ok(StatusCode::VALUE_SERIALIZATION_ERROR),
+            4014 => Ok(StatusCode::VALUE_DESERIALIZATION_ERROR),
+            4015 => Ok(StatusCode::DUPLICATE_MODULE_NAME),
+            4016 => Ok(StatusCode::ABORTED),
+            4017 => Ok(StatusCode::ARITHMETIC_ERROR),
+            4018 => Ok(StatusCode::DYNAMIC_REFERENCE_ERROR),
+            4019 => Ok(StatusCode::CODE_DESERIALIZATION_ERROR),
+            4020 => Ok(StatusCode::EXECUTION_STACK_OVERFLOW),
+            4021 => Ok(StatusCode::CALL_STACK_OVERFLOW),
+            4022 => Ok(StatusCode::NATIVE_FUNCTION_ERROR),
+            4023 => Ok(StatusCode::GAS_SCHEDULE_ERROR),
+            std::u64::MAX => Ok(StatusCode::UNKNOWN_STATUS),
+            _ => Err("invalid StatusCode"),
+        }
+    }
+}
+
+impl From<StatusCode> for u64 {
+    fn from(status: StatusCode) -> u64 {
+        status as u64
+    }
+}
+
 pub mod sub_status {
     // Arithmetic sub status sub-codes
     pub const AEU_UNKNOWN_ARITHMETIC_ERROR: u64 = 0;
@@ -503,6 +647,7 @@ pub mod sub_status {
     pub const AED_DIVISION_BY_ZERO: u64 = 3;
 
     pub const VSF_GAS_SCHEDULE_NOT_FOUND: u64 = 0;
+    pub const VSF_LIBRA_VERSION_NOT_FOUND: u64 = 1;
 
     // Dynamic Reference status sub-codes
     pub const DRE_UNKNOWN_DYNAMIC_REFERENCE_ERROR: u64 = 0;
@@ -513,6 +658,8 @@ pub mod sub_status {
 
     // Native Function Error sub-codes
     pub const NFE_VECTOR_ERROR_BASE: u64 = 0;
+    // Failure in LCS deserialization
+    pub const NFE_LCS_SERIALIZATION_FAILURE: u64 = 0x1C5;
 
     pub const GSE_UNABLE_TO_LOAD_MODULE: u64 = 0;
     pub const GSE_UNABLE_TO_LOAD_RESOURCE: u64 = 1;

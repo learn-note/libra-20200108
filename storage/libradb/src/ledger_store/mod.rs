@@ -4,12 +4,12 @@
 //! This file defines ledger store APIs that are related to the main ledger accumulator, from the
 //! root(LedgerInfo) to leaf(TransactionInfo).
 
-use crate::schema::epoch_by_version::EpochByVersionSchema;
 use crate::{
     change_set::ChangeSet,
     errors::LibraDbError,
     schema::{
-        ledger_info::LedgerInfoSchema, transaction_accumulator::TransactionAccumulatorSchema,
+        epoch_by_version::EpochByVersionSchema, ledger_info::LedgerInfoSchema,
+        transaction_accumulator::TransactionAccumulatorSchema,
         transaction_info::TransactionInfoSchema,
     },
 };
@@ -22,15 +22,17 @@ use libra_crypto::{
     HashValue,
 };
 use libra_types::{
-    crypto_proxies::{LedgerInfoWithSignatures, ValidatorSet},
+    epoch_state::EpochState,
+    ledger_info::LedgerInfoWithSignatures,
     proof::{
-        position::Position, AccumulatorConsistencyProof, TransactionAccumulatorProof,
-        TransactionAccumulatorRangeProof,
+        definition::LeafCount, position::Position, AccumulatorConsistencyProof,
+        TransactionAccumulatorProof, TransactionAccumulatorRangeProof, TransactionInfoWithProof,
     },
     transaction::{TransactionInfo, Version},
 };
-use schemadb::{ReadOptions, DB};
+use schemadb::{ReadOptions, SchemaIterator, DB};
 use std::{ops::Deref, sync::Arc};
+use storage_interface::{StartupInfo, TreeState};
 
 pub(crate) struct LedgerStore {
     db: Arc<DB>,
@@ -120,9 +122,9 @@ impl LedgerStore {
             ensure!(
                 ledger_info_with_sigs
                     .ledger_info()
-                    .next_validator_set()
+                    .next_epoch_state()
                     .is_some(),
-                "DB corruption: the last ledger info of epoch {} is missing next validator set",
+                "DB corruption: the last ledger info of epoch {} is missing next epoch info",
                 epoch,
             );
             results.push(ledger_info_with_sigs);
@@ -147,46 +149,76 @@ impl LedgerStore {
             .store(Arc::new(Some(ledger_info_with_sigs)));
     }
 
-    /// Returns `None` if the DB is empty. Otherwise returns a tuple
-    /// `(LedgerInfoWithSignatures, Option<ValidatorSet>)`: either the first element carries a
-    /// validator set and the second element is `None`, or the second element carries a validator
-    /// set.
-    pub fn get_startup_info(
+    pub fn get_latest_ledger_info_in_epoch(&self, epoch: u64) -> Result<LedgerInfoWithSignatures> {
+        self.db.get::<LedgerInfoSchema>(&epoch)?.ok_or_else(|| {
+            LibraDbError::NotFound(format!("Last LedgerInfo of epoch {}", epoch)).into()
+        })
+    }
+
+    fn get_epoch_state(&self, epoch: u64) -> Result<EpochState> {
+        ensure!(epoch > 0, "EpochState only queryable for epoch >= 1.",);
+
+        let ledger_info_with_sigs =
+            self.db
+                .get::<LedgerInfoSchema>(&(epoch - 1))?
+                .ok_or_else(|| {
+                    LibraDbError::NotFound(format!("Last LedgerInfo of epoch {}", epoch - 1))
+                })?;
+        let latest_epoch_state = ledger_info_with_sigs
+            .ledger_info()
+            .next_epoch_state()
+            .ok_or_else(|| format_err!("Last LedgerInfo in epoch must carry next_epoch_state."))?;
+
+        Ok(latest_epoch_state.clone())
+    }
+
+    pub fn get_tree_state(
         &self,
-    ) -> Result<Option<(LedgerInfoWithSignatures, Option<ValidatorSet>)>> {
-        let latest_ledger_info_with_sigs = match self.get_latest_ledger_info_option() {
+        num_transactions: LeafCount,
+        transaction_info: TransactionInfo,
+    ) -> Result<TreeState> {
+        Ok(TreeState::new(
+            num_transactions,
+            Accumulator::get_frozen_subtree_hashes(self, num_transactions)?,
+            transaction_info.state_root_hash(),
+        ))
+    }
+
+    pub fn get_startup_info(&self) -> Result<Option<StartupInfo>> {
+        // Get the latest ledger info. Return None if not bootstrapped.
+        let latest_ledger_info = match self.get_latest_ledger_info_option() {
             Some(x) => x,
             None => return Ok(None),
         };
+        let latest_epoch_state_if_not_in_li =
+            match latest_ledger_info.ledger_info().next_epoch_state() {
+                Some(_) => None,
+                // If the latest LedgerInfo doesn't carry a validator set, we look for the previous
+                // LedgerInfo which should always carry a validator set.
+                None => Some(self.get_epoch_state(latest_ledger_info.ledger_info().epoch())?),
+            };
 
-        if latest_ledger_info_with_sigs
-            .ledger_info()
-            .next_validator_set()
-            .is_some()
-        {
-            return Ok(Some((latest_ledger_info_with_sigs, None)));
-        }
+        let li_version = latest_ledger_info.ledger_info().version();
+        let (latest_version, latest_txn_info) = self.get_latest_transaction_info()?;
+        assert!(latest_version >= li_version);
+        let (commited_tree_state, synced_tree_state) = if latest_version == li_version {
+            (
+                self.get_tree_state(latest_version + 1, latest_txn_info)?,
+                None,
+            )
+        } else {
+            let commited_txn_info = self.get_transaction_info(li_version)?;
+            (
+                self.get_tree_state(li_version + 1, commited_txn_info)?,
+                Some(self.get_tree_state(latest_version + 1, latest_txn_info)?),
+            )
+        };
 
-        // If the latest LedgerInfo doesn't carry a validator set, we look for the previous
-        // LedgerInfo which should always carry a validator set.
-        let latest_epoch = latest_ledger_info_with_sigs.ledger_info().epoch();
-        ensure!(
-            latest_epoch > 0,
-            "Genesis epoch should always carry a validator set.",
-        );
-
-        let prev_ledger_info_with_sigs = self
-            .db
-            .get::<LedgerInfoSchema>(&(latest_epoch - 1))?
-            .ok_or_else(|| format_err!("At least one epoch change LedgerInfo must exist."))?;
-
-        let latest_validator_set = prev_ledger_info_with_sigs
-            .ledger_info()
-            .next_validator_set()
-            .ok_or_else(|| format_err!("All previous LedgerInfo should have a validator set."))?;
-        Ok(Some((
-            latest_ledger_info_with_sigs,
-            Some(latest_validator_set.clone()),
+        Ok(Some(StartupInfo::new(
+            latest_ledger_info,
+            latest_epoch_state_if_not_in_li,
+            commited_tree_state,
+            synced_tree_state,
         )))
     }
 
@@ -212,15 +244,35 @@ impl LedgerStore {
             .ok_or_else(|| LibraDbError::NotFound(String::from("Genesis TransactionInfo.")).into())
     }
 
+    /// Gets an iterator that yields `num_transaction_infos` transaction infos starting from
+    /// `start_version`.
+    pub fn get_transaction_info_iter(
+        &self,
+        start_version: Version,
+        num_transaction_infos: u64,
+    ) -> Result<TransactionInfoIter> {
+        let mut iter = self
+            .db
+            .iter::<TransactionInfoSchema>(ReadOptions::default())?;
+        iter.seek(&start_version)?;
+        Ok(TransactionInfoIter {
+            inner: iter,
+            expected_next_version: start_version,
+            end_version: start_version
+                .checked_add(num_transaction_infos)
+                .ok_or_else(|| format_err!("Too many transaction infos requested."))?,
+        })
+    }
+
     /// Get transaction info at `version` with proof towards root of ledger at `ledger_version`.
     pub fn get_transaction_info_with_proof(
         &self,
         version: Version,
         ledger_version: Version,
-    ) -> Result<(TransactionInfo, TransactionAccumulatorProof)> {
-        Ok((
-            self.get_transaction_info(version)?,
+    ) -> Result<TransactionInfoWithProof> {
+        Ok(TransactionInfoWithProof::new(
             self.get_transaction_proof(version, ledger_version)?,
+            self.get_transaction_info(version)?,
         ))
     }
 
@@ -295,7 +347,7 @@ impl LedgerStore {
     ) -> Result<()> {
         let ledger_info = ledger_info_with_sigs.ledger_info();
 
-        if ledger_info.next_validator_set().is_some() {
+        if ledger_info.next_epoch_state().is_some() {
             // This is the last version of the current epoch, update the epoch by version index.
             cs.batch
                 .put::<EpochByVersionSchema>(&ledger_info.version(), &ledger_info.epoch())?;
@@ -304,11 +356,6 @@ impl LedgerStore {
             &ledger_info_with_sigs.ledger_info().epoch(),
             ledger_info_with_sigs,
         )
-    }
-
-    /// From left to right, get frozen subtree root hashes of the transaction accumulator.
-    pub fn get_ledger_frozen_subtree_hashes(&self, version: Version) -> Result<Vec<HashValue>> {
-        Accumulator::get_frozen_subtree_hashes(self, version + 1)
     }
 }
 
@@ -319,6 +366,42 @@ impl HashReader for LedgerStore {
         self.db
             .get::<TransactionAccumulatorSchema>(&position)?
             .ok_or_else(|| format_err!("{} does not exist.", position))
+    }
+}
+
+pub struct TransactionInfoIter<'a> {
+    inner: SchemaIterator<'a, TransactionInfoSchema>,
+    expected_next_version: Version,
+    end_version: Version,
+}
+
+impl<'a> TransactionInfoIter<'a> {
+    fn next_impl(&mut self) -> Result<Option<TransactionInfo>> {
+        if self.expected_next_version >= self.end_version {
+            return Ok(None);
+        }
+
+        let ret = match self.inner.next().transpose()? {
+            Some((version, transaction_info)) => {
+                ensure!(
+                    version == self.expected_next_version,
+                    "Transaction info versions are not consecutive.",
+                );
+                self.expected_next_version += 1;
+                Some(transaction_info)
+            }
+            _ => None,
+        };
+
+        Ok(ret)
+    }
+}
+
+impl<'a> Iterator for TransactionInfoIter<'a> {
+    type Item = Result<TransactionInfo>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_impl().transpose()
     }
 }
 

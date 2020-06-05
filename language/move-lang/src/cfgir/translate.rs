@@ -1,20 +1,22 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::shared::unique_map::UniqueMap;
 use crate::{
     cfgir::{
         self,
-        ast::{self as G, BasicBlock, Blocks, Label},
+        ast::{self as G, BasicBlock, BasicBlocks},
         cfg::BlockCFG,
     },
     errors::Errors,
-    hlir::ast as H,
+    hlir::ast::{self as H, Label},
     parser::ast::{FunctionName, ModuleIdent, StructName},
-    shared::*,
+    shared::unique_map::UniqueMap,
 };
-use std::collections::BTreeSet;
-use std::mem;
+use move_ir_types::location::*;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+};
 
 //**************************************************************************************************
 // Context
@@ -27,7 +29,8 @@ struct Context {
     loop_end: Option<Label>,
     next_label: Option<Label>,
     label_count: usize,
-    blocks: Blocks,
+    blocks: BasicBlocks,
+    block_ordering: BTreeMap<Label, usize>,
     infinite_loop_starts: BTreeSet<Label>,
 }
 
@@ -40,7 +43,8 @@ impl Context {
             loop_end: None,
             start: None,
             label_count: 0,
-            blocks: Blocks::new(),
+            blocks: BasicBlocks::new(),
+            block_ordering: BTreeMap::new(),
             infinite_loop_starts: BTreeSet::new(),
         }
     }
@@ -54,25 +58,39 @@ impl Context {
         self.errors
     }
 
-    pub fn has_errors(&self) -> bool {
-        !self.errors.is_empty()
-    }
-
     fn new_label(&mut self) -> Label {
         let count = self.label_count;
         self.label_count += 1;
         Label(count)
     }
 
-    pub fn finish_blocks(&mut self) -> (Label, Blocks, BTreeSet<Label>) {
+    fn insert_block(&mut self, lbl: Label, basic_block: BasicBlock) {
+        assert!(self.block_ordering.insert(lbl, self.blocks.len()).is_none());
+        assert!(self.blocks.insert(lbl, basic_block).is_none());
+    }
+
+    // Returns the blocks inserted in insertion ordering
+    pub fn finish_blocks(&mut self) -> (Label, BasicBlocks, BTreeSet<Label>) {
         self.next_label = None;
         let start = mem::replace(&mut self.start, None);
-        let blocks = mem::replace(&mut self.blocks, Blocks::new());
+        let blocks = mem::replace(&mut self.blocks, BasicBlocks::new());
+        let block_ordering = mem::replace(&mut self.block_ordering, BTreeMap::new());
         let infinite_loop_starts = mem::replace(&mut self.infinite_loop_starts, BTreeSet::new());
         self.label_count = 0;
         self.loop_begin = None;
         self.loop_end = None;
-        (start.unwrap(), blocks, infinite_loop_starts)
+
+        // Blocks will eventually be ordered and outputted to bytecode the label. But labels are
+        // initially created depth first
+        // So the labels need to be remapped based on the insertion order of the block
+        // This preserves the original layout of the code as specified by the user (since code is
+        // finshed+inserted into the map in original code order)
+        let remapping = block_ordering
+            .into_iter()
+            .map(|(lbl, ordering)| (lbl, Label(ordering)))
+            .collect();
+        let (start, blocks) = G::remap_labels(&remapping, start.unwrap(), blocks);
+        (start, blocks, infinite_loop_starts)
     }
 }
 
@@ -83,11 +101,9 @@ impl Context {
 pub fn program(errors: Errors, prog: H::Program) -> (G::Program, Errors) {
     let mut context = Context::new(&prog, errors);
     let modules = modules(&mut context, prog.modules);
-    let main = prog
-        .main
-        .map(|(addr, n, fdef)| (addr, n.clone(), function(&mut context, n, fdef)));
+    let scripts = scripts(&mut context, prog.scripts);
 
-    (G::Program { modules, main }, context.get_errors())
+    (G::Program { modules, scripts }, context.get_errors())
 }
 
 fn modules(
@@ -106,16 +122,42 @@ fn module(
     mdef: H::ModuleDefinition,
 ) -> (ModuleIdent, G::ModuleDefinition) {
     let is_source_module = mdef.is_source_module;
-    let structs = mdef.structs.map(|name, s| struct_def(context, name, s));
+    let dependency_order = mdef.dependency_order;
+    let structs = mdef.structs;
     let functions = mdef.functions.map(|name, f| function(context, name, f));
     (
         module_ident,
         G::ModuleDefinition {
             is_source_module,
+            dependency_order,
             structs,
             functions,
         },
     )
+}
+
+fn scripts(
+    context: &mut Context,
+    hscripts: BTreeMap<String, H::Script>,
+) -> BTreeMap<String, G::Script> {
+    hscripts
+        .into_iter()
+        .map(|(n, s)| (n, script(context, s)))
+        .collect()
+}
+
+fn script(context: &mut Context, hscript: H::Script) -> G::Script {
+    let H::Script {
+        loc,
+        function_name,
+        function: hfunction,
+    } = hscript;
+    let function = function(context, function_name.clone(), hfunction);
+    G::Script {
+        loc,
+        function_name,
+        function,
+    }
 }
 
 //**************************************************************************************************
@@ -124,9 +166,9 @@ fn module(
 
 fn function(context: &mut Context, _name: FunctionName, f: H::Function) -> G::Function {
     let visibility = f.visibility;
-    let signature = function_signature(context, f.signature);
+    let signature = f.signature;
     let acquires = f.acquires;
-    let body = function_body(context, &signature, f.body);
+    let body = function_body(context, &signature, &acquires, f.body);
     G::Function {
         visibility,
         signature,
@@ -135,24 +177,10 @@ fn function(context: &mut Context, _name: FunctionName, f: H::Function) -> G::Fu
     }
 }
 
-fn function_signature(context: &mut Context, sig: H::FunctionSignature) -> G::FunctionSignature {
-    let type_parameters = sig.type_parameters;
-    let parameters = sig
-        .parameters
-        .into_iter()
-        .map(|(v, ty)| (v, single_type(context, ty)))
-        .collect();
-    let return_type = type_(context, sig.return_type);
-    G::FunctionSignature {
-        type_parameters,
-        parameters,
-        return_type,
-    }
-}
-
 fn function_body(
     context: &mut Context,
-    signature: &G::FunctionSignature,
+    signature: &H::FunctionSignature,
+    acquires: &BTreeMap<StructName, Loc>,
     sp!(loc, tb_): H::FunctionBody,
 ) -> G::FunctionBody {
     use G::FunctionBody_ as GB;
@@ -160,13 +188,13 @@ fn function_body(
     assert!(context.next_label.is_none());
     assert!(context.start.is_none());
     assert!(context.blocks.is_empty());
+    assert!(context.block_ordering.is_empty());
     assert!(context.loop_begin.is_none());
     assert!(context.loop_end.is_none());
     assert!(context.infinite_loop_starts.is_empty());
     let b_ = match tb_ {
         HB::Native => GB::Native,
         HB::Defined { locals, body } => {
-            let locals = locals.map(|_, st| single_type(context, st));
             function_block(context, body);
             let (start, mut blocks, infinite_loop_starts) = context.finish_blocks();
 
@@ -178,11 +206,11 @@ fn function_body(
             cfgir::refine_inference_and_verify(
                 &mut context.errors,
                 signature,
+                acquires,
                 &locals,
                 &mut cfg,
                 &infinite_loop_starts,
             );
-            cfgir::verify(&mut context.errors, signature, &locals, &cfg);
             cfgir::optimize(signature, &locals, &mut cfg);
 
             GB::Defined {
@@ -196,79 +224,6 @@ fn function_body(
 }
 
 //**************************************************************************************************
-// Structs
-//**************************************************************************************************
-
-fn struct_def(
-    context: &mut Context,
-    _name: StructName,
-    sdef: H::StructDefinition,
-) -> G::StructDefinition {
-    let resource_opt = sdef.resource_opt;
-    let type_parameters = sdef.type_parameters;
-    let fields = match sdef.fields {
-        H::StructFields::Native(loc) => G::StructFields::Native(loc),
-        H::StructFields::Defined(m) => G::StructFields::Defined(
-            m.into_iter()
-                .map(|(f, t)| (f, base_type(context, t)))
-                .collect(),
-        ),
-    };
-    G::StructDefinition {
-        resource_opt,
-        type_parameters,
-        fields,
-    }
-}
-
-//**************************************************************************************************
-// Types
-//**************************************************************************************************
-
-fn base_types<R: std::iter::FromIterator<G::BaseType>>(
-    context: &Context,
-    tys: impl IntoIterator<Item = H::BaseType>,
-) -> R {
-    tys.into_iter().map(|t| base_type(context, t)).collect()
-}
-
-fn base_type(context: &Context, sp!(loc, nb_): H::BaseType) -> G::BaseType {
-    use G::BaseType_ as GB;
-    use H::BaseType_ as HB;
-    let b_ = match nb_ {
-        HB::Apply(k, n, nbs) => GB::Apply(k, n, base_types(context, nbs)),
-        HB::Param(tp) => GB::Param(tp),
-        HB::UnresolvedError => panic!("ICE UnresolvedError should only have appeared on ret/abort"),
-    };
-    sp(loc, b_)
-}
-
-fn single_types(context: &Context, ss: Vec<H::SingleType>) -> Vec<G::SingleType> {
-    ss.into_iter().map(|s| single_type(context, s)).collect()
-}
-
-fn single_type(context: &Context, sp!(loc, ns_): H::SingleType) -> G::SingleType {
-    use G::SingleType_ as GS;
-    use H::SingleType_ as HS;
-    let s_ = match ns_ {
-        HS::Ref(mut_, nb) => GS::Ref(mut_, base_type(context, nb)),
-        HS::Base(nb) => GS::Base(base_type(context, nb)),
-    };
-    sp(loc, s_)
-}
-
-fn type_(context: &Context, sp!(loc, et_): H::Type) -> G::Type {
-    use G::Type_ as GT;
-    use H::Type_ as HT;
-    let t_ = match et_ {
-        HT::Unit => GT::Unit,
-        HT::Single(s) => GT::Single(single_type(context, s)),
-        HT::Multiple(ss) => GT::Multiple(single_types(context, ss)),
-    };
-    sp(loc, t_)
-}
-
-//**************************************************************************************************
 // Statements
 //**************************************************************************************************
 
@@ -279,7 +234,7 @@ fn function_block(context: &mut Context, blocks: H::Block) {
 }
 
 fn block(context: &mut Context, mut cur_label: Label, blocks: H::Block) {
-    use G::Command_ as C;
+    use H::Command_ as C;
 
     assert!(!blocks.is_empty());
     let loc = blocks.back().unwrap().loc;
@@ -296,12 +251,11 @@ fn block(context: &mut Context, mut cur_label: Label, blocks: H::Block) {
         }
         _ => (),
     }
-    context.blocks.insert(cur_label, basic_block);
+    context.insert_block(cur_label, basic_block);
 }
 
 fn block_(context: &mut Context, cur_label: &mut Label, blocks: H::Block) -> BasicBlock {
-    use G::Command_ as C;
-    use H::Statement_ as S;
+    use H::{Command_ as C, Statement_ as S};
 
     assert!(!blocks.is_empty());
     let mut basic_block = BasicBlock::new();
@@ -310,7 +264,7 @@ fn block_(context: &mut Context, cur_label: &mut Label, blocks: H::Block) -> Bas
         (next_label: $next_label:expr) => {{
             let lbl = mem::replace(cur_label, $next_label);
             let bb = mem::replace(&mut basic_block, BasicBlock::new());
-            context.blocks.insert(lbl, bb);
+            context.insert_block(lbl, bb);
         }};
     }
 
@@ -329,9 +283,16 @@ fn block_(context: &mut Context, cur_label: &mut Label, blocks: H::Block) -> Bas
 
     for sp!(loc, stmt_) in blocks {
         match stmt_ {
-            S::Command(c) => basic_block.push_back(command(context, c)),
+            S::Command(mut cmd) => {
+                command(context, &mut cmd);
+                let is_terminal = cmd.value.is_terminal();
+                basic_block.push_back(cmd);
+                if is_terminal {
+                    finish_block!(next_label: context.new_label());
+                }
+            }
             S::IfElse {
-                cond: hcond,
+                cond,
                 if_block,
                 else_block,
             } => {
@@ -340,9 +301,8 @@ fn block_(context: &mut Context, cur_label: &mut Label, blocks: H::Block) -> Bas
                 let next_label = context.new_label();
 
                 // If cond
-                let cond = exp_(context, *hcond);
                 let jump_if = C::JumpIf {
-                    cond,
+                    cond: *cond,
                     if_true,
                     if_false,
                 };
@@ -356,7 +316,7 @@ fn block_(context: &mut Context, cur_label: &mut Label, blocks: H::Block) -> Bas
                 context.next_label = old_next;
             }
             S::While {
-                cond: (hcond_block, hcond_exp),
+                cond: (hcond_block, cond),
                 block: loop_block,
             } => {
                 let loop_cond = context.new_label();
@@ -372,9 +332,8 @@ fn block_(context: &mut Context, cur_label: &mut Label, blocks: H::Block) -> Bas
                     assert!(basic_block.is_empty());
                     basic_block = block_(context, cur_label, hcond_block);
                 }
-                let cond = exp_(context, *hcond_exp);
                 let jump_if = C::JumpIf {
-                    cond,
+                    cond: *cond,
                     if_true: loop_body,
                     if_false: loop_end,
                 };
@@ -412,127 +371,13 @@ fn block_(context: &mut Context, cur_label: &mut Label, blocks: H::Block) -> Bas
     basic_block
 }
 
-fn command(context: &Context, sp!(loc, hc_): H::Command) -> G::Command {
-    use G::Command_ as C;
-    use H::Command_ as HC;
-
-    let c_ = match hc_ {
-        HC::Assign(ls, e) => C::Assign(lvalues(context, ls), exp(context, e)),
-        HC::Mutate(el, er) => C::Mutate(exp(context, el), exp(context, er)),
-        HC::Abort(e) => C::Abort(exp_(context, e)),
-        HC::Return(e) => C::Return(exp_(context, e)),
-        HC::Continue => C::Jump(context.loop_begin.clone().unwrap()),
-        HC::Break => C::Jump(context.loop_end.clone().unwrap()),
-        HC::IgnoreAndPop { pop_num, exp: e } => C::IgnoreAndPop {
-            pop_num,
-            exp: exp_(context, e),
-        },
-    };
-    sp(loc, c_)
-}
-
-fn lvalues(context: &Context, ls: Vec<H::LValue>) -> Vec<G::LValue> {
-    ls.into_iter().map(|l| lvalue(context, l)).collect()
-}
-
-fn lvalue(context: &Context, sp!(loc, hl_): H::LValue) -> G::LValue {
-    use G::LValue_ as L;
-    use H::LValue_ as HL;
-    let l_ = match hl_ {
-        HL::Ignore => L::Ignore,
-        HL::Var(v, st) => L::Var(v, Box::new(single_type(context, *st))),
-        HL::Unpack(s, bs, fields) => L::Unpack(
-            s,
-            base_types(context, bs),
-            fields
-                .into_iter()
-                .map(|(f, fl)| (f, lvalue(context, fl)))
-                .collect(),
-        ),
-    };
-    sp(loc, l_)
-}
-
-fn exp(context: &Context, he: Box<H::Exp>) -> Box<G::Exp> {
-    Box::new(exp_(context, *he))
-}
-
-fn exp_(context: &Context, he: H::Exp) -> G::Exp {
-    use G::UnannotatedExp_ as E;
-    use H::UnannotatedExp_ as HE;
-    let ty = type_(context, he.ty);
-    let sp!(loc, he_) = he.exp;
-    let e_ = match he_ {
-        HE::Unit => E::Unit,
-        HE::Value(v) => E::Value(v),
-        HE::Move { from_user, var } => E::Move { from_user, var },
-        HE::Copy { from_user, var } => E::Copy { from_user, var },
-        HE::ModuleCall(hcall) => {
-            let hcall = *hcall;
-            let module = hcall.module;
-            let name = hcall.name;
-            let type_arguments = base_types(context, hcall.type_arguments);
-            let arguments = exp(context, hcall.arguments);
-            let acquires = hcall.acquires;
-            let mcall = G::ModuleCall {
-                module,
-                name,
-                type_arguments,
-                arguments,
-                acquires,
-            };
-            E::ModuleCall(Box::new(mcall))
+fn command(context: &Context, sp!(_, hc_): &mut H::Command) {
+    use H::Command_ as C;
+    match hc_ {
+        C::Assign(_, _) | C::Mutate(_, _) | C::Abort(_) | C::Return(_) | C::IgnoreAndPop { .. } => {
         }
-        HE::Builtin(bf, e) => E::Builtin(builtin(context, *bf), exp(context, e)),
-        HE::Freeze(e) => E::Freeze(exp(context, e)),
-        HE::Dereference(e) => E::Dereference(exp(context, e)),
-        HE::UnaryExp(u, e) => E::UnaryExp(u, exp(context, e)),
-        HE::BinopExp(el, b, er) => E::BinopExp(exp(context, el), b, exp(context, er)),
-        HE::Pack(s, bs, hfields) => {
-            let fields = hfields
-                .into_iter()
-                .map(|(f, bt, e)| (f, base_type(context, bt), exp_(context, e)))
-                .collect();
-            E::Pack(s, base_types(context, bs), fields)
-        }
-        HE::ExpList(es) => {
-            assert!(!es.is_empty());
-            E::ExpList(exp_list(context, es))
-        }
-        HE::Borrow(mut_, e, f) => E::Borrow(mut_, exp(context, e), f),
-        HE::BorrowLocal(mut_, v) => E::BorrowLocal(mut_, v),
-        HE::UnresolvedError => {
-            assert!(context.has_errors());
-            E::UnresolvedError
-        }
-    };
-    G::exp(ty, sp(loc, e_))
-}
-
-fn builtin(context: &Context, sp!(loc, hf_): H::BuiltinFunction) -> Box<G::BuiltinFunction> {
-    use G::BuiltinFunction_ as B;
-    use H::BuiltinFunction_ as HB;
-    let f_ = match hf_ {
-        HB::MoveToSender(bt) => B::MoveToSender(base_type(context, bt)),
-        HB::MoveFrom(bt) => B::MoveFrom(base_type(context, bt)),
-        HB::BorrowGlobal(mut_, bt) => B::BorrowGlobal(mut_, base_type(context, bt)),
-        HB::Exists(bt) => B::Exists(base_type(context, bt)),
-    };
-    Box::new(sp(loc, f_))
-}
-
-fn exp_list(context: &Context, items: Vec<H::ExpListItem>) -> Vec<G::ExpListItem> {
-    items
-        .into_iter()
-        .map(|item| exp_list_item(context, item))
-        .collect()
-}
-
-fn exp_list_item(context: &Context, item: H::ExpListItem) -> G::ExpListItem {
-    use G::ExpListItem as I;
-    use H::ExpListItem as HI;
-    match item {
-        HI::Single(e, st) => I::Single(exp_(context, e), Box::new(single_type(context, *st))),
-        HI::Splat(loc, e, ss) => I::Splat(loc, exp_(context, e), single_types(context, ss)),
+        C::Continue => *hc_ = C::Jump(context.loop_begin.clone().unwrap()),
+        C::Break => *hc_ = C::Jump(context.loop_end.clone().unwrap()),
+        C::Jump(_) | C::JumpIf { .. } => panic!("ICE unexpected jump before translation to jumps"),
     }
 }

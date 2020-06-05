@@ -3,29 +3,38 @@
 
 use crate::{
     common::NetworkPublicKeys,
-    protocols::identity::{exchange_identity, Identity},
+    noise_wrapper::{AntiReplayTimestamps, NoiseWrapper},
+    protocols::{
+        identity::{exchange_handshake, exchange_peerid},
+        wire::handshake::v1::{HandshakeMsg, MessagingProtocolVersion, SupportedProtocols},
+    },
 };
-use libra_crypto::{
-    x25519::{X25519StaticPrivateKey, X25519StaticPublicKey},
-    ValidKey,
-};
+use futures::io::{AsyncRead, AsyncWrite};
+use libra_config::network_id::NetworkId;
+use libra_crypto::{traits::ValidCryptoMaterial, x25519};
 use libra_logger::prelude::*;
+use libra_network_address::NetworkAddress;
+use libra_security_logger::{security_log, SecurityEvent};
 use libra_types::PeerId;
-use netcore::{
-    multiplexing::{yamux::Yamux, StreamMultiplexer},
-    transport::{boxed, memory, tcp, TransportExt},
-};
-use noise::NoiseConfig;
+use netcore::transport::{boxed, memory, tcp, ConnectionOrigin, TransportExt};
+use once_cell::sync::Lazy;
 use std::{
     collections::HashMap,
     convert::TryFrom,
+    fmt::Debug,
     io,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
 /// A timeout for the connection to open and complete all of the upgrade steps.
 pub const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Currently supported messaging protocol version.
+/// TODO: Add ability to support more than one messaging protocol.
+pub const SUPPORTED_MESSAGING_PROTOCOL: MessagingProtocolVersion = MessagingProtocolVersion::V1;
+/// Global connection-id generator.
+static CONNECTION_ID_GENERATOR: Lazy<Arc<Mutex<ConnectionIdGenerator>>> =
+    Lazy::new(|| Arc::new(Mutex::new(ConnectionIdGenerator::new())));
 
 const LIBRA_TCP_TRANSPORT: tcp::TcpTransport = tcp::TcpTransport {
     // Use default options.
@@ -36,6 +45,94 @@ const LIBRA_TCP_TRANSPORT: tcp::TcpTransport = tcp::TcpTransport {
     // Use TCP_NODELAY for libra tcp connections.
     nodelay: Some(true),
 };
+
+pub trait TSocket: AsyncRead + AsyncWrite + Send + Debug + Unpin + 'static {}
+
+impl<T> TSocket for T where T: AsyncRead + AsyncWrite + Send + Debug + Unpin + 'static {}
+
+/// Unique local identifier for a connection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct ConnectionId(u32);
+
+impl From<u32> for ConnectionId {
+    fn from(i: u32) -> ConnectionId {
+        ConnectionId(i)
+    }
+}
+
+/// Generator of unique ConnectionIds.
+struct ConnectionIdGenerator {
+    next: ConnectionId,
+}
+
+impl ConnectionIdGenerator {
+    fn new() -> ConnectionIdGenerator {
+        Self {
+            next: ConnectionId(0),
+        }
+    }
+
+    fn next(&mut self) -> ConnectionId {
+        let ret = self.next;
+        self.next = ConnectionId(ret.0.wrapping_add(1));
+        ret
+    }
+}
+
+/// Metadata associated with an established connection.
+#[derive(Clone, Debug)]
+pub struct ConnectionMetadata {
+    peer_id: PeerId,
+    connection_id: ConnectionId,
+    addr: NetworkAddress,
+    origin: ConnectionOrigin,
+    messaging_protocol: MessagingProtocolVersion,
+    application_protocols: SupportedProtocols,
+}
+
+impl ConnectionMetadata {
+    pub fn new(
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        addr: NetworkAddress,
+        origin: ConnectionOrigin,
+        messaging_protocol: MessagingProtocolVersion,
+        application_protocols: SupportedProtocols,
+    ) -> ConnectionMetadata {
+        ConnectionMetadata {
+            peer_id,
+            connection_id,
+            addr,
+            origin,
+            messaging_protocol,
+            application_protocols,
+        }
+    }
+
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    pub fn connection_id(&self) -> ConnectionId {
+        self.connection_id
+    }
+
+    pub fn addr(&self) -> &NetworkAddress {
+        &self.addr
+    }
+
+    pub fn origin(&self) -> ConnectionOrigin {
+        self.origin
+    }
+}
+
+/// The `Connection` struct consists of connection metadata and the actual socket for
+/// communication.
+#[derive(Debug)]
+pub struct Connection<TSocket> {
+    pub socket: TSocket,
+    pub metadata: ConnectionMetadata,
+}
 
 fn identity_key_to_peer_id(
     trusted_peers: &RwLock<HashMap<PeerId, NetworkPublicKeys>>,
@@ -50,139 +147,169 @@ fn identity_key_to_peer_id(
     None
 }
 
-// Ensures that peer id in received identity is same as peer id derived from noise handshake.
-fn match_peer_id(identity: Identity, peer_id: PeerId) -> Result<Identity, io::Error> {
-    if identity.peer_id() != peer_id {
-        security_log(SecurityEvent::InvalidNetworkPeer)
-            .error("InvalidIdentity")
-            .data(&identity)
-            .data(&peer_id)
-            .log();
-        Err(io::Error::new(
-                io::ErrorKind::Other,
+/// temporary checks to make sure noise pubkeys are actually getting propagated correctly.
+// TODO(philiphayes): remove this after Transport refactor
+#[allow(dead_code)]
+fn verify_noise_pubkey(
+    addr: &NetworkAddress,
+    remote_static_key: &[u8],
+    origin: ConnectionOrigin,
+) -> Result<(), io::Error> {
+    if let ConnectionOrigin::Outbound = origin {
+        let expected_remote_static_key = addr.find_noise_proto().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid NetworkAddress, no NoiseIK protocol: '{}'", addr),
+            )
+        })?;
+
+        if remote_static_key != expected_remote_static_key.as_slice() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
                 format!(
-                    "PeerId received from Noise Handshake ({}) doesn't match one received from Identity Exchange ({})",
-                    peer_id.short_str(),
-                    identity.peer_id().short_str()
-                )
-        ))
-    } else {
-        Ok(identity)
+                    "remote static pubkey did not match expected: actual: {:?}, expected: {:?}",
+                    remote_static_key, expected_remote_static_key,
+                ),
+            ));
+        }
     }
+
+    Ok(())
 }
 
-// Ensures that connected peer has the same role as self.
-fn check_role(own_identity: &Identity, other_identity: Identity) -> Result<Identity, io::Error> {
-    if other_identity.role() != own_identity.role() {
-        Err(io::Error::new(
+pub async fn perform_handshake<T: TSocket>(
+    peer_id: PeerId,
+    mut socket: T,
+    addr: NetworkAddress,
+    origin: ConnectionOrigin,
+    own_handshake: &HandshakeMsg,
+) -> Result<Connection<T>, io::Error> {
+    let handshake_other = exchange_handshake(&own_handshake, &mut socket).await?;
+    if own_handshake.network_id != handshake_other.network_id {
+        return Err(io::Error::new(
             io::ErrorKind::Other,
             format!(
-                "Role of connected peer({}): {:?} does not match self role: {:?}",
-                other_identity.peer_id().short_str(),
-                other_identity.role(),
-                own_identity.role(),
+                "network_ids don't match own: {:?} received: {:?}",
+                own_handshake.network_id, handshake_other.network_id
             ),
-        ))
-    } else {
-        Ok(other_identity)
+        ));
+    }
+
+    let intersecting_protocols = own_handshake.find_common_protocols(&handshake_other);
+    match intersecting_protocols {
+        None => {
+            info!("No matching protocols found for connection with peer: {:?}. Handshake received: {:?}",
+                  peer_id.short_str(), handshake_other);
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "no matching messaging protocol",
+            ))
+        }
+        Some((messaging_protocol, application_protocols)) => Ok(Connection {
+            socket,
+            metadata: ConnectionMetadata::new(
+                peer_id,
+                CONNECTION_ID_GENERATOR.lock().unwrap().next(),
+                addr,
+                origin,
+                messaging_protocol,
+                application_protocols,
+            ),
+        }),
     }
 }
 
 pub fn build_memory_noise_transport(
-    own_identity: Identity,
-    identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
+    network_id: NetworkId,
+    identity_key: x25519::PrivateKey,
     trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+    application_protocols: SupportedProtocols,
+) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
     let memory_transport = memory::MemoryTransport::default();
-    let noise_config = Arc::new(NoiseConfig::new(identity_keypair));
+    let noise_config = Arc::new(NoiseWrapper::new(identity_key));
+    let noise_timestamps = Arc::new(RwLock::new(AntiReplayTimestamps::default()));
+    let mut own_handshake = HandshakeMsg::new(network_id);
+    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
 
     memory_transport
-        .and_then(move |socket, origin| {
-            async move {
-                let (remote_static_key, socket) =
-                    noise_config.upgrade_connection(socket, origin).await?;
-                if let Some(peer_id) = identity_key_to_peer_id(&trusted_peers, &remote_static_key) {
-                    Ok((peer_id, socket))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
-                }
+        .and_then(move |socket, addr, origin| async move {
+            let remote_public_key = addr.find_noise_proto();
+            let (remote_static_key, socket) = noise_config
+                .upgrade_connection(
+                    socket,
+                    origin,
+                    Some(noise_timestamps),
+                    remote_public_key,
+                    Some(&trusted_peers),
+                )
+                .await?;
+
+            if let Some(peer_id) =
+                identity_key_to_peer_id(&trusted_peers, remote_static_key.as_slice())
+            {
+                Ok((peer_id, socket))
+            } else {
+                Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
             }
         })
-        .and_then(|(peer_id, socket), origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, socket), addr, origin| async move {
+            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
 }
 
 pub fn build_unauthenticated_memory_noise_transport(
-    own_identity: Identity,
-    identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+    network_id: NetworkId,
+    identity_key: x25519::PrivateKey,
+    application_protocols: SupportedProtocols,
+) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
     let memory_transport = memory::MemoryTransport::default();
-    let noise_config = Arc::new(NoiseConfig::new(identity_keypair));
+    let noise_config = Arc::new(NoiseWrapper::new(identity_key));
+    let mut own_handshake = HandshakeMsg::new(network_id);
+    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
+
     memory_transport
-        .and_then(move |socket, origin| {
+        .and_then(move |socket, addr, origin| {
             async move {
-                let (remote_static_key, socket) =
-                    noise_config.upgrade_connection(socket, origin).await?;
-                // Generate PeerId from X25519StaticPublicKey.
+                let remote_public_key = addr.find_noise_proto();
+                let (remote_static_key, socket) = noise_config
+                    .upgrade_connection(socket, origin, None, remote_public_key, None)
+                    .await?;
+
+                // Generate PeerId from x25519::PublicKey.
                 // Note: This is inconsistent with current types because AccountAddress is derived
                 // from consensus key which is of type Ed25519PublicKey. Since AccountAddress does
                 // not mean anything in a setting without remote authentication, we use the network
                 // public key to generate a peer_id for the peer. The only reason this works is
                 // that both are 32 bytes in size. If/when this condition no longer holds, we will
                 // receive an error.
-                let peer_id = PeerId::try_from(remote_static_key).unwrap();
+                let peer_id = PeerId::try_from(remote_static_key.as_slice()).unwrap();
                 Ok((peer_id, socket))
             }
         })
-        .and_then(|(peer_id, socket), origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, socket), addr, origin| async move {
+            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
 }
 
 pub fn build_memory_transport(
-    own_identity: Identity,
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+    network_id: NetworkId,
+    own_peer_id: PeerId,
+    application_protocols: SupportedProtocols,
+) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
     let memory_transport = memory::MemoryTransport::default();
+    let mut own_handshake = HandshakeMsg::new(network_id);
+    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
 
     memory_transport
-        .and_then(|socket, origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok(muxer)
-            }
+        .and_then(move |mut socket, _addr, _origin| async move {
+            Ok((exchange_peerid(&own_peer_id, &mut socket).await?, socket))
         })
-        .and_then(move |muxer, origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                check_role(&own_identity, identity).and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, socket), addr, origin| async move {
+            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
@@ -190,42 +317,44 @@ pub fn build_memory_transport(
 
 //TODO(bmwill) Maybe create an Either Transport so we can merge the building of Memory + Tcp
 pub fn build_tcp_noise_transport(
-    own_identity: Identity,
-    identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
+    network_id: NetworkId,
+    identity_key: x25519::PrivateKey,
     trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
-    let noise_config = Arc::new(NoiseConfig::new(identity_keypair));
+    application_protocols: SupportedProtocols,
+) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
+    let noise_config = Arc::new(NoiseWrapper::new(identity_key));
+    let noise_timestamps = Arc::new(RwLock::new(AntiReplayTimestamps::default()));
+    let mut own_handshake = HandshakeMsg::new(network_id);
+    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
 
     LIBRA_TCP_TRANSPORT
-        .and_then(move |socket, origin| {
-            async move {
-                let (remote_static_key, socket) =
-                    noise_config.upgrade_connection(socket, origin).await?;
-                if let Some(peer_id) = identity_key_to_peer_id(&trusted_peers, &remote_static_key) {
-                    Ok((peer_id, socket))
-                } else {
-                    security_log(SecurityEvent::InvalidNetworkPeer)
-                        .error("UntrustedPeer")
-                        .data(&trusted_peers)
-                        .data(&remote_static_key)
-                        .log();
-                    Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
-                }
+        .and_then(move |socket, addr, origin| async move {
+            let remote_public_key = addr.find_noise_proto();
+            let (remote_static_key, socket) = noise_config
+                .upgrade_connection(
+                    socket,
+                    origin,
+                    Some(noise_timestamps),
+                    remote_public_key,
+                    Some(&trusted_peers),
+                )
+                .await?;
+
+            if let Some(peer_id) =
+                identity_key_to_peer_id(&trusted_peers, &remote_static_key.as_slice())
+            {
+                Ok((peer_id, socket))
+            } else {
+                security_log(SecurityEvent::InvalidNetworkPeer)
+                    .error("UntrustedPeer")
+                    .data(&trusted_peers)
+                    .data(&remote_static_key)
+                    .log();
+                Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
             }
         })
-        .and_then(|(peer_id, socket), origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, socket), addr, origin| async move {
+            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
@@ -234,60 +363,111 @@ pub fn build_tcp_noise_transport(
 // Transport based on TCP + Noise, but without remote authentication (i.e., any
 // node is allowed to connect).
 pub fn build_unauthenticated_tcp_noise_transport(
-    own_identity: Identity,
-    identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
-    let noise_config = Arc::new(NoiseConfig::new(identity_keypair));
+    network_id: NetworkId,
+    identity_key: x25519::PrivateKey,
+    application_protocols: SupportedProtocols,
+) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
+    let noise_config = Arc::new(NoiseWrapper::new(identity_key));
+    let mut own_handshake = HandshakeMsg::new(network_id);
+    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
+
     LIBRA_TCP_TRANSPORT
-        .and_then(move |socket, origin| {
+        .and_then(move |socket, addr, origin| {
             async move {
-                let (remote_static_key, socket) =
-                    noise_config.upgrade_connection(socket, origin).await?;
-                // Generate PeerId from X25519StaticPublicKey.
+                let remote_public_key = addr.find_noise_proto();
+                let (remote_static_key, socket) = noise_config
+                    .upgrade_connection(socket, origin, None, remote_public_key, None)
+                    .await?;
+
+                // Generate PeerId from x25519::PublicKey.
                 // Note: This is inconsistent with current types because AccountAddress is derived
                 // from consensus key which is of type Ed25519PublicKey. Since AccountAddress does
                 // not mean anything in a setting without remote authentication, we use the network
                 // public key to generate a peer_id for the peer. The only reason this works is that
                 // both are 32 bytes in size. If/when this condition no longer holds, we will receive
                 // an error.
-                let peer_id = PeerId::try_from(remote_static_key).unwrap();
+                let peer_id = PeerId::try_from(remote_static_key.as_slice()).unwrap();
                 Ok((peer_id, socket))
             }
         })
-        .and_then(|(peer_id, socket), origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, socket), addr, origin| async move {
+            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
 }
 
 pub fn build_tcp_transport(
-    own_identity: Identity,
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+    network_id: NetworkId,
+    own_peer_id: PeerId,
+    application_protocols: SupportedProtocols,
+) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
+    let mut own_handshake = HandshakeMsg::new(network_id);
+    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
+
     LIBRA_TCP_TRANSPORT
-        .and_then(|socket, origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok(muxer)
-            }
+        .and_then(move |mut socket, _addr, _origin| async move {
+            Ok((exchange_peerid(&own_peer_id, &mut socket).await?, socket))
         })
-        .and_then(move |muxer, origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                check_role(&own_identity, identity).and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, socket), addr, origin| async move {
+            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        protocols::wire::handshake::v1::{HandshakeMsg, MessagingProtocolVersion},
+        transport::perform_handshake,
+        ProtocolId,
+    };
+    use futures::{executor::block_on, future::join};
+    use libra_config::network_id::NetworkId;
+    use libra_network_address::NetworkAddress;
+    use libra_types::PeerId;
+    use memsocket::MemorySocket;
+    use netcore::transport::ConnectionOrigin;
+
+    #[test]
+    fn handshake_network_id_mismatch() {
+        let (outbound, inbound) = MemorySocket::new_pair();
+
+        let mut server_handshake = HandshakeMsg::new(NetworkId::Validator);
+        // This is required to ensure that test doesn't get an error for a different reason
+        server_handshake.add(
+            MessagingProtocolVersion::V1,
+            [ProtocolId::ConsensusDirectSend].iter().into(),
+        );
+        let mut client_handshake = server_handshake.clone();
+        // Ensure client doesn't match networks
+        client_handshake.network_id = NetworkId::Public;
+
+        let server = async move {
+            perform_handshake(
+                PeerId::random(),
+                inbound,
+                NetworkAddress::mock(),
+                ConnectionOrigin::Inbound,
+                &server_handshake,
+            )
+            .await
+            .unwrap_err()
+        };
+
+        let client = async move {
+            perform_handshake(
+                PeerId::random(),
+                outbound,
+                NetworkAddress::mock(),
+                ConnectionOrigin::Outbound,
+                &client_handshake,
+            )
+            .await
+            .unwrap_err()
+        };
+
+        block_on(join(server, client));
+    }
 }

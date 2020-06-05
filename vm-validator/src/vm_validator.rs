@@ -2,98 +2,79 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use libra_config::config::NodeConfig;
 use libra_types::{
-    account_address::AccountAddress, account_config::AccountResource,
-    transaction::SignedTransaction, vm_error::VMStatus,
+    account_address::AccountAddress,
+    account_config::AccountResource,
+    on_chain_config::{LibraVersion, OnChainConfigPayload, VMConfig},
+    transaction::{SignedTransaction, VMValidatorResult},
 };
+use libra_vm::LibraVM;
 use scratchpad::SparseMerkleTree;
-use std::convert::TryFrom;
-use std::sync::Arc;
-use storage_client::{StorageRead, VerifiedStateView};
-use tokio::runtime::Handle;
-use vm_runtime::{LibraVM, VMVerifier};
+use std::{convert::TryFrom, sync::Arc};
+use storage_interface::{state_view::VerifiedStateView, DbReader};
 
 #[cfg(test)]
 #[path = "unit_tests/vm_validator_test.rs"]
 mod vm_validator_test;
 
-#[async_trait::async_trait]
 pub trait TransactionValidation: Send + Sync + Clone {
-    type ValidationInstance: VMVerifier;
+    type ValidationInstance: libra_vm::VMValidator;
+
     /// Validate a txn from client
-    async fn validate_transaction(&self, _txn: SignedTransaction) -> Result<Option<VMStatus>>;
+    fn validate_transaction(&self, _txn: SignedTransaction) -> Result<VMValidatorResult>;
+
+    /// Restart the transaction validation instance
+    fn restart(&mut self, config: OnChainConfigPayload) -> Result<()>;
 }
 
 #[derive(Clone)]
 pub struct VMValidator {
-    storage_read_client: Arc<dyn StorageRead>,
-    rt_handle: Handle,
+    db_reader: Arc<dyn DbReader>,
     vm: LibraVM,
 }
 
 impl VMValidator {
-    pub fn new(
-        config: &NodeConfig,
-        storage_read_client: Arc<dyn StorageRead>,
-        rt_handle: Handle,
-    ) -> Self {
-        VMValidator {
-            storage_read_client,
-            rt_handle,
-            vm: LibraVM::new(&config.vm_config),
-        }
+    pub fn new(db_reader: Arc<dyn DbReader>) -> Self {
+        let mut vm = LibraVM::new();
+        let (version, state_root) = db_reader.get_latest_state_root().expect("Should not fail.");
+        let smt = SparseMerkleTree::new(state_root);
+        let state_view =
+            VerifiedStateView::new(Arc::clone(&db_reader), Some(version), state_root, &smt);
+
+        vm.load_configs(&state_view);
+        VMValidator { db_reader, vm }
     }
 }
 
-#[async_trait::async_trait]
 impl TransactionValidation for VMValidator {
     type ValidationInstance = LibraVM;
 
-    async fn validate_transaction(&self, txn: SignedTransaction) -> Result<Option<VMStatus>> {
-        let (version, state_root) = self.storage_read_client.get_latest_state_root().await?;
-        let client = self.storage_read_client.clone();
-        let rt_handle = self.rt_handle.clone();
-        let vm = self.vm.clone();
-        // We have to be careful here. The storage read client only exposes async functions but the
-        // whole VM is synchronous and async/await isn't currently using in the VM. Due to this
-        // there is a trick in the StateView impl which spawns a task on a runtime to actually do
-        // the async read while using "block_on" to synchronously wait for the read to complete.
-        // This is where things get tricky. If that task is spawned onto the same thread in the
-        // pool as the task that is using "block_on" then there is a chance that the read will
-        // never complete since it will be resource starved resulting in the "block_on" task
-        // hanging forever.
-        //
-        // In order to work around this issue we can use "spawn_blocking" to move the task that is
-        // using "block_on" to its own thread, where it won't interfere with have a chance to
-        // starve other async tasks.
-        tokio::task::spawn_blocking(move || {
-            let smt = SparseMerkleTree::new(state_root);
-            let state_view =
-                VerifiedStateView::new(client, rt_handle, Some(version), state_root, &smt);
+    fn validate_transaction(&self, txn: SignedTransaction) -> Result<VMValidatorResult> {
+        use libra_vm::VMValidator;
 
-            vm.validate_transaction(txn, &state_view)
-        })
-        .await
-        .map_err(Into::into)
+        let (version, state_root) = self.db_reader.get_latest_state_root()?;
+        let db_reader = Arc::clone(&self.db_reader);
+        let vm = self.vm.clone();
+
+        let smt = SparseMerkleTree::new(state_root);
+        let state_view = VerifiedStateView::new(db_reader, Some(version), state_root, &smt);
+
+        Ok(vm.validate_transaction(txn, &state_view))
+    }
+
+    fn restart(&mut self, config: OnChainConfigPayload) -> Result<()> {
+        let vm_config = config.get::<VMConfig>()?;
+        let version = config.get::<LibraVersion>()?;
+
+        self.vm = LibraVM::init_with_config(version, vm_config);
+        Ok(())
     }
 }
 
-/// read account state
-/// returns account's current sequence number and balance
-pub async fn get_account_state(
-    storage_read_client: Arc<dyn StorageRead>,
-    address: AccountAddress,
-) -> Result<(u64, u64)> {
-    let account_state = storage_read_client
-        .get_latest_account_state(address)
-        .await?;
-    Ok(if let Some(blob) = account_state {
-        let account_resource = AccountResource::try_from(&blob)?;
-        let sequence_number = account_resource.sequence_number();
-        let balance = account_resource.balance();
-        (sequence_number, balance)
-    } else {
-        (0, 0)
-    })
+/// returns account's sequence number from storage
+pub fn get_account_sequence_number(storage: &dyn DbReader, address: AccountAddress) -> Result<u64> {
+    match storage.get_latest_account_state(address)? {
+        Some(blob) => Ok(AccountResource::try_from(&blob)?.sequence_number()),
+        None => Ok(0),
+    }
 }

@@ -1,18 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::shared::unique_map::UniqueMap;
 use crate::{
     errors::*,
     naming::ast as N,
     parser::ast::{ModuleIdent, StructName},
-    shared::*,
+    shared::{unique_map::UniqueMap, *},
 };
-use petgraph::algo::astar as petgraph_astar;
-use petgraph::algo::toposort as petgraph_toposort;
-use petgraph::algo::Cycle;
-use petgraph::graphmap::DiGraphMap;
-use std::collections::{BTreeMap, BTreeSet};
+use move_ir_types::location::*;
+use petgraph::{algo::toposort as petgraph_toposort, graphmap::DiGraphMap};
+use std::collections::BTreeMap;
 
 //**************************************************************************************************
 // Entry
@@ -20,41 +17,33 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub fn verify(errors: &mut Errors, modules: &mut UniqueMap<ModuleIdent, N::ModuleDefinition>) {
     let imm_modules = &modules;
-    let context = &mut Context::new(errors, imm_modules);
+    let context = &mut Context::new(imm_modules);
     module_defs(context, modules);
-    match build_ordering(context) {
+    let graph = &context.dependency_graph();
+    match petgraph_toposort(graph, None) {
         Err(cycle_node) => {
             let cycle_ident = cycle_node.node_id().clone();
-            report_cycle(context, cycle_ident)
+            let error = cycle_error(context, cycle_ident);
+            errors.push(error)
         }
         Ok(ordered_ids) => {
-            let ordering = ordered_ids
-                .into_iter()
-                .filter(|m| imm_modules.get(m).unwrap().is_source_module.is_some())
-                .cloned()
-                .enumerate()
-                .collect::<Vec<_>>();
-            for (order, mident) in ordering {
-                modules.get_mut(&mident).unwrap().is_source_module = Some(order)
+            let ordered_ids = ordered_ids.into_iter().cloned().collect::<Vec<_>>();
+            for (order, mident) in ordered_ids.into_iter().rev().enumerate() {
+                modules.get_mut(&mident).unwrap().dependency_order = order
             }
         }
     }
 }
 
 struct Context<'a> {
-    errors: &'a mut Errors,
     modules: &'a UniqueMap<ModuleIdent, N::ModuleDefinition>,
     neighbors: BTreeMap<ModuleIdent, BTreeMap<ModuleIdent, Loc>>,
     current_module: Option<ModuleIdent>,
 }
 
 impl<'a> Context<'a> {
-    fn new(
-        errors: &'a mut Errors,
-        modules: &'a UniqueMap<ModuleIdent, N::ModuleDefinition>,
-    ) -> Self {
+    fn new(modules: &'a UniqueMap<ModuleIdent, N::ModuleDefinition>) -> Self {
         Context {
-            errors,
             modules,
             neighbors: BTreeMap::new(),
             current_module: None,
@@ -86,13 +75,7 @@ impl<'a> Context<'a> {
     }
 }
 
-fn build_ordering<'a>(
-    context: &'a Context,
-) -> Result<Vec<&'a ModuleIdent>, Cycle<&'a ModuleIdent>> {
-    petgraph_toposort(&context.dependency_graph(), None)
-}
-
-fn report_cycle(context: &mut Context, cycle_ident: ModuleIdent) {
+fn cycle_error(context: &Context, cycle_ident: ModuleIdent) -> Error {
     let cycle = shortest_cycle(&context.dependency_graph(), &cycle_ident);
 
     // For printing uses, sort the cycle by location (earliest first)
@@ -109,39 +92,7 @@ fn report_cycle(context: &mut Context, cycle_ident: ModuleIdent) {
         "Using this module creates a dependency cycle: {}",
         cycle_strings
     );
-    context
-        .errors
-        .push(vec![(used_loc, use_msg), (used_loc, cycle_msg)])
-}
-
-fn shortest_cycle<'a>(
-    dependency_graph: &DiGraphMap<&'a ModuleIdent, ()>,
-    start: &'a ModuleIdent,
-) -> Vec<&'a ModuleIdent> {
-    let shortest_path = dependency_graph
-        .neighbors(start)
-        .fold(None, |shortest_path, neighbor| {
-            let path_opt = petgraph_astar(
-                dependency_graph,
-                neighbor,
-                |finish| finish == start,
-                |_e| 1,
-                |_| 0,
-            );
-            match (shortest_path, path_opt) {
-                (p, None) | (None, p) => p,
-                (Some((acc_len, acc_path)), Some((cur_len, cur_path))) => {
-                    Some(if cur_len < acc_len {
-                        (cur_len, cur_path)
-                    } else {
-                        (acc_len, acc_path)
-                    })
-                }
-            }
-        });
-    let (_, mut path) = shortest_path.unwrap();
-    path.insert(0, start);
-    path
+    vec![(used_loc, use_msg), (used_loc, cycle_msg)]
 }
 
 fn best_cycle_loc<'a>(
@@ -170,9 +121,6 @@ fn module_defs(context: &mut Context, modules: &UniqueMap<ModuleIdent, N::Module
 
 fn module(context: &mut Context, mident: ModuleIdent, mdef: &N::ModuleDefinition) {
     context.current_module = Some(mident);
-    mdef.uses
-        .iter()
-        .for_each(|(mident, loc)| context.add_usage(mident, *loc));
     mdef.structs
         .iter()
         .for_each(|(_, sdef)| struct_def(context, sdef));
@@ -183,9 +131,7 @@ fn module(context: &mut Context, mident: ModuleIdent, mdef: &N::ModuleDefinition
 
 fn struct_def(context: &mut Context, sdef: &N::StructDefinition) {
     if let N::StructFields::Defined(fields) = &sdef.fields {
-        fields
-            .iter()
-            .for_each(|(_, (_, bt))| base_type(context, bt));
+        fields.iter().for_each(|(_, (_, bt))| type_(context, bt));
     }
 }
 
@@ -198,11 +144,11 @@ fn function(context: &mut Context, fdef: &N::Function) {
 }
 
 fn function_signature(context: &mut Context, sig: &N::FunctionSignature) {
-    single_types(context, sig.parameters.iter().map(|(_, st)| st));
+    types(context, sig.parameters.iter().map(|(_, st)| st));
     type_(context, &sig.return_type)
 }
 
-fn function_acquires(_context: &mut Context, _acqs: &BTreeSet<StructName>) {}
+fn function_acquires(_context: &mut Context, _acqs: &BTreeMap<StructName, Loc>) {}
 
 //**************************************************************************************************
 // Types
@@ -215,44 +161,28 @@ fn type_name(context: &mut Context, sp!(loc, tn_): &N::TypeName) {
     }
 }
 
-fn base_types_opt(context: &mut Context, bs_opt: &Option<Vec<N::BaseType>>) {
-    bs_opt.iter().for_each(|bs| base_types(context, bs))
+fn types<'a>(context: &mut Context, tys: impl IntoIterator<Item = &'a N::Type>) {
+    tys.into_iter().for_each(|ty| type_(context, ty))
 }
 
-fn base_types<'a>(context: &mut Context, bs: impl IntoIterator<Item = &'a N::BaseType>) {
-    bs.into_iter().for_each(|bt| base_type(context, bt))
+fn types_opt(context: &mut Context, tys_opt: &Option<Vec<N::Type>>) {
+    tys_opt.iter().for_each(|tys| types(context, tys))
 }
 
-fn base_type(context: &mut Context, sp!(_, bt_): &N::BaseType) {
-    use N::BaseType_ as BT;
-    if let BT::Apply(_, tn, bs) = bt_ {
-        type_name(context, tn);
-        base_types(context, bs);
-    }
-}
-
-fn single_types<'a>(context: &mut Context, ss: impl IntoIterator<Item = &'a N::SingleType>) {
-    ss.into_iter().for_each(|st| single_type(context, st))
-}
-
-fn single_type(context: &mut Context, sp!(_, st_): &N::SingleType) {
-    use N::SingleType_ as ST;
-    match st_ {
-        ST::Base(bt) | ST::Ref(_, bt) => base_type(context, bt),
+fn type_(context: &mut Context, sp!(_, ty_): &N::Type) {
+    use N::Type_ as T;
+    match ty_ {
+        T::Apply(_, tn, tys) => {
+            type_name(context, tn);
+            types(context, tys);
+        }
+        T::Ref(_, t) => type_(context, t),
+        T::Param(_) | T::Unit | T::Anything | T::UnresolvedError | T::Var(_) => (),
     }
 }
 
 fn type_opt(context: &mut Context, t_opt: &Option<N::Type>) {
     t_opt.iter().for_each(|t| type_(context, t))
-}
-
-fn type_(context: &mut Context, sp!(_, t_): &N::Type) {
-    use N::Type_ as T;
-    match t_ {
-        T::Unit => (),
-        T::Single(s) => single_type(context, s),
-        T::Multiple(ss) => single_types(context, ss),
-    }
 }
 
 //**************************************************************************************************
@@ -265,64 +195,53 @@ fn sequence(context: &mut Context, sequence: &N::Sequence) {
         match item_ {
             SI::Seq(e) => exp(context, e),
             SI::Declare(bl, ty_opt) => {
-                binds(context, &bl.value);
+                lvalues(context, &bl.value);
                 type_opt(context, ty_opt);
             }
             SI::Bind(bl, e) => {
-                binds(context, &bl.value);
+                lvalues(context, &bl.value);
                 exp(context, e)
             }
         }
     }
 }
 
-fn binds<'a>(context: &mut Context, bl: impl IntoIterator<Item = &'a N::Bind>) {
-    bl.into_iter().for_each(|b| bind(context, b))
+fn lvalues<'a>(context: &mut Context, al: impl IntoIterator<Item = &'a N::LValue>) {
+    al.into_iter().for_each(|a| lvalue(context, a))
 }
 
-fn bind(context: &mut Context, sp!(loc, b_): &N::Bind) {
-    use N::Bind_ as B;
-    if let B::Unpack(m, _, bs_opt, f) = b_ {
+fn lvalue(context: &mut Context, sp!(loc, a_): &N::LValue) {
+    use N::LValue_ as L;
+    if let L::Unpack(m, _, bs_opt, f) = a_ {
         context.add_usage(m, *loc);
-        base_types_opt(context, bs_opt);
-        binds(context, f.iter().map(|(_, (_, b))| b));
-    }
-}
-
-fn assigns<'a>(context: &mut Context, al: impl IntoIterator<Item = &'a N::Assign>) {
-    al.into_iter().for_each(|a| assign(context, a))
-}
-
-fn assign(context: &mut Context, sp!(loc, a_): &N::Assign) {
-    use N::Assign_ as A;
-    if let A::Unpack(m, _, bs_opt, f) = a_ {
-        context.add_usage(m, *loc);
-        base_types_opt(context, bs_opt);
-        assigns(context, f.iter().map(|(_, (_, b))| b));
+        types_opt(context, bs_opt);
+        lvalues(context, f.iter().map(|(_, (_, b))| b));
     }
 }
 
 fn exp(context: &mut Context, sp!(loc, e_): &N::Exp) {
     use N::Exp_ as E;
     match e_ {
-        E::Unit
+        E::Unit { .. }
         | E::UnresolvedError
         | E::Break
         | E::Continue
+        | E::Spec(_, _)
+        | E::InferredNum(_)
         | E::Value(_)
         | E::Move(_)
         | E::Copy(_)
         | E::Use(_) => (),
 
-        E::ModuleCall(m, _, bs_opt, er) => {
+        E::ModuleCall(m, _, bs_opt, sp!(_, es_)) => {
             context.add_usage(m, *loc);
-            base_types_opt(context, bs_opt);
-            exp(context, er);
+            types_opt(context, bs_opt);
+            es_.iter().for_each(|e| exp(context, e))
         }
 
-        E::Builtin(bf, er) => {
+        E::Builtin(bf, sp!(_, es_)) => {
             builtin_function(context, bf);
-            exp(context, er);
+            es_.iter().for_each(|e| exp(context, e))
         }
 
         E::IfElse(ec, et, ef) => {
@@ -337,7 +256,7 @@ fn exp(context: &mut Context, sp!(loc, e_): &N::Exp) {
         }
         E::Block(seq) => sequence(context, seq),
         E::Assign(al, e) => {
-            assigns(context, &al.value);
+            lvalues(context, &al.value);
             exp(context, e)
         }
         E::FieldMutate(edotted, e) => {
@@ -351,7 +270,7 @@ fn exp(context: &mut Context, sp!(loc, e_): &N::Exp) {
 
         E::Pack(m, _, bs_opt, fes) => {
             context.add_usage(m, *loc);
-            base_types_opt(context, bs_opt);
+            types_opt(context, bs_opt);
             fes.iter().for_each(|(_, (_, e))| exp(context, e))
         }
 
@@ -359,7 +278,7 @@ fn exp(context: &mut Context, sp!(loc, e_): &N::Exp) {
 
         E::DerefBorrow(edotted) | E::Borrow(_, edotted) => exp_dotted(context, edotted),
 
-        E::Annotate(e, ty) => {
+        E::Cast(e, ty) | E::Annotate(e, ty) => {
             exp(context, e);
             type_(context, ty)
         }
@@ -378,9 +297,10 @@ fn builtin_function(context: &mut Context, sp!(_, bf_): &N::BuiltinFunction) {
     use N::BuiltinFunction_ as B;
     match bf_ {
         B::MoveToSender(bt_opt)
+        | B::MoveTo(bt_opt)
         | B::MoveFrom(bt_opt)
         | B::BorrowGlobal(_, bt_opt)
         | B::Exists(bt_opt)
-        | B::Freeze(bt_opt) => bt_opt.iter().for_each(|bt| base_type(context, bt)),
+        | B::Freeze(bt_opt) => type_opt(context, bt_opt),
     }
 }

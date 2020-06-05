@@ -10,7 +10,9 @@ pub struct MempoolTransaction {
     // system expiration time of transaction. It should be removed from mempool by that time
     pub expiration_time: Duration,
     pub gas_amount: u64,
+    pub ranking_score: u64,
     pub timeline_state: TimelineState,
+    pub is_governance_txn: bool,
 }
 
 impl MempoolTransaction {
@@ -18,13 +20,17 @@ impl MempoolTransaction {
         txn: SignedTransaction,
         expiration_time: Duration,
         gas_amount: u64,
+        ranking_score: u64,
         timeline_state: TimelineState,
+        is_governance_txn: bool,
     ) -> Self {
         Self {
             txn,
             gas_amount,
+            ranking_score,
             expiration_time,
             timeline_state,
+            is_governance_txn,
         }
     }
     pub(crate) fn get_sequence_number(&self) -> u64 {

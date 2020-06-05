@@ -1,9 +1,22 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use libra_metrics::{Histogram, IntGauge, OpMetrics};
+use libra_metrics::{
+    register_histogram_vec, register_int_counter_vec, register_int_gauge_vec, HistogramVec,
+    IntCounterVec, IntGauge, IntGaugeVec, OpMetrics,
+};
 use once_cell::sync::Lazy;
-use prometheus::{HistogramVec, IntCounterVec, IntGaugeVec};
+
+// some type labels
+pub const REQUEST_LABEL: &str = "request";
+pub const RESPONSE_LABEL: &str = "response";
+
+// some state labels
+pub const CANCELED_LABEL: &str = "canceled";
+pub const DECLINED_LABEL: &str = "declined";
+pub const FAILED_LABEL: &str = "failed";
+pub const RECEIVED_LABEL: &str = "received";
+pub const SENT_LABEL: &str = "sent";
 
 pub static LIBRA_NETWORK_PEERS: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge_vec!(
@@ -47,10 +60,11 @@ pub static LIBRA_NETWORK_RPC_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static LIBRA_NETWORK_RPC_LATENCY: Lazy<Histogram> = Lazy::new(|| {
-    register_histogram!(
+pub static LIBRA_NETWORK_RPC_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
         "libra_network_rpc_latency_seconds",
-        "Libra network rpc latency histogram"
+        "Libra network rpc latency histogram",
+        &["type", "protocol_id", "peer_id"]
     )
     .unwrap()
 });
@@ -92,35 +106,6 @@ pub static PENDING_NETWORK_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
         &["state"]
     )
     .unwrap()
-});
-
-/// Counter of pending network events to Consensus
-pub static PENDING_CONSENSUS_NETWORK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "pending_consensus_network_events",
-        "Counters(queued,dequeued,dropped) related to pending network notifications to Consensus",
-        &["state"]
-    )
-    .unwrap()
-});
-
-/// Counter of pending network events to Mempool
-pub static PENDING_MEMPOOL_NETWORK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "pending_mempool_network_events",
-        "Counters(queued,dequeued,dropped) related to pending network notifications to Mempool",
-        &["state"]
-    )
-    .unwrap()
-});
-
-/// Counter of pending network events to State Synchronizer
-pub static PENDING_STATE_SYNCHRONIZER_NETWORK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "pending_state_sync_network_events",
-        "Counters(queued,dequeued,dropped) related to pending network notifications to State Synchronizer",
-        &["state"]
-    ).unwrap()
 });
 
 /// Counter of pending network events to Health Checker.
@@ -170,6 +155,10 @@ pub static PENDING_CONNECTION_HANDLER_NOTIFICATIONS: Lazy<IntGauge> =
 pub static PENDING_PEER_MANAGER_DIAL_REQUESTS: Lazy<IntGauge> =
     Lazy::new(|| OP_COUNTERS.gauge("pending_peer_manager_dial_requests"));
 
+/// Counter of messages pending in queue to be sent out on the wire.
+pub static PENDING_WIRE_MESSAGES: Lazy<IntGauge> =
+    Lazy::new(|| OP_COUNTERS.gauge("pending_wire_messages"));
+
 /// Counter of pending requests in Direct Send
 pub static PENDING_DIRECT_SEND_REQUESTS: &str = "pending_direct_send_requests";
 
@@ -184,9 +173,6 @@ pub static PENDING_RPC_NOTIFICATIONS: &str = "pending_rpc_notifications";
 
 /// Counter of pending requests for each remote peer
 pub static PENDING_PEER_REQUESTS: &str = "pending_peer_requests";
-
-/// Counter of pending outbound messages in Direct Send for each remote peer
-pub static PENDING_DIRECT_SEND_OUTBOUND_MESSAGES: &str = "pending_direct_send_outbound_messages";
 
 /// Counter of pending RPC events from Peer to Rpc actor.
 pub static PENDING_PEER_RPC_NOTIFICATIONS: &str = "pending_peer_rpc_notifications";

@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, Result};
-use libra_types::PeerId;
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fmt,
     fs::File,
     io::{Read, Write},
@@ -13,16 +13,19 @@ use std::{
     str::FromStr,
 };
 use thiserror::Error;
-use toml;
 
 mod admission_control_config;
 pub use admission_control_config::*;
+mod rpc_config;
+pub use rpc_config::*;
 mod consensus_config;
 pub use consensus_config::*;
 mod debug_interface_config;
 pub use debug_interface_config::*;
 mod execution_config;
 pub use execution_config::*;
+mod key_manager_config;
+pub use key_manager_config::*;
 mod logger_config;
 pub use logger_config::*;
 mod metrics_config;
@@ -31,28 +34,33 @@ mod mempool_config;
 pub use mempool_config::*;
 mod network_config;
 pub use network_config::*;
+mod secure_backend_config;
+pub use secure_backend_config::*;
 mod state_sync_config;
 pub use state_sync_config::*;
 mod storage_config;
 pub use storage_config::*;
 mod safety_rules_config;
 pub use safety_rules_config::*;
+mod upstream_config;
+pub use upstream_config::*;
 mod test_config;
-pub use test_config::*;
-mod vm_config;
+use crate::network_id::NetworkId;
 use libra_types::waypoint::Waypoint;
-pub use vm_config::*;
+pub use test_config::*;
 
 /// Config pulls in configuration information from the config file.
 /// This is used to set up the nodes and configure various parameters.
 /// The config file is broken up into sections for each module
 /// so that only that module can be passed around
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
-#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone, PartialEq))]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     #[serde(default)]
     pub admission_control: AdmissionControlConfig,
+    #[serde(default)]
+    pub rpc: RpcConfig,
     #[serde(default)]
     pub base: BaseConfig,
     #[serde(default)]
@@ -76,9 +84,9 @@ pub struct NodeConfig {
     #[serde(default)]
     pub test: Option<TestConfig>,
     #[serde(default)]
-    pub validator_network: Option<NetworkConfig>,
+    pub upstream: UpstreamConfig,
     #[serde(default)]
-    pub vm_config: VMConfig,
+    pub validator_network: Option<NetworkConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -86,7 +94,7 @@ pub struct NodeConfig {
 pub struct BaseConfig {
     data_dir: PathBuf,
     pub role: RoleType,
-    pub waypoint: Option<Waypoint>,
+    pub waypoint: WaypointConfig,
 }
 
 impl Default for BaseConfig {
@@ -94,7 +102,25 @@ impl Default for BaseConfig {
         BaseConfig {
             data_dir: PathBuf::from("/opt/libra/data/commmon"),
             role: RoleType::Validator,
-            waypoint: None,
+            waypoint: WaypointConfig::None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum WaypointConfig {
+    FromConfig { waypoint: Waypoint },
+    FromStorage { backend: SecureBackend },
+    None,
+}
+
+impl WaypointConfig {
+    pub fn waypoint_from_config(&self) -> Option<Waypoint> {
+        if let WaypointConfig::FromConfig { waypoint } = self {
+            Some(*waypoint)
+        } else {
+            None
         }
     }
 }
@@ -107,11 +133,11 @@ pub enum RoleType {
 }
 
 impl RoleType {
-    pub fn is_validator(&self) -> bool {
-        *self == RoleType::Validator
+    pub fn is_validator(self) -> bool {
+        self == RoleType::Validator
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             RoleType::Validator => "validator",
             RoleType::FullNode => "full_node",
@@ -153,11 +179,12 @@ impl NodeConfig {
         self.storage.set_data_dir(data_dir);
     }
 
-    /// This clones the underlying data except for the keypair so that this config can be used as a
+    /// This clones the underlying data except for the keys so that this config can be used as a
     /// template for another config.
     pub fn clone_for_template(&self) -> Self {
         Self {
             admission_control: self.admission_control.clone(),
+            rpc: self.rpc.clone(),
             base: self.base.clone(),
             consensus: self.consensus.clone(),
             debug_interface: self.debug_interface.clone(),
@@ -173,32 +200,11 @@ impl NodeConfig {
             state_sync: self.state_sync.clone(),
             storage: self.storage.clone(),
             test: None,
-            validator_network: if let Some(n) = &self.validator_network {
-                Some(n.clone_for_template())
-            } else {
-                None
-            },
-            vm_config: self.vm_config.clone(),
-        }
-    }
-
-    /// Determines whether a node `peer_id` is an upstream peer of a node with this NodeConfig.
-    /// For a validator node, any of its validator peers are considered an upstream peer
-    /// In general, a network ID is a PeerId that this node uses to uniquely identify a network it belongs to.
-    /// This is equivalent to the `peer_id` field in the NetworkConfig of this NodeConfig
-    /// Here, `network_id` is the ID of the network that the peer and this node belong to.
-    pub fn is_upstream_peer(&self, peer_id: PeerId, network_id: PeerId) -> bool {
-        match self.base.role {
-            RoleType::Validator => self
+            upstream: self.upstream.clone(),
+            validator_network: self
                 .validator_network
                 .as_ref()
-                .map(|cfg| cfg.peer_id == network_id)
-                .unwrap_or_default(),
-            RoleType::FullNode => self
-                .state_sync
-                .upstream_peers
-                .upstream_peers
-                .contains(&peer_id),
+                .map(|n| n.clone_for_template()),
         }
     }
 
@@ -219,13 +225,23 @@ impl NodeConfig {
             );
         }
 
+        let mut network_ids = HashSet::new();
         let input_dir = RootPath::new(input_path);
         config.execution.load(&input_dir)?;
         if let Some(network) = &mut config.validator_network {
             network.load(&input_dir, RoleType::Validator)?;
+            network_ids.insert(network.network_id.clone());
         }
         for network in &mut config.full_node_networks {
             network.load(&input_dir, RoleType::FullNode)?;
+
+            // Validate that a network isn't repeated
+            let network_id = network.network_id.clone();
+            ensure!(
+                !network_ids.contains(&network_id),
+                format!("network_id {:?} was repeated", network_id)
+            );
+            network_ids.insert(network_id);
         }
         config.set_data_dir(config.data_dir().clone());
         Ok(config)
@@ -245,19 +261,21 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Returns true if network_config is for an upstream network
-    pub fn is_upstream_network(&self, network_config: &NetworkConfig) -> bool {
-        self.state_sync
-            .upstream_peers
-            .upstream_peers
-            .iter()
-            .any(|peer_id| network_config.network_peers.peers.contains_key(peer_id))
-    }
-
     pub fn randomize_ports(&mut self) {
         self.admission_control.randomize_ports();
         self.debug_interface.randomize_ports();
         self.storage.randomize_ports();
+        self.rpc.randomize_ports();
+
+        if let Some(network) = self.validator_network.as_mut() {
+            network.listen_address = crate::utils::get_available_port_in_multiaddr(true);
+            network.advertised_address = network.listen_address.clone();
+        }
+
+        for network in self.full_node_networks.iter_mut() {
+            network.listen_address = crate::utils::get_available_port_in_multiaddr(true);
+            network.advertised_address = network.listen_address.clone();
+        }
     }
 
     pub fn random() -> Self {
@@ -281,11 +299,15 @@ impl NodeConfig {
         let mut test = TestConfig::new_with_temp_dir();
 
         if self.base.role == RoleType::Validator {
+            test.initialize_storage = true;
             test.random_account_key(rng);
-            let peer_id = PeerId::from_public_key(test.account_keypair.as_ref().unwrap().public());
+            let peer_id = libra_types::account_address::from_public_key(
+                &test.operator_keypair.as_ref().unwrap().public_key(),
+            );
 
             if self.validator_network.is_none() {
-                self.validator_network = Some(NetworkConfig::default());
+                let network_config = NetworkConfig::network_with_id(NetworkId::Validator);
+                self.validator_network = Some(network_config);
             }
 
             let validator_network = self.validator_network.as_mut().unwrap();
@@ -294,7 +316,8 @@ impl NodeConfig {
         } else {
             self.validator_network = None;
             if self.full_node_networks.is_empty() {
-                self.full_node_networks.push(NetworkConfig::default());
+                let network_config = NetworkConfig::network_with_id(NetworkId::Public);
+                self.full_node_networks.push(network_config);
             }
             for network in &mut self.full_node_networks {
                 network.random(rng);
@@ -389,9 +412,10 @@ mod test {
 
         expected_network.advertised_address = actual_network.advertised_address.clone();
         expected_network.listen_address = actual_network.listen_address.clone();
-        expected_network.network_keypairs = actual_network.network_keypairs.clone();
+        expected_network.identity = actual_network.identity.clone();
         expected_network.network_peers = actual_network.network_peers.clone();
         expected_network.seed_peers = actual_network.seed_peers.clone();
+        expected_network.seed_peers_file = actual_network.seed_peers_file.clone();
 
         expected.set_data_dir(actual.data_dir().clone());
         compare_configs(&actual, &expected);
@@ -428,7 +452,7 @@ mod test {
     }
 
     fn compare_configs(actual: &NodeConfig, expected: &NodeConfig) {
-        // This is broken down first into smaller evaluations to improve idenitfying what is broken.
+        // This is broken down first into smaller evaluations to improve identifying what is broken.
         // The output for a broken config leveraging assert at the top level config is not readable.
         assert_eq!(actual.admission_control, expected.admission_control);
         assert_eq!(actual.base, expected.base);
@@ -444,7 +468,6 @@ mod test {
         assert_eq!(actual.storage, expected.storage);
         assert_eq!(actual.test, expected.test);
         assert_eq!(actual.validator_network, expected.validator_network);
-        assert_eq!(actual.vm_config, expected.vm_config);
         assert_eq!(actual, expected);
     }
 

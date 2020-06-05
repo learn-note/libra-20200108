@@ -11,39 +11,37 @@ use crate::{
     thread::ThreadService,
     SafetyRules, TSafetyRules,
 };
-use consensus_types::common::{Author, Payload};
-use libra_config::config::{NodeConfig, SafetyRulesBackend, SafetyRulesService};
-use libra_secure_storage::{InMemoryStorage, OnDiskStorage, Storage};
+use consensus_types::common::Author;
+use libra_config::config::{NodeConfig, SafetyRulesService};
+use libra_secure_storage::{config, Storage};
 use std::{
+    convert::TryInto,
     net::SocketAddr,
     sync::{Arc, RwLock},
 };
 
 pub fn extract_service_inputs(config: &mut NodeConfig) -> (Author, PersistentSafetyStorage) {
-    let author = config
-        .validator_network
-        .as_ref()
-        .expect("Missing validator network")
-        .peer_id;
+    let author = config::peer_id(
+        config
+            .validator_network
+            .as_ref()
+            .expect("Missing validator network"),
+    );
 
     let backend = &config.consensus.safety_rules.backend;
-    let (initialize, internal_storage): (bool, Box<dyn Storage>) = match backend {
-        SafetyRulesBackend::InMemoryStorage => (true, Box::new(InMemoryStorage::new())),
-        SafetyRulesBackend::OnDiskStorage(config) => {
-            (config.default, Box::new(OnDiskStorage::new(config.path())))
-        }
-    };
+    let internal_storage: Box<dyn Storage> =
+        backend.try_into().expect("Unable to initialize storage");
 
-    let storage = if initialize {
-        let test_config = config.test.as_mut().expect("Missing test config");
+    let storage = if let Some(test_config) = config.test.as_mut() {
         let private_key = test_config
             .consensus_keypair
             .as_mut()
             .expect("Missing consensus keypair in test config")
             .take_private()
             .expect("Failed to take Consensus private key, key absent or already read");
+        let waypoint = config::waypoint(&config.base.waypoint);
 
-        PersistentSafetyStorage::initialize(internal_storage, private_key)
+        PersistentSafetyStorage::initialize(internal_storage, private_key, waypoint)
     } else {
         PersistentSafetyStorage::new(internal_storage)
     };
@@ -51,19 +49,19 @@ pub fn extract_service_inputs(config: &mut NodeConfig) -> (Author, PersistentSaf
     (author, storage)
 }
 
-enum SafetyRulesWrapper<T> {
-    Local(Arc<RwLock<SafetyRules<T>>>),
-    Process(ProcessService<T>),
-    Serializer(Arc<RwLock<SerializerService<T>>>),
-    SpawnedProcess(SpawnedProcess<T>),
-    Thread(ThreadService<T>),
+enum SafetyRulesWrapper {
+    Local(Arc<RwLock<SafetyRules>>),
+    Process(ProcessService),
+    Serializer(Arc<RwLock<SerializerService>>),
+    SpawnedProcess(SpawnedProcess),
+    Thread(ThreadService),
 }
 
-pub struct SafetyRulesManager<T> {
-    internal_safety_rules: SafetyRulesWrapper<T>,
+pub struct SafetyRulesManager {
+    internal_safety_rules: SafetyRulesWrapper,
 }
 
-impl<T: Payload> SafetyRulesManager<T> {
+impl SafetyRulesManager {
     pub fn new(config: &mut NodeConfig) -> Self {
         match &config.consensus.safety_rules.service {
             SafetyRulesService::Process(conf) => return Self::new_process(conf.server_address),
@@ -89,7 +87,7 @@ impl<T: Payload> SafetyRulesManager<T> {
     }
 
     pub fn new_process(server_addr: SocketAddr) -> Self {
-        let process_service = ProcessService::<T>::new(server_addr);
+        let process_service = ProcessService::new(server_addr);
         Self {
             internal_safety_rules: SafetyRulesWrapper::Process(process_service),
         }
@@ -106,20 +104,20 @@ impl<T: Payload> SafetyRulesManager<T> {
     }
 
     pub fn new_spawned_process(config: &NodeConfig) -> Self {
-        let process = SpawnedProcess::<T>::new(config);
+        let process = SpawnedProcess::new(config);
         Self {
             internal_safety_rules: SafetyRulesWrapper::SpawnedProcess(process),
         }
     }
 
     pub fn new_thread(author: Author, storage: PersistentSafetyStorage) -> Self {
-        let thread = ThreadService::<T>::new(author, storage);
+        let thread = ThreadService::new(author, storage);
         Self {
             internal_safety_rules: SafetyRulesWrapper::Thread(thread),
         }
     }
 
-    pub fn client(&self) -> Box<dyn TSafetyRules<T> + Send + Sync> {
+    pub fn client(&self) -> Box<dyn TSafetyRules + Send + Sync> {
         match &self.internal_safety_rules {
             SafetyRulesWrapper::Local(safety_rules) => {
                 Box::new(LocalClient::new(safety_rules.clone()))

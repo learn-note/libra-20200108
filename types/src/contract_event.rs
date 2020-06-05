@@ -3,28 +3,61 @@
 
 use crate::{
     account_config::{
-        received_payment_tag, sent_payment_tag, ReceivedPaymentEvent, SentPaymentEvent,
+        BurnEvent, CancelBurnEvent, MintEvent, NewBlockEvent, NewEpochEvent, PreburnEvent,
+        ReceivedPaymentEvent, SentPaymentEvent, UpgradeEvent,
     },
     event::EventKey,
-    language_storage::TypeTag,
     ledger_info::LedgerInfo,
     proof::EventProof,
     transaction::Version,
 };
-use anyhow::{ensure, format_err, Error, Result};
-use libra_crypto::{
-    hash::{CryptoHash, CryptoHasher},
-    HashValue,
-};
-use libra_crypto_derive::CryptoHasher;
+use anyhow::{ensure, Error, Result};
+use libra_crypto::hash::CryptoHash;
+use libra_crypto_derive::{CryptoHasher, LCSCryptoHash};
+use move_core_types::{language_storage::TypeTag, move_resource::MoveResource};
+
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::convert::{TryFrom, TryInto};
+use std::{convert::TryFrom, ops::Deref};
+
+/// Support versioning of the data structure.
+#[derive(Hash, Clone, Eq, PartialEq, Serialize, Deserialize, CryptoHasher, LCSCryptoHash)]
+pub enum ContractEvent {
+    V0(ContractEventV0),
+}
+
+impl ContractEvent {
+    pub fn new(
+        key: EventKey,
+        sequence_number: u64,
+        type_tag: TypeTag,
+        event_data: Vec<u8>,
+    ) -> Self {
+        ContractEvent::V0(ContractEventV0::new(
+            key,
+            sequence_number,
+            type_tag,
+            event_data,
+        ))
+    }
+}
+
+// Temporary hack to avoid massive changes, it won't work when new variant comes and needs proper
+// dispatch at that time.
+impl Deref for ContractEvent {
+    type Target = ContractEventV0;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            ContractEvent::V0(event) => event,
+        }
+    }
+}
 
 /// Entry produced via a call to the `emit_event` builtin.
 #[derive(Hash, Clone, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
-pub struct ContractEvent {
+pub struct ContractEventV0 {
     /// The unique key that the event was emitted to
     key: EventKey,
     /// The number of messages that have been emitted to the path previously
@@ -35,14 +68,14 @@ pub struct ContractEvent {
     event_data: Vec<u8>,
 }
 
-impl ContractEvent {
+impl ContractEventV0 {
     pub fn new(
         key: EventKey,
         sequence_number: u64,
         type_tag: TypeTag,
         event_data: Vec<u8>,
     ) -> Self {
-        ContractEvent {
+        Self {
             key,
             sequence_number,
             type_tag,
@@ -71,7 +104,7 @@ impl TryFrom<&ContractEvent> for SentPaymentEvent {
     type Error = Error;
 
     fn try_from(event: &ContractEvent) -> Result<Self> {
-        if event.type_tag != TypeTag::Struct(sent_payment_tag()) {
+        if event.type_tag != TypeTag::Struct(SentPaymentEvent::struct_tag()) {
             anyhow::bail!("Expected Sent Payment")
         }
         Self::try_from_bytes(&event.event_data)
@@ -82,8 +115,85 @@ impl TryFrom<&ContractEvent> for ReceivedPaymentEvent {
     type Error = Error;
 
     fn try_from(event: &ContractEvent) -> Result<Self> {
-        if event.type_tag != TypeTag::Struct(received_payment_tag()) {
+        if event.type_tag != TypeTag::Struct(ReceivedPaymentEvent::struct_tag()) {
             anyhow::bail!("Expected Received Payment")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for MintEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(MintEvent::struct_tag()) {
+            anyhow::bail!("Expected MintEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for BurnEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(BurnEvent::struct_tag()) {
+            anyhow::bail!("Expected BurnEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for PreburnEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(PreburnEvent::struct_tag()) {
+            anyhow::bail!("Expected PreburnEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for CancelBurnEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(CancelBurnEvent::struct_tag()) {
+            anyhow::bail!("Expected CancelBurnEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for UpgradeEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(Self::struct_tag()) {
+            anyhow::bail!("Expected UpgradeEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for NewBlockEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(Self::struct_tag()) {
+            anyhow::bail!("Expected NewBlockEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for NewEpochEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(Self::struct_tag()) {
+            anyhow::bail!("Expected NewEpochEvent")
         }
         Self::try_from_bytes(&event.event_data)
     }
@@ -122,40 +232,7 @@ impl std::fmt::Display for ContractEvent {
     }
 }
 
-impl CryptoHash for ContractEvent {
-    type Hasher = ContractEventHasher;
-
-    fn hash(&self) -> HashValue {
-        let mut state = Self::Hasher::default();
-        state.write(&lcs::to_bytes(self).expect("Failed to serialize."));
-        state.finish()
-    }
-}
-
-impl TryFrom<crate::proto::types::Event> for ContractEvent {
-    type Error = Error;
-
-    fn try_from(event: crate::proto::types::Event) -> Result<Self> {
-        let key = EventKey::try_from(event.key.as_ref())?;
-        let sequence_number = event.sequence_number;
-        let type_tag = lcs::from_bytes(&event.type_tag)?;
-        let event_data = event.event_data;
-        Ok(Self::new(key, sequence_number, type_tag, event_data))
-    }
-}
-
-impl From<ContractEvent> for crate::proto::types::Event {
-    fn from(event: ContractEvent) -> Self {
-        Self {
-            key: event.key.to_vec(),
-            sequence_number: event.sequence_number,
-            type_tag: lcs::to_bytes(&event.type_tag).expect("Failed to serialize."),
-            event_data: event.event_data,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct EventWithProof {
     pub transaction_version: u64, // Should be `Version`
@@ -241,35 +318,5 @@ impl EventWithProof {
         )?;
 
         Ok(())
-    }
-}
-
-impl TryFrom<crate::proto::types::EventWithProof> for EventWithProof {
-    type Error = Error;
-
-    fn try_from(event: crate::proto::types::EventWithProof) -> Result<Self> {
-        Ok(Self::new(
-            event.transaction_version,
-            event.event_index,
-            event
-                .event
-                .ok_or_else(|| format_err!("Missing event"))?
-                .try_into()?,
-            event
-                .proof
-                .ok_or_else(|| format_err!("Missing proof"))?
-                .try_into()?,
-        ))
-    }
-}
-
-impl From<EventWithProof> for crate::proto::types::EventWithProof {
-    fn from(event: EventWithProof) -> Self {
-        Self {
-            transaction_version: event.transaction_version,
-            event_index: event.event_index,
-            event: Some(event.event.into()),
-            proof: Some(event.proof.into()),
-        }
     }
 }

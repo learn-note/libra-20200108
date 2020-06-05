@@ -4,8 +4,15 @@ variable "cluster_test" {
 }
 
 resource "aws_iam_role" "cluster-test-runner" {
-  name               = "ClusterTestRunner-Role-${var.region}-${terraform.workspace}"
-  assume_role_policy = data.aws_iam_policy_document.instance-assume-role.json
+  name                 = "ClusterTestRunner-Role-${var.region}-${terraform.workspace}"
+  path                 = var.iam_path
+  assume_role_policy   = data.aws_iam_policy_document.instance-assume-role.json
+  permissions_boundary = var.permissions_boundary_policy
+
+  tags = {
+    Terraform = "testnet"
+    Workspace = terraform.workspace
+  }
 }
 
 data "aws_caller_identity" "current" {}
@@ -22,14 +29,15 @@ data "aws_iam_policy_document" "cluster-test-runner" {
 }
 
 resource "aws_iam_role_policy" "cluster-test-runner" {
-  name   = "ClusterTestRunner-Policy-${var.region}-${terraform.workspace}"
-  role   = "${aws_iam_role.cluster-test-runner.name}"
+  name   = "ClusterTest-EC2-ECR-ECS"
+  role   = aws_iam_role.cluster-test-runner.name
   policy = data.aws_iam_policy_document.cluster-test-runner.json
 }
 
 resource "aws_iam_instance_profile" "cluster-test-runner" {
   name = "ClusterTestRunner-IamProfile-${var.region}-${terraform.workspace}"
-  role = "${aws_iam_role.cluster-test-runner.name}"
+  path = var.iam_path
+  role = aws_iam_role.cluster-test-runner.name
 }
 
 data "template_file" "cluster_test_user_data" {
@@ -54,13 +62,14 @@ resource "aws_instance" "cluster-test-runner" {
   tags = {
     Name      = "${terraform.workspace}-cluster-test-runner"
     Role      = "cluster-test-runner"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
-  iam_instance_profile = "${aws_iam_instance_profile.cluster-test-runner.name}"
+  iam_instance_profile = aws_iam_instance_profile.cluster-test-runner.name
 
   root_block_device {
-      volume_type = "gp2"
-      volume_size = 1024
+    volume_type = "gp2"
+    volume_size = 1024
   }
 }
 
@@ -68,6 +77,11 @@ resource "aws_security_group" "cluster-test-host" {
   name        = "${terraform.workspace}-cluster-test-host"
   description = "Benchmarker host"
   vpc_id      = aws_vpc.testnet.id
+
+  tags = {
+    Terraform = "testnet"
+    Workspace = terraform.workspace
+  }
 }
 
 resource "aws_security_group_rule" "validator-svc-debug" {

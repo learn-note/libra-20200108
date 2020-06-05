@@ -19,12 +19,19 @@ fn verify(
         .for_each(|(idx, expected_txn_info)| {
             let version = first_version + idx as u64;
 
-            let (txn_info, proof) = store
+            let txn_info_with_proof = store
                 .get_transaction_info_with_proof(version, ledger_version)
                 .unwrap();
 
-            assert_eq!(&txn_info, expected_txn_info);
-            proof.verify(root_hash, txn_info.hash(), version).unwrap();
+            assert_eq!(txn_info_with_proof.transaction_info(), expected_txn_info);
+            txn_info_with_proof
+                .ledger_info_to_transaction_info_proof()
+                .verify(
+                    root_hash,
+                    txn_info_with_proof.transaction_info().hash(),
+                    version,
+                )
+                .unwrap();
         })
 }
 
@@ -45,9 +52,8 @@ proptest! {
         batch1 in vec(any::<TransactionInfo>(), 1..100),
         batch2 in vec(any::<TransactionInfo>(), 1..100),
     ) {
-
         let tmp_dir = TempPath::new();
-        let db = LibraDB::new(&tmp_dir);
+        let db = LibraDB::new_for_test(&tmp_dir);
         let store = &db.ledger_store;
 
         // insert two batches of transaction infos
@@ -62,5 +68,36 @@ proptest! {
 
         // retrieve batch1 and verify against root_hash after batch1 was interted
         verify(store, &batch1, 0, ledger_version1, root_hash1);
+    }
+
+    #[test]
+    fn test_transaction_info_get_iterator(
+        (infos, start_version, num_transaction_infos) in
+            vec(any::<TransactionInfo>(), 1..100)
+                .prop_flat_map(|infos| {
+                    let num_infos = infos.len() as u64;
+                    (Just(infos), 0..num_infos)
+                })
+                .prop_flat_map(|(infos, start_version)| {
+                    let num_infos = infos.len() as u64;
+                    (Just(infos), Just(start_version), 0..num_infos * 2)
+                })
+    ) {
+        let tmp_dir = TempPath::new();
+        let db = LibraDB::new_for_test(&tmp_dir);
+        let store = &db.ledger_store;
+        save(store, 0, &infos);
+
+        let iter = store
+            .get_transaction_info_iter(start_version, num_transaction_infos)
+            .unwrap();
+        prop_assert_eq!(
+            infos
+                .into_iter()
+                .skip(start_version as usize)
+                .take(num_transaction_infos as usize)
+                .collect::<Vec<_>>(),
+            iter.collect::<Result<Vec<_>>>().unwrap()
+        );
     }
 }

@@ -1,13 +1,26 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use libra_metrics::DurationHistogram;
+use libra_metrics::{
+    register_histogram, register_int_counter, register_int_counter_vec, register_int_gauge,
+    DurationHistogram, Histogram, IntCounter, IntCounterVec, IntGauge,
+};
 use once_cell::sync::Lazy;
-use prometheus::{Histogram, IntCounter, IntCounterVec, IntGauge};
 
 //////////////////////
 // HEALTH COUNTERS
 //////////////////////
+
+/// Counter of pending network events to Consensus
+pub static PENDING_CONSENSUS_NETWORK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "libra_consensus_pending_network_events",
+        "Counters(queued,dequeued,dropped) related to pending network notifications to Consensus",
+        &["state"]
+    )
+    .unwrap()
+});
+
 /// This counter is set to the round of the highest committed block.
 pub static LAST_COMMITTED_ROUND: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!(
@@ -44,11 +57,11 @@ pub static PREFERRED_BLOCK_ROUND: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
-/// This counter is set to the last round reported by the local pacemaker.
+/// This counter is set to the last round reported by the local round_state.
 pub static CURRENT_ROUND: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!(
         "libra_consensus_current_round",
-        "This counter is set to the last round reported by the local pacemaker."
+        "This counter is set to the last round reported by the local round_state."
     )
     .unwrap()
 });
@@ -94,21 +107,11 @@ pub static EVENT_PROCESSING_LOOP_BUSY_DURATION_S: Lazy<DurationHistogram> = Lazy
     )
 });
 
-/// Counters(queued,dequeued,dropped) related to proposals channel
-pub static PROPOSAL_CHANNEL_MSGS: Lazy<IntCounterVec> = Lazy::new(|| {
+/// Counters(queued,dequeued,dropped) related to consensus channel
+pub static CONSENSUS_CHANNEL_MSGS: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
-        "libra_consensus_proposal_channel_msgs_count",
-        "Counters(queued,dequeued,dropped) related to proposals channel",
-        &["state"]
-    )
-    .unwrap()
-});
-
-/// Counters(queued,dequeued,dropped) related to votes channel
-pub static VOTES_CHANNEL_MSGS: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "libra_consensus_votes_channel_msgs_count",
-        "Counters(queued,dequeued,dropped) related to votes channel",
+        "libra_consensus_channel_msgs_count",
+        "Counters(queued,dequeued,dropped) related to consensus channel",
         &["state"]
     )
     .unwrap()
@@ -124,26 +127,6 @@ pub static BLOCK_RETRIEVAL_CHANNEL_MSGS: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
-/// Counters(queued,dequeued,dropped) related to sync info channel
-pub static SYNC_INFO_CHANNEL_MSGS: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "libra_consensus_sync_info_dropped_channel_msgs_count",
-        "Counters(queued,dequeued,dropped) related to sync info channel",
-        &["state"]
-    )
-    .unwrap()
-});
-
-/// Counters(queued,dequeued,dropped) related to epoch change channel
-pub static EPOCH_CHANGE_CHANNEL_MSGS: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "libra_consensus_epoch_change_dropped_channel_msgs_count",
-        "Counters(queued,dequeued,dropped) related to epoch change channel",
-        &["state"]
-    )
-    .unwrap()
-});
-
 //////////////////////
 // PROPOSAL ELECTION
 //////////////////////
@@ -152,12 +135,6 @@ pub static EPOCH_CHANGE_CHANNEL_MSGS: Lazy<IntCounterVec> = Lazy::new(|| {
 /// (both primary and secondary)
 pub static PROPOSALS_COUNT: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("libra_consensus_proposals_count", "Count of the block proposals sent by this validator since last restart (both primary and secondary)").unwrap()
-});
-
-/// Count the number of times a validator voted for secondary proposals (upon timeout) since
-/// last restart.
-pub static VOTE_SECONDARY_PROPOSAL_COUNT: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!("libra_consensus_vote_secondary_proposal_count", "Count the number of times a validator voted for secondary proposals (upon timeout) since last restart.").unwrap()
 });
 
 /// Count the number of times a validator voted for a nil block since last restart.
@@ -170,7 +147,7 @@ pub static VOTE_NIL_COUNT: Lazy<IntCounter> = Lazy::new(|| {
 });
 
 //////////////////////
-// PACEMAKER COUNTERS
+// RoundState COUNTERS
 //////////////////////
 /// Count of the rounds that gathered QC since last restart.
 pub static QC_ROUNDS_COUNT: Lazy<IntCounter> = Lazy::new(|| {
@@ -318,13 +295,14 @@ pub static BLOCK_EXECUTION_DURATION_S: Lazy<DurationHistogram> = Lazy::new(|| {
     )
 });
 
-pub static UNWRAPPED_PROPOSAL_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
-    register_histogram!(
-        "libra_consensus_unwrapped_proposal_size_bytes",
-        "Histogram of proposal size after LCS but before wrapping with GRPC and libra net."
-    )
-    .unwrap()
-});
+// TODO Consider reintroducing this counter
+// pub static UNWRAPPED_PROPOSAL_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
+//     register_histogram!(
+//         "libra_consensus_unwrapped_proposal_size_bytes",
+//         "Histogram of proposal size after LCS but before wrapping with GRPC and libra net."
+//     )
+//     .unwrap()
+// });
 
 /// Histogram of duration of a commit procedure (the time it takes for the execution / storage to
 /// commit a block once we decide to do so).
@@ -419,7 +397,7 @@ pub static VOTE_SUCCESS_WAIT_S: Lazy<DurationHistogram> = Lazy::new(|| {
 
 /// Histogram of time waited for failing to have the ability to vote (both those that waited and didn't wait) while trying to follow timestamp rules
 pub static VOTE_FAILURE_WAIT_S: Lazy<DurationHistogram> = Lazy::new(|| {
-    DurationHistogram::new(register_histogram!("libra_consensus_vote_success_wait_s", "Histogram of time waited for failing to have the ability to vote (both those that waited and didn't wait) while trying to follow timestamp rules").unwrap())
+    DurationHistogram::new(register_histogram!("libra_consensus_vote_failure_wait_s", "Histogram of time waited for failing to have the ability to vote (both those that waited and didn't wait) while trying to follow timestamp rules").unwrap())
 });
 
 ///////////////////
@@ -434,11 +412,11 @@ pub static PENDING_SELF_MESSAGES: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
-/// Count of the pending outbound pacemaker timeouts
-pub static PENDING_PACEMAKER_TIMEOUTS: Lazy<IntGauge> = Lazy::new(|| {
+/// Count of the pending outbound round timeouts
+pub static PENDING_ROUND_TIMEOUTS: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!(
-        "libra_consensus_pending_pacemaker_timeouts",
-        "Count of the pending outbound pacemaker timeouts"
+        "libra_consensus_pending_round_timeouts",
+        "Count of the pending outbound round timeouts"
     )
     .unwrap()
 });

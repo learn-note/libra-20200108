@@ -3,7 +3,6 @@
 
 use crate::*;
 use language_common::{error_codes::*, tooling::fake_executor::Account};
-use libra_crypto;
 use libra_types::account_address::AccountAddress;
 use move_ir::{assert_error_type, assert_no_error};
 
@@ -51,7 +50,7 @@ main() {{
 
   return;
 }}",
-        hex::encode(AccountAddress::from_public_key(pubkey))
+        hex::encode(libra_types::account_address::from_public_key(pubkey))
     );
 
     // rotate key

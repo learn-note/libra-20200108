@@ -5,8 +5,10 @@
 //!
 //! Each protocol corresponds to a certain order of messages
 pub mod direct_send;
+pub mod network;
 pub mod rpc;
 
-pub(crate) mod discovery;
-pub(crate) mod health_checker;
-pub(crate) mod identity;
+pub mod discovery;
+pub mod health_checker;
+pub mod identity;
+pub mod wire;

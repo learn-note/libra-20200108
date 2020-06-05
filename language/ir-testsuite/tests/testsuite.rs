@@ -14,6 +14,7 @@ use ir_to_bytecode::{
 use libra_types::account_address::AccountAddress;
 use move_ir_types::ast;
 use std::path::Path;
+use stdlib::{stdlib_modules, StdLibOptions};
 
 struct IRCompiler {
     deps: Vec<VerifiedModule>,
@@ -35,10 +36,10 @@ impl Compiler for IRCompiler {
         address: AccountAddress,
         input: &str,
     ) -> Result<ScriptOrModule> {
-        Ok(match parse_script_or_module(input)? {
+        Ok(match parse_script_or_module("unused_file_name", input)? {
             ast::ScriptOrModule::Script(parsed_script) => {
                 log(format!("{}", &parsed_script));
-                ScriptOrModule::Script(compile_script(address, parsed_script, &self.deps)?.0)
+                ScriptOrModule::Script(compile_script(Some(address), parsed_script, &self.deps)?.0)
             }
             ast::ScriptOrModule::Module(parsed_module) => {
                 log(format!("{}", &parsed_module));
@@ -50,11 +51,17 @@ impl Compiler for IRCompiler {
             }
         })
     }
+
+    fn use_staged_genesis(&self) -> bool {
+        true
+    }
 }
 
 fn run_test(path: &Path) -> datatest_stable::Result<()> {
-    let compiler = IRCompiler::new(stdlib::stdlib_modules().to_vec());
-    testsuite::functional_tests(compiler, path)
+    testsuite::functional_tests(
+        IRCompiler::new(stdlib_modules(StdLibOptions::Fresh).to_vec()),
+        path,
+    )
 }
 
 datatest_stable::harness!(run_test, "tests", r".*\.mvir");

@@ -2,14 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    context::{Context, MaterializedPools},
+    context::{Context, MaterializedPools, TABLE_MAX_SIZE},
     errors::*,
 };
-
 use anyhow::{bail, format_err, Result};
-use bytecode_source_map::source_map::{ModuleSourceMap, SourceMap};
-use libra_types::{account_address::AccountAddress, identifier::Identifier};
-use move_ir_types::ast::{self, *};
+use bytecode_source_map::source_map::SourceMap;
+use libra_types::account_address::AccountAddress;
+use move_core_types::value::{MoveTypeLayout, MoveValue};
+use move_ir_types::{
+    ast::{self, Bytecode as IRBytecode, Bytecode_ as IRBytecode_, *},
+    location::*,
+    sp,
+};
 use std::{
     clone::Clone,
     collections::{
@@ -20,28 +24,34 @@ use std::{
 use vm::{
     access::ModuleAccess,
     file_format::{
-        self, Bytecode, CodeOffset, CodeUnit, CompiledModule, CompiledModuleMut, CompiledProgram,
-        CompiledScript, CompiledScriptMut, FieldDefinition, FieldDefinitionIndex,
-        FunctionDefinition, FunctionSignature, Kind, LocalsSignature, MemberCount, SignatureToken,
-        StructDefinition, StructFieldInformation, StructHandleIndex, TableIndex,
+        Bytecode, CodeOffset, CodeUnit, CompiledModule, CompiledModuleMut, CompiledScript,
+        CompiledScriptMut, Constant, FieldDefinition, FunctionDefinition, FunctionSignature, Kind,
+        Signature, SignatureToken, StructDefinition, StructDefinitionIndex, StructFieldInformation,
+        StructHandleIndex, TableIndex, TypeParameterIndex, TypeSignature,
     },
 };
 
 macro_rules! record_src_loc {
     (local: $context:expr, $var:expr) => {{
-        let source_name = (Identifier::from($var.name()), $var.span);
+        let source_name = ($var.value.clone().into_inner(), $var.loc);
         $context
             .source_map
             .add_local_mapping($context.current_function_definition_index(), source_name)?;
     }};
-    (field: $context:expr, $field:expr) => {{
+    (parameter: $context:expr, $var:expr) => {{
+        let source_name = ($var.value.clone().into_inner(), $var.loc);
         $context
             .source_map
-            .add_struct_field_mapping($context.current_struct_definition_index(), $field.span)?;
+            .add_parameter_mapping($context.current_function_definition_index(), source_name)?;
+    }};
+    (field: $context:expr, $idx: expr, $field:expr) => {{
+        $context
+            .source_map
+            .add_struct_field_mapping($idx, $field.loc)?;
     }};
     (function_type_formals: $context:expr, $var:expr) => {
         for (ty_var, _) in $var.iter() {
-            let source_name = (Identifier::from(ty_var.name()), ty_var.span);
+            let source_name = (ty_var.value.clone().into_inner(), ty_var.loc);
             $context.source_map.add_function_type_parameter_mapping(
                 $context.current_function_definition_index(),
                 source_name,
@@ -57,7 +67,7 @@ macro_rules! record_src_loc {
     }};
     (struct_type_formals: $context:expr, $var:expr) => {
         for (ty_var, _) in $var.iter() {
-            let source_name = (Identifier::from(ty_var.name()), ty_var.span);
+            let source_name = (ty_var.value.clone().into_inner(), ty_var.loc);
             $context.source_map.add_struct_type_parameter_mapping(
                 $context.current_struct_definition_index(),
                 source_name,
@@ -82,6 +92,21 @@ macro_rules! make_push_instr {
                     $loc,
                 )?;
                 $code.push($instr);
+            }};
+        }
+    };
+}
+
+macro_rules! make_record_nop_label {
+    ($context:ident, $code:ident) => {
+        macro_rules! record_nop_label {
+            ($label:expr) => {{
+                let code_offset = $code.len() as CodeOffset;
+                $context.source_map.add_nop_mapping(
+                    $context.current_function_definition_index(),
+                    $label,
+                    code_offset,
+                )?;
             }};
         }
     };
@@ -124,6 +149,7 @@ impl ControlFlowInfo {
 
 // Inferred representation of SignatureToken's
 // In essence, it's a signature token with a "bottom" type added
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum InferredType {
     // Result of the compiler failing to infer the type of an expression
     // Not translatable to a signature token
@@ -134,16 +160,20 @@ enum InferredType {
     U8,
     U64,
     U128,
-    ByteArray,
     Address,
-    Struct(StructHandleIndex),
+    Signer,
+    Vector(Box<InferredType>),
+    Struct(StructHandleIndex, Vec<InferredType>),
     Reference(Box<InferredType>),
     MutableReference(Box<InferredType>),
     TypeParameter(String),
 }
 
 impl InferredType {
-    fn from_signature_token(sig_token: &SignatureToken) -> Self {
+    fn from_signature_token_with_subst(
+        subst: &HashMap<TypeParameterIndex, InferredType>,
+        sig_token: &SignatureToken,
+    ) -> Self {
         use InferredType as I;
         use SignatureToken as S;
         match sig_token {
@@ -151,45 +181,109 @@ impl InferredType {
             S::U8 => I::U8,
             S::U64 => I::U64,
             S::U128 => I::U128,
-            S::ByteArray => I::ByteArray,
             S::Address => I::Address,
-            S::Struct(si, _) => I::Struct(*si),
+            S::Signer => I::Signer,
+            S::Vector(s_inner) => I::Vector(Box::new(Self::from_signature_token_with_subst(
+                subst, s_inner,
+            ))),
+            S::Struct(si) => {
+                let tys = Self::from_signature_tokens_with_subst(subst, &[]);
+                I::Struct(*si, tys)
+            }
+            S::StructInstantiation(si, sig_tys) => {
+                let tys = Self::from_signature_tokens_with_subst(subst, sig_tys);
+                I::Struct(*si, tys)
+            }
             S::Reference(s_inner) => {
-                let i_inner = Self::from_signature_token(&*s_inner);
+                let i_inner = Self::from_signature_token_with_subst(subst, s_inner);
                 I::Reference(Box::new(i_inner))
             }
             S::MutableReference(s_inner) => {
-                let i_inner = Self::from_signature_token(&*s_inner);
+                let i_inner = Self::from_signature_token_with_subst(subst, s_inner);
                 I::MutableReference(Box::new(i_inner))
             }
-            S::TypeParameter(s_inner) => I::TypeParameter(s_inner.to_string()),
+            S::TypeParameter(tp) => match subst.get(tp) {
+                Some(bound_type) => bound_type.clone(),
+                None => I::TypeParameter(tp.to_string()),
+            },
         }
     }
 
-    fn get_struct_handle(&self) -> Result<StructHandleIndex> {
+    fn from_signature_tokens_with_subst(
+        subst: &HashMap<TypeParameterIndex, InferredType>,
+        sig_tokens: &[SignatureToken],
+    ) -> Vec<Self> {
+        sig_tokens
+            .iter()
+            .map(|sig_ty| Self::from_signature_token_with_subst(subst, sig_ty))
+            .collect()
+    }
+
+    fn from_signature_token(sig_token: &SignatureToken) -> Self {
+        Self::from_signature_token_with_subst(&HashMap::new(), sig_token)
+    }
+
+    fn from_signature_tokens(sig_tokens: &[SignatureToken]) -> Vec<Self> {
+        Self::from_signature_tokens_with_subst(&HashMap::new(), sig_tokens)
+    }
+
+    fn get_struct_handle(&self) -> Result<(StructHandleIndex, &Vec<InferredType>)> {
         match self {
             InferredType::Anything => bail!("could not infer struct type"),
             InferredType::Bool => bail!("no struct type for Bool"),
             InferredType::U8 => bail!("no struct type for U8"),
             InferredType::U64 => bail!("no struct type for U64"),
             InferredType::U128 => bail!("no struct type for U128"),
-            InferredType::ByteArray => bail!("no struct type for ByteArray"),
             InferredType::Address => bail!("no struct type for Address"),
+            InferredType::Signer => bail!("no struct type for Signer"),
+            InferredType::Vector(_) => bail!("no struct type for vector"),
             InferredType::Reference(inner) | InferredType::MutableReference(inner) => {
                 inner.get_struct_handle()
             }
-            InferredType::Struct(idx) => Ok(*idx),
+            InferredType::Struct(idx, tys) => Ok((*idx, tys)),
             InferredType::TypeParameter(_) => bail!("no struct type for type parameter"),
         }
+    }
+
+    fn to_signature_token(ty: &Self) -> Result<SignatureToken> {
+        use InferredType as I;
+        use SignatureToken as S;
+        Ok(match ty {
+            I::Bool => S::Bool,
+            I::U8 => S::U8,
+            I::U64 => S::U64,
+            I::U128 => S::U128,
+            I::Address => S::Address,
+            I::Signer => S::Signer,
+            I::Vector(inner) => S::Vector(Box::new(Self::to_signature_token(inner)?)),
+            I::Struct(si, tys) if tys.is_empty() => S::Struct(*si),
+            I::Struct(si, tys) => S::StructInstantiation(*si, Self::build_signature_tokens(tys)?),
+            I::Reference(inner) => S::Reference(Box::new(Self::to_signature_token(inner)?)),
+            I::MutableReference(inner) => {
+                S::MutableReference(Box::new(Self::to_signature_token(inner)?))
+            }
+            I::TypeParameter(s) => match s.parse::<TableIndex>() {
+                Ok(idx) => S::TypeParameter(idx),
+                Err(_) => bail!(
+                    "ICE unsubstituted type parameter when converting back to signature tokens"
+                ),
+            },
+            I::Anything => bail!("Could not infer type"),
+        })
+    }
+
+    fn build_signature_tokens(tys: &[InferredType]) -> Result<Vec<SignatureToken>> {
+        tys.iter()
+            .map(|sig_ty| Self::to_signature_token(sig_ty))
+            .collect()
     }
 }
 
 // Holds information about a function being compiled.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FunctionFrame {
-    local_count: u8,
     locals: HashMap<Var_, u8>,
-    local_types: LocalsSignature,
+    local_types: Signature,
     // i64 to allow the bytecode verifier to catch errors of
     // - negative stack sizes
     // - excessivley large stack sizes
@@ -197,12 +291,20 @@ struct FunctionFrame {
     // Theoretically, we could use a BigInt here, but that is probably overkill for any testing
     max_stack_depth: i64,
     cur_stack_depth: i64,
+    type_parameters: HashMap<TypeVar_, TypeParameterIndex>,
     loops: Vec<LoopInfo>,
 }
 
 impl FunctionFrame {
-    fn new() -> FunctionFrame {
-        FunctionFrame::default()
+    fn new(type_parameters: HashMap<TypeVar_, TypeParameterIndex>) -> FunctionFrame {
+        FunctionFrame {
+            locals: HashMap::new(),
+            local_types: Signature(vec![]),
+            max_stack_depth: 0,
+            cur_stack_depth: 0,
+            loops: vec![],
+            type_parameters,
+        }
     }
 
     // Manage the stack info for the function
@@ -238,11 +340,11 @@ impl FunctionFrame {
     }
 
     fn define_local(&mut self, var: &Var_, type_: SignatureToken) -> Result<u8> {
-        if self.local_count >= u8::max_value() {
+        if self.locals.len() >= TABLE_MAX_SIZE {
             bail!("Max number of locals reached");
         }
 
-        let cur_loc_idx = self.local_count;
+        let cur_loc_idx = self.locals.len() as u8;
         let loc = var.clone();
         let entry = self.locals.entry(loc);
         match entry {
@@ -250,7 +352,6 @@ impl FunctionFrame {
             Vacant(e) => {
                 e.insert(cur_loc_idx);
                 self.local_types.0.push(type_);
-                self.local_count += 1;
             }
         }
         Ok(cur_loc_idx)
@@ -294,68 +395,44 @@ impl FunctionFrame {
             None => bail!("Impossible: failed to get loop breaks (no loops in stack)"),
         }
     }
-}
 
-/// Compile a transaction program.
-pub fn compile_program<'a, T: 'a + ModuleAccess>(
-    address: AccountAddress,
-    program: Program,
-    deps: impl IntoIterator<Item = &'a T>,
-) -> Result<(CompiledProgram, SourceMap<Loc>)> {
-    let deps = deps
-        .into_iter()
-        .map(|dep| dep.as_module())
-        .collect::<Vec<_>>();
-    // This is separate to avoid unnecessary code gen due to monomorphization.
-    let mut modules = vec![];
-    let mut source_maps = vec![];
-    for m in program.modules {
-        let (module, source_map) = {
-            let deps = deps.iter().copied().chain(&modules);
-            compile_module(address, m, deps)?
-        };
-        modules.push(module);
-        source_maps.push(source_map);
+    fn type_parameters(&self) -> &HashMap<TypeVar_, TypeParameterIndex> {
+        &self.type_parameters
     }
-
-    let deps = deps.into_iter().chain(modules.iter());
-    let (script, source_map) = compile_script(address, program.script, deps)?;
-    source_maps.push(source_map);
-    Ok((CompiledProgram { modules, script }, source_maps))
 }
 
 /// Compile a transaction script.
 pub fn compile_script<'a, T: 'a + ModuleAccess>(
-    address: AccountAddress,
+    address: Option<AccountAddress>,
     script: Script,
     dependencies: impl IntoIterator<Item = &'a T>,
-) -> Result<(CompiledScript, ModuleSourceMap<Loc>)> {
-    let current_module = QualifiedModuleIdent {
-        address,
-        name: ModuleName::new(file_format::self_module_name().to_owned()),
-    };
-    let mut context = Context::new(dependencies, current_module)?;
-    let self_name = ModuleName::new(ModuleName::self_name().into());
+) -> Result<(CompiledScript, SourceMap<Loc>)> {
+    let mut context = Context::new(dependencies, None)?;
 
     compile_imports(&mut context, address, script.imports)?;
-    let main_name = FunctionName::new(Identifier::new("main").unwrap());
+    compile_explicit_dependency_declarations(
+        &mut context,
+        script.explicit_dependency_declarations,
+    )?;
     let function = script.main;
 
-    let sig = function_signature(&mut context, &function.signature)?;
-    context.declare_function(self_name.clone(), main_name.clone(), sig)?;
-    let main = compile_function(&mut context, &self_name, main_name, function, 0)?;
+    let sig = function_signature(&mut context, &function.value.signature)?;
+    let parameters_sig_idx = context.signature_index(Signature(sig.parameters))?;
+
+    record_src_loc!(function_decl: context, function.loc, 0);
+    let code = compile_function_body_impl(&mut context, function.value)?.unwrap();
 
     let (
         MaterializedPools {
             module_handles,
             struct_handles,
             function_handles,
-            type_signatures,
-            function_signatures,
-            locals_signatures,
+            signatures,
             identifiers,
-            byte_array_pool,
-            address_pool,
+            address_identifiers,
+            constant_pool,
+            function_instantiations,
+            ..
         },
         source_map,
     ) = context.materialize_pools();
@@ -363,17 +440,19 @@ pub fn compile_script<'a, T: 'a + ModuleAccess>(
         module_handles,
         struct_handles,
         function_handles,
-        type_signatures,
-        function_signatures,
-        locals_signatures,
+        function_instantiations,
+        signatures,
         identifiers,
-        byte_array_pool,
-        address_pool,
-        main,
+        address_identifiers,
+        constant_pool,
+
+        type_parameters: sig.type_parameters,
+        parameters: parameters_sig_idx,
+        code,
     };
     compiled_script
         .freeze()
-        .map_err(|errs| InternalCompilerError::BoundsCheckErrors(errs).into())
+        .map_err(|err| InternalCompilerError::BoundsCheckErrors(err).into())
         .map(|frozen_script| (frozen_script, source_map))
 }
 
@@ -382,34 +461,41 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
     address: AccountAddress,
     module: ModuleDefinition,
     dependencies: impl IntoIterator<Item = &'a T>,
-) -> Result<(CompiledModule, ModuleSourceMap<Loc>)> {
+) -> Result<(CompiledModule, SourceMap<Loc>)> {
     let current_module = QualifiedModuleIdent {
         address,
         name: module.name,
     };
-    let mut context = Context::new(dependencies, current_module)?;
+    let mut context = Context::new(dependencies, Some(current_module.clone()))?;
     let self_name = ModuleName::new(ModuleName::self_name().into());
+    let self_module_handle_idx = context.declare_import(current_module, self_name.clone())?;
     // Explicitly declare all imports as they will be included even if not used
-    compile_imports(&mut context, address, module.imports)?;
+    compile_imports(&mut context, Some(address), module.imports)?;
 
     // Explicitly declare all structs as they will be included even if not used
     for s in &module.structs {
         let ident = QualifiedStructIdent {
             module: self_name.clone(),
-            name: s.name.clone(),
+            name: s.value.name.clone(),
         };
-        let (_, tys) = type_formals(&s.type_formals)?;
-        context.declare_struct_handle_index(ident, s.is_nominal_resource, tys)?;
+        let kinds = type_parameter_kinds(&s.value.type_formals);
+        context.declare_struct_handle_index(ident, s.value.is_nominal_resource, kinds)?;
     }
 
+    // Add explicit handles/dependency declarations to the pools
+    compile_explicit_dependency_declarations(
+        &mut context,
+        module.explicit_dependency_declarations,
+    )?;
+
     for (name, function) in &module.functions {
-        let sig = function_signature(&mut context, &function.signature)?;
+        let sig = function_signature(&mut context, &function.value.signature)?;
         context.declare_function(self_name.clone(), name.clone(), sig)?;
     }
 
     // Current module
 
-    let (struct_defs, field_defs) = compile_structs(&mut context, &self_name, module.structs)?;
+    let struct_defs = compile_structs(&mut context, &self_name, module.structs)?;
 
     let function_defs = compile_functions(&mut context, &self_name, module.functions)?;
 
@@ -418,87 +504,159 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
             module_handles,
             struct_handles,
             function_handles,
-            type_signatures,
-            function_signatures,
-            locals_signatures,
+            field_handles,
+            signatures,
             identifiers,
-            byte_array_pool,
-            address_pool,
+            address_identifiers,
+            constant_pool,
+            function_instantiations,
+            struct_def_instantiations,
+            field_instantiations,
         },
         source_map,
     ) = context.materialize_pools();
     let compiled_module = CompiledModuleMut {
         module_handles,
+        self_module_handle_idx,
         struct_handles,
         function_handles,
-        type_signatures,
-        function_signatures,
-        locals_signatures,
+        field_handles,
+        struct_def_instantiations,
+        function_instantiations,
+        field_instantiations,
+        signatures,
         identifiers,
-        byte_array_pool,
-        address_pool,
+        address_identifiers,
+        constant_pool,
         struct_defs,
-        field_defs,
         function_defs,
     };
     compiled_module
         .freeze()
-        .map_err(|errs| InternalCompilerError::BoundsCheckErrors(errs).into())
+        .map_err(|err| InternalCompilerError::BoundsCheckErrors(err).into())
         .map(|frozen_module| (frozen_module, source_map))
+}
+
+fn compile_explicit_dependency_declarations(
+    context: &mut Context,
+    dependencies: Vec<ModuleDependency>,
+) -> Result<()> {
+    for dependency in dependencies {
+        let ModuleDependency {
+            name: mname,
+            structs,
+            functions,
+        } = dependency;
+        for struct_dep in structs {
+            let StructDependency {
+                is_nominal_resource,
+                name,
+                type_formals: tys,
+            } = struct_dep;
+            let sname = QualifiedStructIdent::new(mname.clone(), name);
+            let kinds = type_parameter_kinds(&tys);
+            context.declare_struct_handle_index(sname, is_nominal_resource, kinds)?;
+        }
+        for function_dep in functions {
+            let FunctionDependency { name, signature } = function_dep;
+            let sig = function_signature(context, &signature)?;
+            context.declare_function(mname.clone(), name, sig)?;
+        }
+    }
+    Ok(())
 }
 
 fn compile_imports(
     context: &mut Context,
-    address: AccountAddress,
+    address_opt: Option<AccountAddress>,
     imports: Vec<ImportDefinition>,
 ) -> Result<()> {
     for import in imports {
-        let ident = match import.ident {
-            ModuleIdent::Transaction(name) => QualifiedModuleIdent { address, name },
-            ModuleIdent::Qualified(id) => id,
+        let ident = match (address_opt, import.ident) {
+            (Some(address), ModuleIdent::Transaction(name)) => {
+                QualifiedModuleIdent { address, name }
+            }
+            (None, ModuleIdent::Transaction(name)) => bail!(
+                "Invalid import '{}'. No address specified for script so cannot resolve import",
+                name
+            ),
+            (_, ModuleIdent::Qualified(id)) => id,
         };
         context.declare_import(ident, import.alias)?;
     }
     Ok(())
 }
 
-fn type_formals(ast_tys: &[(TypeVar, ast::Kind)]) -> Result<(HashMap<TypeVar_, usize>, Vec<Kind>)> {
+fn type_parameter_indexes(
+    ast_tys: &[(TypeVar, ast::Kind)],
+) -> Result<HashMap<TypeVar_, TypeParameterIndex>> {
     let mut m = HashMap::new();
-    let mut tys = vec![];
-    for (idx, (ty_var, k)) in ast_tys.iter().enumerate() {
-        let old = m.insert(ty_var.value.clone(), idx);
+    for (idx, (ty_var, _)) in ast_tys.iter().enumerate() {
+        if idx > TABLE_MAX_SIZE {
+            bail!("Too many type parameters")
+        }
+        let old = m.insert(ty_var.value.clone(), idx as TypeParameterIndex);
         if old.is_some() {
             bail!("Type formal '{}'' already bound", ty_var)
         }
-        tys.push(kind(k));
     }
-    Ok((m, tys))
+    Ok(m)
+}
+
+fn make_type_argument_subst(
+    tokens: &[InferredType],
+) -> Result<HashMap<TypeParameterIndex, InferredType>> {
+    let mut subst = HashMap::new();
+    for (idx, token) in tokens.iter().enumerate() {
+        if idx > TABLE_MAX_SIZE {
+            bail!("Too many type arguments")
+        }
+        subst.insert(idx as TypeParameterIndex, token.clone());
+    }
+    Ok(subst)
+}
+
+fn type_parameter_kinds(ast_tys: &[(TypeVar, ast::Kind)]) -> Vec<Kind> {
+    ast_tys.iter().map(|(_, k)| kind(k)).collect()
 }
 
 fn kind(ast_k: &ast::Kind) -> Kind {
     match ast_k {
         ast::Kind::All => Kind::All,
         ast::Kind::Resource => Kind::Resource,
-        ast::Kind::Unrestricted => Kind::Unrestricted,
+        ast::Kind::Copyable => Kind::Copyable,
     }
 }
 
-fn compile_types(context: &mut Context, tys: &[Type]) -> Result<Vec<SignatureToken>> {
+fn compile_types(
+    context: &mut Context,
+    type_parameters: &HashMap<TypeVar_, TypeParameterIndex>,
+    tys: &[Type],
+) -> Result<Vec<SignatureToken>> {
     tys.iter()
-        .map(|ty| compile_type(context, ty))
+        .map(|ty| compile_type(context, type_parameters, ty))
         .collect::<Result<_>>()
 }
 
-fn compile_type(context: &mut Context, ty: &Type) -> Result<SignatureToken> {
+fn compile_type(
+    context: &mut Context,
+    type_parameters: &HashMap<TypeVar_, TypeParameterIndex>,
+    ty: &Type,
+) -> Result<SignatureToken> {
     Ok(match ty {
         Type::Address => SignatureToken::Address,
+        Type::Signer => SignatureToken::Signer,
         Type::U8 => SignatureToken::U8,
         Type::U64 => SignatureToken::U64,
         Type::U128 => SignatureToken::U128,
         Type::Bool => SignatureToken::Bool,
-        Type::ByteArray => SignatureToken::ByteArray,
+        Type::Vector(inner_type) => SignatureToken::Vector(Box::new(compile_type(
+            context,
+            type_parameters,
+            inner_type,
+        )?)),
         Type::Reference(is_mutable, inner_type) => {
-            let inner_token = Box::new(compile_type(context, inner_type)?);
+            let inner_token = Box::new(compile_type(context, type_parameters, inner_type)?);
             if *is_mutable {
                 SignatureToken::MutableReference(inner_token)
             } else {
@@ -507,11 +665,20 @@ fn compile_type(context: &mut Context, ty: &Type) -> Result<SignatureToken> {
         }
         Type::Struct(ident, tys) => {
             let sh_idx = context.struct_handle_index(ident.clone())?;
-            let tokens = compile_types(context, tys)?;
-            SignatureToken::Struct(sh_idx, tokens)
+
+            if tys.is_empty() {
+                SignatureToken::Struct(sh_idx)
+            } else {
+                let tokens = compile_types(context, type_parameters, tys)?;
+                SignatureToken::StructInstantiation(sh_idx, tokens)
+            }
         }
         Type::TypeParameter(ty_var) => {
-            SignatureToken::TypeParameter(context.type_formal_index(ty_var)?)
+            let idx = match type_parameters.get(&ty_var) {
+                None => bail!("Unbound type parameter {}", ty_var),
+                Some(idx) => *idx,
+            };
+            SignatureToken::TypeParameter(idx)
         }
     })
 }
@@ -520,19 +687,18 @@ fn function_signature(
     context: &mut Context,
     f: &ast::FunctionSignature,
 ) -> Result<FunctionSignature> {
-    let (map, _) = type_formals(&f.type_formals)?;
-    context.bind_type_formals(map)?;
-    let return_types = compile_types(context, &f.return_type)?;
-    let arg_types = f
+    let m = type_parameter_indexes(&f.type_formals)?;
+    let return_ = compile_types(context, &m, &f.return_type)?;
+    let parameters = f
         .formals
         .iter()
-        .map(|(_, ty)| compile_type(context, ty))
+        .map(|(_, ty)| compile_type(context, &m, ty))
         .collect::<Result<_>>()?;
-    let type_formals = f.type_formals.iter().map(|(_, k)| kind(k)).collect();
-    Ok(FunctionSignature {
-        return_types,
-        arg_types,
-        type_formals,
+    let type_parameters = f.type_formals.iter().map(|(_, k)| kind(k)).collect();
+    Ok(vm::file_format::FunctionSignature {
+        return_,
+        parameters,
+        type_parameters,
     })
 }
 
@@ -540,59 +706,49 @@ fn compile_structs(
     context: &mut Context,
     self_name: &ModuleName,
     structs: Vec<ast::StructDefinition>,
-) -> Result<(Vec<StructDefinition>, Vec<FieldDefinition>)> {
+) -> Result<Vec<StructDefinition>> {
     let mut struct_defs = vec![];
-    let mut field_defs = vec![];
     for s in structs {
         let sident = QualifiedStructIdent {
             module: self_name.clone(),
-            name: s.name.clone(),
+            name: s.value.name.clone(),
         };
         let sh_idx = context.struct_handle_index(sident.clone())?;
-        record_src_loc!(struct_decl: context, s.span);
-        record_src_loc!(struct_type_formals: context, &s.type_formals);
-        let (map, _) = type_formals(&s.type_formals)?;
-        context.bind_type_formals(map)?;
-        let field_information = compile_fields(context, &mut field_defs, sh_idx, s.value.fields)?;
-        context.declare_struct_definition_index(s.value.name)?;
+        record_src_loc!(struct_decl: context, s.loc);
+        record_src_loc!(struct_type_formals: context, &s.value.type_formals);
+        let m = type_parameter_indexes(&s.value.type_formals)?;
+        let sd_idx = context.declare_struct_definition_index(s.value.name)?;
+        let field_information = compile_fields(context, &m, sh_idx, sd_idx, s.value.fields)?;
         struct_defs.push(StructDefinition {
             struct_handle: sh_idx,
             field_information,
         });
     }
-    Ok((struct_defs, field_defs))
+    Ok(struct_defs)
 }
 
 fn compile_fields(
     context: &mut Context,
-    field_pool: &mut Vec<FieldDefinition>,
+    type_parameters: &HashMap<TypeVar_, TypeParameterIndex>,
     sh_idx: StructHandleIndex,
+    sd_idx: StructDefinitionIndex,
     sfields: StructDefinitionFields,
 ) -> Result<StructFieldInformation> {
     Ok(match sfields {
         StructDefinitionFields::Native => StructFieldInformation::Native,
         StructDefinitionFields::Move { fields } => {
-            let pool_len = field_pool.len();
-            let field_count = fields.len();
-
-            let field_information = StructFieldInformation::Declared {
-                field_count: (field_count as MemberCount),
-                fields: FieldDefinitionIndex(pool_len as TableIndex),
-            };
-
+            let mut decl_fields = vec![];
             for (decl_order, (f, ty)) in fields.into_iter().enumerate() {
-                let name = context.identifier_index(f.name())?;
-                record_src_loc!(field: context, f);
-                let sig_token = compile_type(context, &ty)?;
-                let signature = context.type_signature_index(sig_token.clone())?;
-                context.declare_field(sh_idx, f.value, sig_token, decl_order)?;
-                field_pool.push(FieldDefinition {
-                    struct_: sh_idx,
+                let name = context.identifier_index(f.value.as_inner())?;
+                record_src_loc!(field: context, sd_idx, f);
+                let sig_token = compile_type(context, type_parameters, &ty)?;
+                context.declare_field(sh_idx, sd_idx, f.value, sig_token.clone(), decl_order);
+                decl_fields.push(FieldDefinition {
                     name,
-                    signature,
+                    signature: TypeSignature(sig_token),
                 });
             }
-            field_information
+            StructFieldInformation::Declared(decl_fields)
         }
     })
 }
@@ -611,6 +767,41 @@ fn compile_functions(
         .collect()
 }
 
+fn compile_function_body_impl(
+    context: &mut Context,
+    ast_function: Function_,
+) -> Result<Option<CodeUnit>> {
+    Ok(match ast_function.body {
+        FunctionBody::Move { locals, code } => {
+            let m = type_parameter_indexes(&ast_function.signature.type_formals)?;
+            Some(compile_function_body(
+                context,
+                m,
+                ast_function.signature.formals,
+                locals,
+                code,
+            )?)
+        }
+        FunctionBody::Bytecode { locals, code } => {
+            let m = type_parameter_indexes(&ast_function.signature.type_formals)?;
+            Some(compile_function_body_bytecode(
+                context,
+                m,
+                ast_function.signature.formals,
+                locals,
+                code,
+            )?)
+        }
+
+        FunctionBody::Native => {
+            for (var, _) in ast_function.signature.formals.into_iter() {
+                record_src_loc!(parameter: context, var)
+            }
+            None
+        }
+    })
+}
+
 fn compile_function(
     context: &mut Context,
     self_name: &ModuleName,
@@ -618,21 +809,18 @@ fn compile_function(
     ast_function: Function,
     function_index: usize,
 ) -> Result<FunctionDefinition> {
-    record_src_loc!(function_decl: context, ast_function.span, function_index);
+    record_src_loc!(function_decl: context, ast_function.loc, function_index);
     record_src_loc!(
         function_type_formals: context,
-        &ast_function.signature.type_formals
+        &ast_function.value.signature.type_formals
     );
     let fh_idx = context.function_handle(self_name.clone(), name)?.1;
 
     let ast_function = ast_function.value;
 
-    let flags = match ast_function.visibility {
-        FunctionVisibility::Internal => 0,
-        FunctionVisibility::Public => CodeUnit::PUBLIC,
-    } | match &ast_function.body {
-        FunctionBody::Move { .. } => 0,
-        FunctionBody::Native => CodeUnit::NATIVE,
+    let is_public = match ast_function.visibility {
+        FunctionVisibility::Internal => false,
+        FunctionVisibility::Public => true,
     };
     let acquires_global_resources = ast_function
         .acquires
@@ -640,22 +828,11 @@ fn compile_function(
         .map(|name| context.struct_definition_index(name))
         .collect::<Result<_>>()?;
 
-    let code = match ast_function.body {
-        FunctionBody::Move { locals, code } => {
-            let (m, _) = type_formals(&ast_function.signature.type_formals)?;
-            context.bind_type_formals(m)?;
-            compile_function_body(context, ast_function.signature.formals, locals, code)?
-        }
-        FunctionBody::Native => {
-            for (var, _) in ast_function.signature.formals.into_iter() {
-                record_src_loc!(local: context, var)
-            }
-            CodeUnit::default()
-        }
-    };
+    let code = compile_function_body_impl(context, ast_function)?;
+
     Ok(FunctionDefinition {
         function: fh_idx,
-        flags,
+        is_public,
         acquires_global_resources,
         code,
     })
@@ -663,38 +840,31 @@ fn compile_function(
 
 fn compile_function_body(
     context: &mut Context,
+    type_parameters: HashMap<TypeVar_, TypeParameterIndex>,
     formals: Vec<(Var, Type)>,
     locals: Vec<(Var, Type)>,
     block: Block_,
 ) -> Result<CodeUnit> {
-    let mut function_frame = FunctionFrame::new();
-    let mut locals_signature = LocalsSignature(vec![]);
+    let mut function_frame = FunctionFrame::new(type_parameters);
+    let mut locals_signature = Signature(vec![]);
     for (var, t) in formals {
-        let sig = compile_type(context, &t)?;
-        function_frame.define_local(&var, sig.clone())?;
-        locals_signature.0.push(sig);
-        record_src_loc!(local: context, var);
+        let sig = compile_type(context, function_frame.type_parameters(), &t)?;
+        function_frame.define_local(&var.value, sig.clone())?;
+        record_src_loc!(parameter: context, var);
     }
+
     for (var_, t) in locals {
-        let sig = compile_type(context, &t)?;
+        let sig = compile_type(context, function_frame.type_parameters(), &t)?;
         function_frame.define_local(&var_.value, sig.clone())?;
         locals_signature.0.push(sig);
         record_src_loc!(local: context, var_);
     }
-    let sig_idx = context.locals_signature_index(locals_signature)?;
+    let sig_idx = context.signature_index(locals_signature)?;
 
     let mut code = vec![];
     compile_block(context, &mut function_frame, &mut code, block)?;
-    let max_stack_size = if function_frame.max_stack_depth < 0 {
-        0
-    } else if function_frame.max_stack_depth > i64::from(u16::max_value()) {
-        u16::max_value()
-    } else {
-        function_frame.max_stack_depth as u16
-    };
     Ok(CodeUnit {
         locals: sig_idx,
-        max_stack_size,
         code,
     })
 }
@@ -736,7 +906,7 @@ fn compile_if_else(
     if_else: IfElse,
 ) -> Result<ControlFlowInfo> {
     make_push_instr!(context, code);
-    let cond_span = if_else.cond.span;
+    let cond_span = if_else.cond.loc;
     compile_expression(context, function_frame, code, if_else.cond)?;
 
     let brfalse_ins_loc = code.len();
@@ -756,7 +926,7 @@ fn compile_if_else(
             let branch_ins_loc = code.len();
             if !if_cf_info.terminal_node {
                 // placeholder, final branch target replaced later
-                push_instr!(else_block.span, Bytecode::Branch(0));
+                push_instr!(else_block.loc, Bytecode::Branch(0));
                 else_block_location += 1;
             }
             let else_cf_info = compile_block(context, function_frame, code, else_block.value)?;
@@ -780,7 +950,7 @@ fn compile_while(
     while_: While,
 ) -> Result<ControlFlowInfo> {
     make_push_instr!(context, code);
-    let cond_span = while_.cond.span;
+    let cond_span = while_.cond.loc;
     let loop_start_loc = code.len();
     function_frame.push_loop(loop_start_loc)?;
     compile_expression(context, function_frame, code, while_.cond)?;
@@ -792,7 +962,7 @@ fn compile_while(
     function_frame.pop()?;
 
     compile_block(context, function_frame, code, while_.block.value)?;
-    push_instr!(while_.block.span, Bytecode::Branch(loop_start_loc as u16));
+    push_instr!(while_.block.loc, Bytecode::Branch(loop_start_loc as u16));
 
     let loop_end_loc = code.len() as u16;
     code[brfalse_loc] = Bytecode::BrFalse(loop_end_loc);
@@ -827,7 +997,7 @@ fn compile_loop(
     function_frame.push_loop(loop_start_loc)?;
 
     let body_cf_info = compile_block(context, function_frame, code, loop_.block.value)?;
-    push_instr!(loop_.block.span, Bytecode::Branch(loop_start_loc as u16));
+    push_instr!(loop_.block.loc, Bytecode::Branch(loop_start_loc as u16));
 
     let loop_end_loc = code.len() as u16;
     let breaks = function_frame.get_loop_breaks()?;
@@ -871,13 +1041,13 @@ fn compile_command(
     match cmd.value {
         Cmd_::Return(exps) => {
             compile_expression(context, function_frame, code, *exps)?;
-            push_instr!(cmd.span, Bytecode::Ret);
+            push_instr!(cmd.loc, Bytecode::Ret);
         }
         Cmd_::Abort(exp_opt) => {
             if let Some(exp) = exp_opt {
                 compile_expression(context, function_frame, code, *exp)?;
             }
-            push_instr!(cmd.span, Bytecode::Abort);
+            push_instr!(cmd.loc, Bytecode::Abort);
             function_frame.pop()?;
         }
         Cmd_::Assign(lvalues, rhs_expressions) => {
@@ -885,29 +1055,38 @@ fn compile_command(
             compile_lvalues(context, function_frame, code, lvalues)?;
         }
         Cmd_::Unpack(name, tys, bindings, e) => {
-            let tokens = LocalsSignature(compile_types(context, &tys)?);
-            let type_actuals_id = context.locals_signature_index(tokens)?;
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
 
             compile_expression(context, function_frame, code, *e)?;
 
             let def_idx = context.struct_definition_index(&name)?;
-            push_instr!(cmd.span, Bytecode::Unpack(def_idx, type_actuals_id));
+            if tys.is_empty() {
+                push_instr!(cmd.loc, Bytecode::Unpack(def_idx));
+            } else {
+                let type_parameters_id = context.signature_index(tokens)?;
+                let si_idx = context.struct_instantiation_index(def_idx, type_parameters_id)?;
+                push_instr!(cmd.loc, Bytecode::UnpackGeneric(si_idx));
+            }
             function_frame.pop()?;
 
             for (field_, lhs_variable) in bindings.iter().rev() {
                 let loc_idx = function_frame.get_local(&lhs_variable.value)?;
                 let st_loc = Bytecode::StLoc(loc_idx);
-                push_instr!(field_.span, st_loc);
+                push_instr!(field_.loc, st_loc);
             }
         }
         Cmd_::Continue => {
             let loc = function_frame.get_loop_start()?;
-            push_instr!(cmd.span, Bytecode::Branch(loc as u16));
+            push_instr!(cmd.loc, Bytecode::Branch(loc as u16));
         }
         Cmd_::Break => {
             function_frame.push_loop_break(code.len())?;
             // placeholder, to be replaced when the enclosing while is compiled
-            push_instr!(cmd.span, Bytecode::Branch(0));
+            push_instr!(cmd.loc, Bytecode::Branch(0));
         }
         Cmd_::Exp(e) => {
             compile_expression(context, function_frame, code, *e)?;
@@ -930,17 +1109,17 @@ fn compile_lvalues(
         match lvalue_.value {
             LValue_::Var(v) => {
                 let loc_idx = function_frame.get_local(&v.value)?;
-                push_instr!(lvalue_.span, Bytecode::StLoc(loc_idx));
+                push_instr!(lvalue_.loc, Bytecode::StLoc(loc_idx));
                 function_frame.pop()?;
             }
             LValue_::Mutate(e) => {
                 compile_expression(context, function_frame, code, e)?;
-                push_instr!(lvalue_.span, Bytecode::WriteRef);
+                push_instr!(lvalue_.loc, Bytecode::WriteRef);
                 function_frame.pop()?;
                 function_frame.pop()?;
             }
             LValue_::Pop => {
-                push_instr!(lvalue_.span, Bytecode::Pop);
+                push_instr!(lvalue_.loc, Bytecode::Pop);
                 function_frame.pop()?;
             }
         }
@@ -981,7 +1160,7 @@ fn compile_expression(
         Exp_::Move(v) => {
             let loc_idx = function_frame.get_local(&v.value)?;
             let load_loc = Bytecode::MoveLoc(loc_idx);
-            push_instr!(exp.span, load_loc);
+            push_instr!(exp.loc, load_loc);
             function_frame.push()?;
             let loc_type = function_frame.get_local_type(loc_idx)?;
             vec_deque![InferredType::from_signature_token(loc_type)]
@@ -989,7 +1168,7 @@ fn compile_expression(
         Exp_::Copy(v) => {
             let loc_idx = function_frame.get_local(&v.value)?;
             let load_loc = Bytecode::CopyLoc(loc_idx);
-            push_instr!(exp.span, load_loc);
+            push_instr!(exp.loc, load_loc);
             function_frame.push()?;
             let loc_type = function_frame.get_local_type(loc_idx)?;
             vec_deque![InferredType::from_signature_token(loc_type)]
@@ -999,45 +1178,50 @@ fn compile_expression(
             let loc_type = function_frame.get_local_type(loc_idx)?;
             let inner_token = Box::new(InferredType::from_signature_token(loc_type));
             if is_mutable {
-                push_instr!(exp.span, Bytecode::MutBorrowLoc(loc_idx));
+                push_instr!(exp.loc, Bytecode::MutBorrowLoc(loc_idx));
                 function_frame.push()?;
                 vec_deque![InferredType::MutableReference(inner_token)]
             } else {
-                push_instr!(exp.span, Bytecode::ImmBorrowLoc(loc_idx));
+                push_instr!(exp.loc, Bytecode::ImmBorrowLoc(loc_idx));
                 function_frame.push()?;
                 vec_deque![InferredType::Reference(inner_token)]
             }
         }
         Exp_::Value(cv) => match cv.value {
             CopyableVal_::Address(address) => {
-                let addr_idx = context.address_index(address)?;
-                push_instr!(exp.span, Bytecode::LdAddr(addr_idx));
+                let address_value = MoveValue::Address(address);
+                let constant = compile_constant(context, MoveTypeLayout::Address, address_value)?;
+                let idx = context.constant_index(constant)?;
+                push_instr!(exp.loc, Bytecode::LdConst(idx));
                 function_frame.push()?;
                 vec_deque![InferredType::Address]
             }
             CopyableVal_::U8(i) => {
-                push_instr!(exp.span, Bytecode::LdU8(i));
+                push_instr!(exp.loc, Bytecode::LdU8(i));
                 function_frame.push()?;
                 vec_deque![InferredType::U8]
             }
             CopyableVal_::U64(i) => {
-                push_instr!(exp.span, Bytecode::LdU64(i));
+                push_instr!(exp.loc, Bytecode::LdU64(i));
                 function_frame.push()?;
                 vec_deque![InferredType::U64]
             }
             CopyableVal_::U128(i) => {
-                push_instr!(exp.span, Bytecode::LdU128(i));
+                push_instr!(exp.loc, Bytecode::LdU128(i));
                 function_frame.push()?;
                 vec_deque![InferredType::U128]
             }
             CopyableVal_::ByteArray(buf) => {
-                let buf_idx = context.byte_array_index(&buf)?;
-                push_instr!(exp.span, Bytecode::LdByteArray(buf_idx));
+                let vec_value = MoveValue::vector_u8(buf);
+                let type_ = MoveTypeLayout::Vector(Box::new(MoveTypeLayout::U8));
+                let constant = compile_constant(context, type_, vec_value)?;
+                let idx = context.constant_index(constant)?;
+                push_instr!(exp.loc, Bytecode::LdConst(idx));
                 function_frame.push()?;
-                vec_deque![InferredType::ByteArray]
+                vec_deque![InferredType::Vector(Box::new(InferredType::U8))]
             }
             CopyableVal_::Bool(b) => {
-                push_instr! {exp.span,
+                push_instr! {exp.loc,
                     if b {
                         Bytecode::LdTrue
                     } else {
@@ -1048,9 +1232,11 @@ fn compile_expression(
                 vec_deque![InferredType::Bool]
             }
         },
-        Exp_::Pack(name, tys, fields) => {
-            let tokens = LocalsSignature(compile_types(context, &tys)?);
-            let type_actuals_id = context.locals_signature_index(tokens)?;
+        Exp_::Pack(name, ast_tys, fields) => {
+            let sig_tys = compile_types(context, function_frame.type_parameters(), &ast_tys)?;
+            let tys = InferredType::from_signature_tokens(&sig_tys);
+            let tokens = Signature(sig_tys);
+            let type_actuals_id = context.signature_index(tokens)?;
             let def_idx = context.struct_definition_index(&name)?;
 
             let self_name = ModuleName::new(ModuleName::self_name().into());
@@ -1070,19 +1256,24 @@ fn compile_expression(
 
                 compile_expression(context, function_frame, code, e)?;
             }
-            push_instr!(exp.span, Bytecode::Pack(def_idx, type_actuals_id));
+            if tys.is_empty() {
+                push_instr!(exp.loc, Bytecode::Pack(def_idx));
+            } else {
+                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                push_instr!(exp.loc, Bytecode::PackGeneric(si_idx));
+            }
             for _ in 0..num_fields {
                 function_frame.pop()?;
             }
             function_frame.push()?;
 
-            vec_deque![InferredType::Struct(sh_idx)]
+            vec_deque![InferredType::Struct(sh_idx, tys)]
         }
         Exp_::UnaryExp(op, e) => {
             compile_expression(context, function_frame, code, *e)?;
             match op {
                 UnaryOp::Not => {
-                    push_instr!(exp.span, Bytecode::Not);
+                    push_instr!(exp.loc, Bytecode::Not);
                     vec_deque![InferredType::Bool]
                 }
             }
@@ -1094,82 +1285,85 @@ fn compile_expression(
             function_frame.pop()?;
             match op {
                 BinOp::Add => {
-                    push_instr!(exp.span, Bytecode::Add);
+                    push_instr!(exp.loc, Bytecode::Add);
                     vec_deque![infer_int_bin_op_result_ty(&tys1, &tys2)]
                 }
                 BinOp::Sub => {
-                    push_instr!(exp.span, Bytecode::Sub);
+                    push_instr!(exp.loc, Bytecode::Sub);
                     vec_deque![infer_int_bin_op_result_ty(&tys1, &tys2)]
                 }
                 BinOp::Mul => {
-                    push_instr!(exp.span, Bytecode::Mul);
+                    push_instr!(exp.loc, Bytecode::Mul);
                     vec_deque![infer_int_bin_op_result_ty(&tys1, &tys2)]
                 }
                 BinOp::Mod => {
-                    push_instr!(exp.span, Bytecode::Mod);
+                    push_instr!(exp.loc, Bytecode::Mod);
                     vec_deque![infer_int_bin_op_result_ty(&tys1, &tys2)]
                 }
                 BinOp::Div => {
-                    push_instr!(exp.span, Bytecode::Div);
+                    push_instr!(exp.loc, Bytecode::Div);
                     vec_deque![infer_int_bin_op_result_ty(&tys1, &tys2)]
                 }
                 BinOp::BitOr => {
-                    push_instr!(exp.span, Bytecode::BitOr);
+                    push_instr!(exp.loc, Bytecode::BitOr);
                     vec_deque![infer_int_bin_op_result_ty(&tys1, &tys2)]
                 }
                 BinOp::BitAnd => {
-                    push_instr!(exp.span, Bytecode::BitAnd);
+                    push_instr!(exp.loc, Bytecode::BitAnd);
                     vec_deque![infer_int_bin_op_result_ty(&tys1, &tys2)]
                 }
                 BinOp::Xor => {
-                    push_instr!(exp.span, Bytecode::Xor);
+                    push_instr!(exp.loc, Bytecode::Xor);
                     vec_deque![infer_int_bin_op_result_ty(&tys1, &tys2)]
                 }
                 BinOp::Shl => {
-                    push_instr!(exp.span, Bytecode::Shl);
+                    push_instr!(exp.loc, Bytecode::Shl);
                     tys1
                 }
                 BinOp::Shr => {
-                    push_instr!(exp.span, Bytecode::Shr);
+                    push_instr!(exp.loc, Bytecode::Shr);
                     tys1
                 }
                 BinOp::Or => {
-                    push_instr!(exp.span, Bytecode::Or);
+                    push_instr!(exp.loc, Bytecode::Or);
                     vec_deque![InferredType::Bool]
                 }
                 BinOp::And => {
-                    push_instr!(exp.span, Bytecode::And);
+                    push_instr!(exp.loc, Bytecode::And);
                     vec_deque![InferredType::Bool]
                 }
                 BinOp::Eq => {
-                    push_instr!(exp.span, Bytecode::Eq);
+                    push_instr!(exp.loc, Bytecode::Eq);
                     vec_deque![InferredType::Bool]
                 }
                 BinOp::Neq => {
-                    push_instr!(exp.span, Bytecode::Neq);
+                    push_instr!(exp.loc, Bytecode::Neq);
                     vec_deque![InferredType::Bool]
                 }
                 BinOp::Lt => {
-                    push_instr!(exp.span, Bytecode::Lt);
+                    push_instr!(exp.loc, Bytecode::Lt);
                     vec_deque![InferredType::Bool]
                 }
                 BinOp::Gt => {
-                    push_instr!(exp.span, Bytecode::Gt);
+                    push_instr!(exp.loc, Bytecode::Gt);
                     vec_deque![InferredType::Bool]
                 }
                 BinOp::Le => {
-                    push_instr!(exp.span, Bytecode::Le);
+                    push_instr!(exp.loc, Bytecode::Le);
                     vec_deque![InferredType::Bool]
                 }
                 BinOp::Ge => {
-                    push_instr!(exp.span, Bytecode::Ge);
+                    push_instr!(exp.loc, Bytecode::Ge);
                     vec_deque![InferredType::Bool]
+                }
+                BinOp::Subrange => {
+                    unreachable!("Subrange operators should only appear in specification ASTs.");
                 }
             }
         }
         Exp_::Dereference(e) => {
             let loc_type = compile_expression(context, function_frame, code, *e)?.pop_front();
-            push_instr!(exp.span, Bytecode::ReadRef);
+            push_instr!(exp.loc, Bytecode::ReadRef);
             match loc_type {
                 Some(InferredType::MutableReference(sig_ref_token)) => vec_deque![*sig_ref_token],
                 Some(InferredType::Reference(sig_ref_token)) => vec_deque![*sig_ref_token],
@@ -1185,17 +1379,37 @@ fn compile_expression(
                 compile_expression(context, function_frame, code, *inner_exp)?.pop_front();
             let loc_type =
                 loc_type_opt.ok_or_else(|| format_err!("Impossible no expression to borrow"))?;
-            let sh_idx = loc_type.get_struct_handle()?;
-            let (fd_idx, field_type, _) = context.field(sh_idx, field)?;
+            let (sh_idx, tys) = loc_type.get_struct_handle()?;
+            let subst = make_type_argument_subst(tys)?;
+            let (def_idx, field_type, field_offset) = context.field(sh_idx, field)?;
+
             function_frame.pop()?;
-            let inner_token = Box::new(InferredType::from_signature_token(&field_type));
+            let inner_token = Box::new(InferredType::from_signature_token_with_subst(
+                &subst,
+                &field_type,
+            ));
+
+            let fh_idx = context.field_handle_index(def_idx, field_offset as u16)?;
+            if tys.is_empty() {
+                if is_mutable {
+                    push_instr!(exp.loc, Bytecode::MutBorrowField(fh_idx));
+                } else {
+                    push_instr!(exp.loc, Bytecode::ImmBorrowField(fh_idx));
+                }
+            } else {
+                let inst = InferredType::build_signature_tokens(tys)?;
+                let inst_idx = context.signature_index(Signature(inst))?;
+                let field_inst_idx = context.field_instantiation_index(fh_idx, inst_idx)?;
+                if is_mutable {
+                    push_instr!(exp.loc, Bytecode::MutBorrowFieldGeneric(field_inst_idx));
+                } else {
+                    push_instr!(exp.loc, Bytecode::ImmBorrowFieldGeneric(field_inst_idx));
+                }
+            };
+            function_frame.push()?;
             if is_mutable {
-                push_instr!(exp.span, Bytecode::MutBorrowField(fd_idx));
-                function_frame.push()?;
                 vec_deque![InferredType::MutableReference(inner_token)]
             } else {
-                push_instr!(exp.span, Bytecode::ImmBorrowField(fd_idx));
-                function_frame.push()?;
                 vec_deque![InferredType::Reference(inner_token)]
             }
         }
@@ -1228,30 +1442,55 @@ fn compile_call(
         FunctionCall_::Builtin(function) => {
             match function {
                 Builtin::GetTxnSender => {
-                    push_instr!(call.span, Bytecode::GetTxnSenderAddress);
+                    push_instr!(call.loc, Bytecode::GetTxnSenderAddress);
                     function_frame.push()?;
                     vec_deque![InferredType::Address]
                 }
                 Builtin::Exists(name, tys) => {
-                    let tokens = LocalsSignature(compile_types(context, &tys)?);
-                    let type_actuals_id = context.locals_signature_index(tokens)?;
+                    let tokens = Signature(compile_types(
+                        context,
+                        function_frame.type_parameters(),
+                        &tys,
+                    )?);
+                    let type_actuals_id = context.signature_index(tokens)?;
                     let def_idx = context.struct_definition_index(&name)?;
-                    push_instr!(call.span, Bytecode::Exists(def_idx, type_actuals_id));
+                    if tys.is_empty() {
+                        push_instr!(call.loc, Bytecode::Exists(def_idx));
+                    } else {
+                        let si_idx =
+                            context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                        push_instr!(call.loc, Bytecode::ExistsGeneric(si_idx));
+                    }
                     function_frame.pop()?;
                     function_frame.push()?;
                     vec_deque![InferredType::Bool]
                 }
-                Builtin::BorrowGlobal(mut_, name, tys) => {
-                    let tokens = LocalsSignature(compile_types(context, &tys)?);
-                    let type_actuals_id = context.locals_signature_index(tokens)?;
+                Builtin::BorrowGlobal(mut_, name, ast_tys) => {
+                    let sig_tys =
+                        compile_types(context, function_frame.type_parameters(), &ast_tys)?;
+                    let tys = InferredType::from_signature_tokens(&sig_tys);
+                    let tokens = Signature(sig_tys);
+                    let type_actuals_id = context.signature_index(tokens)?;
                     let def_idx = context.struct_definition_index(&name)?;
-                    push_instr! {call.span,
-                        if mut_ {
-                            Bytecode::MutBorrowGlobal(def_idx, type_actuals_id)
-                        } else {
-                            Bytecode::ImmBorrowGlobal(def_idx, type_actuals_id)
-                        }
-                    };
+                    if tys.is_empty() {
+                        push_instr! {call.loc,
+                            if mut_ {
+                                Bytecode::MutBorrowGlobal(def_idx)
+                            } else {
+                                Bytecode::ImmBorrowGlobal(def_idx)
+                            }
+                        };
+                    } else {
+                        let si_idx =
+                            context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                        push_instr! {call.loc,
+                            if mut_ {
+                                Bytecode::MutBorrowGlobalGeneric(si_idx)
+                            } else {
+                                Bytecode::ImmBorrowGlobalGeneric(si_idx)
+                            }
+                        };
+                    }
                     function_frame.pop()?;
                     function_frame.push()?;
 
@@ -1261,18 +1500,27 @@ fn compile_call(
                         name,
                     };
                     let sh_idx = context.struct_handle_index(ident)?;
-                    let inner = Box::new(InferredType::Struct(sh_idx));
+                    let inner = Box::new(InferredType::Struct(sh_idx, tys));
                     vec_deque![if mut_ {
                         InferredType::MutableReference(inner)
                     } else {
                         InferredType::Reference(inner)
                     }]
                 }
-                Builtin::MoveFrom(name, tys) => {
-                    let tokens = LocalsSignature(compile_types(context, &tys)?);
-                    let type_actuals_id = context.locals_signature_index(tokens)?;
+                Builtin::MoveFrom(name, ast_tys) => {
+                    let sig_tys =
+                        compile_types(context, function_frame.type_parameters(), &ast_tys)?;
+                    let tys = InferredType::from_signature_tokens(&sig_tys);
+                    let tokens = Signature(sig_tys);
+                    let type_actuals_id = context.signature_index(tokens)?;
                     let def_idx = context.struct_definition_index(&name)?;
-                    push_instr!(call.span, Bytecode::MoveFrom(def_idx, type_actuals_id));
+                    if tys.is_empty() {
+                        push_instr!(call.loc, Bytecode::MoveFrom(def_idx));
+                    } else {
+                        let si_idx =
+                            context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                        push_instr!(call.loc, Bytecode::MoveFromGeneric(si_idx));
+                    }
                     function_frame.pop()?; // pop the address
                     function_frame.push()?; // push the return value
 
@@ -1282,19 +1530,46 @@ fn compile_call(
                         name,
                     };
                     let sh_idx = context.struct_handle_index(ident)?;
-                    vec_deque![InferredType::Struct(sh_idx)]
+                    vec_deque![InferredType::Struct(sh_idx, tys)]
                 }
                 Builtin::MoveToSender(name, tys) => {
-                    let tokens = LocalsSignature(compile_types(context, &tys)?);
-                    let type_actuals_id = context.locals_signature_index(tokens)?;
+                    let tokens = Signature(compile_types(
+                        context,
+                        function_frame.type_parameters(),
+                        &tys,
+                    )?);
+                    let type_actuals_id = context.signature_index(tokens)?;
                     let def_idx = context.struct_definition_index(&name)?;
-
-                    push_instr!(call.span, Bytecode::MoveToSender(def_idx, type_actuals_id));
+                    if tys.is_empty() {
+                        push_instr!(call.loc, Bytecode::MoveToSender(def_idx));
+                    } else {
+                        let si_idx =
+                            context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                        push_instr!(call.loc, Bytecode::MoveToSenderGeneric(si_idx));
+                    }
+                    function_frame.push()?;
+                    vec_deque![]
+                }
+                Builtin::MoveTo(name, tys) => {
+                    let tokens = Signature(compile_types(
+                        context,
+                        function_frame.type_parameters(),
+                        &tys,
+                    )?);
+                    let type_actuals_id = context.signature_index(tokens)?;
+                    let def_idx = context.struct_definition_index(&name)?;
+                    if tys.is_empty() {
+                        push_instr!(call.loc, Bytecode::MoveTo(def_idx));
+                    } else {
+                        let si_idx =
+                            context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                        push_instr!(call.loc, Bytecode::MoveToGeneric(si_idx));
+                    }
                     function_frame.push()?;
                     vec_deque![]
                 }
                 Builtin::Freeze => {
-                    push_instr!(call.span, Bytecode::FreezeRef);
+                    push_instr!(call.loc, Bytecode::FreezeRef);
                     function_frame.pop()?; // pop mut ref
                     function_frame.push()?; // push imm ref
                     let inner_token = match argument_types.pop_front() {
@@ -1306,19 +1581,19 @@ fn compile_call(
                     vec_deque![InferredType::Reference(inner_token)]
                 }
                 Builtin::ToU8 => {
-                    push_instr!(call.span, Bytecode::CastU8);
+                    push_instr!(call.loc, Bytecode::CastU8);
                     function_frame.pop()?;
                     function_frame.push()?;
                     vec_deque![InferredType::U8]
                 }
                 Builtin::ToU64 => {
-                    push_instr!(call.span, Bytecode::CastU64);
+                    push_instr!(call.loc, Bytecode::CastU64);
                     function_frame.pop()?;
                     function_frame.push()?;
                     vec_deque![InferredType::U64]
                 }
                 Builtin::ToU128 => {
-                    push_instr!(call.span, Bytecode::CastU128);
+                    push_instr!(call.loc, Bytecode::CastU128);
                     function_frame.pop()?;
                     function_frame.push()?;
                     vec_deque![InferredType::U128]
@@ -1330,22 +1605,362 @@ fn compile_call(
             name,
             type_actuals,
         } => {
-            let tokens = LocalsSignature(compile_types(context, &type_actuals)?);
-            let type_actuals_id = context.locals_signature_index(tokens)?;
+            let ty_arg_tokens =
+                compile_types(context, function_frame.type_parameters(), &type_actuals)?;
+            let ty_args = ty_arg_tokens
+                .iter()
+                .map(|t| InferredType::from_signature_token(t))
+                .collect::<Vec<_>>();
+            let subst = &make_type_argument_subst(&ty_args)?;
+            let tokens = Signature(ty_arg_tokens);
+            let type_actuals_id = context.signature_index(tokens)?;
             let fh_idx = context.function_handle(module.clone(), name.clone())?.1;
-            let fcall = Bytecode::Call(fh_idx, type_actuals_id);
-            push_instr!(call.span, fcall);
+            let fcall = if type_actuals.is_empty() {
+                Bytecode::Call(fh_idx)
+            } else {
+                let fi_idx = context.function_instantiation_index(fh_idx, type_actuals_id)?;
+                Bytecode::CallGeneric(fi_idx)
+            };
+            push_instr!(call.loc, fcall);
             for _ in 0..argument_types.len() {
                 function_frame.pop()?;
             }
             // Return value of current function is pushed onto the stack.
             function_frame.push()?;
-            let signature = &context.function_signature(module, name)?.0;
+            let signature = context.function_signature(module, name)?;
             signature
-                .return_types
+                .return_
                 .iter()
-                .map(InferredType::from_signature_token)
+                .map(|t| InferredType::from_signature_token_with_subst(subst, t))
                 .collect()
         }
     })
+}
+
+fn compile_constant(
+    _context: &mut Context,
+    type_: MoveTypeLayout,
+    value: MoveValue,
+) -> Result<Constant> {
+    Constant::serialize_constant(&type_, &value)
+        .ok_or_else(|| format_err!("Could not serialize constant"))
+}
+
+//**************************************************************************************************
+// Bytecode
+//**************************************************************************************************
+
+fn compile_function_body_bytecode(
+    context: &mut Context,
+    type_parameters: HashMap<TypeVar_, TypeParameterIndex>,
+    formals: Vec<(Var, Type)>,
+    locals: Vec<(Var, Type)>,
+    blocks: BytecodeBlocks,
+) -> Result<CodeUnit> {
+    let mut function_frame = FunctionFrame::new(type_parameters);
+    let mut locals_signature = Signature(vec![]);
+    for (var, t) in formals {
+        let sig = compile_type(context, function_frame.type_parameters(), &t)?;
+        function_frame.define_local(&var.value, sig.clone())?;
+        record_src_loc!(parameter: context, var);
+    }
+    for (var_, t) in locals {
+        let sig = compile_type(context, function_frame.type_parameters(), &t)?;
+        function_frame.define_local(&var_.value, sig.clone())?;
+        locals_signature.0.push(sig);
+        record_src_loc!(local: context, var_);
+    }
+    let sig_idx = context.signature_index(locals_signature)?;
+
+    let mut code = vec![];
+    let mut label_to_index: HashMap<BlockLabel, u16> = HashMap::new();
+    for (label, block) in blocks {
+        label_to_index.insert(label.clone(), code.len() as u16);
+        context.label_index(label)?;
+        compile_bytecode_block(context, &mut function_frame, &mut code, block)?;
+    }
+    let fake_to_actual = context.build_index_remapping(label_to_index);
+    remap_branch_offsets(&mut code, &fake_to_actual);
+    Ok(CodeUnit {
+        locals: sig_idx,
+        code,
+    })
+}
+
+fn compile_bytecode_block(
+    context: &mut Context,
+    function_frame: &mut FunctionFrame,
+    code: &mut Vec<Bytecode>,
+    block: BytecodeBlock,
+) -> Result<()> {
+    for instr in block {
+        compile_bytecode(context, function_frame, code, instr)?
+    }
+    Ok(())
+}
+
+fn compile_bytecode(
+    context: &mut Context,
+    function_frame: &mut FunctionFrame,
+    code: &mut Vec<Bytecode>,
+    sp!(loc, instr_): IRBytecode,
+) -> Result<()> {
+    make_push_instr!(context, code);
+    make_record_nop_label!(context, code);
+    let ff_instr = match instr_ {
+        IRBytecode_::Pop => Bytecode::Pop,
+        IRBytecode_::Ret => Bytecode::Ret,
+        IRBytecode_::Nop(None) => Bytecode::Nop,
+        IRBytecode_::Nop(Some(lbl)) => {
+            record_nop_label!(lbl);
+            Bytecode::Nop
+        }
+        IRBytecode_::BrTrue(lbl) => Bytecode::BrTrue(context.label_index(lbl)?),
+        IRBytecode_::BrFalse(lbl) => Bytecode::BrFalse(context.label_index(lbl)?),
+        IRBytecode_::Branch(lbl) => Bytecode::Branch(context.label_index(lbl)?),
+        IRBytecode_::LdU8(u) => Bytecode::LdU8(u),
+        IRBytecode_::LdU64(u) => Bytecode::LdU64(u),
+        IRBytecode_::LdU128(u) => Bytecode::LdU128(u),
+        IRBytecode_::CastU8 => Bytecode::CastU8,
+        IRBytecode_::CastU64 => Bytecode::CastU64,
+        IRBytecode_::CastU128 => Bytecode::CastU128,
+        IRBytecode_::LdByteArray(b) => {
+            let vec_value = MoveValue::vector_u8(b);
+            let type_ = MoveTypeLayout::Vector(Box::new(MoveTypeLayout::U8));
+            let constant = compile_constant(context, type_, vec_value)?;
+            Bytecode::LdConst(context.constant_index(constant)?)
+        }
+        IRBytecode_::LdAddr(a) => {
+            let address_value = MoveValue::Address(a);
+            let constant = compile_constant(context, MoveTypeLayout::Address, address_value)?;
+            Bytecode::LdConst(context.constant_index(constant)?)
+        }
+        IRBytecode_::LdTrue => Bytecode::LdTrue,
+        IRBytecode_::LdFalse => Bytecode::LdFalse,
+        IRBytecode_::CopyLoc(sp!(_, v_)) => Bytecode::CopyLoc(function_frame.get_local(&v_)?),
+        IRBytecode_::MoveLoc(sp!(_, v_)) => Bytecode::MoveLoc(function_frame.get_local(&v_)?),
+        IRBytecode_::StLoc(sp!(_, v_)) => Bytecode::StLoc(function_frame.get_local(&v_)?),
+        IRBytecode_::Call(m, n, tys) => {
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
+            let type_actuals_id = context.signature_index(tokens)?;
+            let fh_idx = context.function_handle(m, n)?.1;
+            if tys.is_empty() {
+                Bytecode::Call(fh_idx)
+            } else {
+                let fi_idx = context.function_instantiation_index(fh_idx, type_actuals_id)?;
+                Bytecode::CallGeneric(fi_idx)
+            }
+        }
+        IRBytecode_::Pack(n, tys) => {
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
+            let type_actuals_id = context.signature_index(tokens)?;
+            let def_idx = context.struct_definition_index(&n)?;
+            if tys.is_empty() {
+                Bytecode::Pack(def_idx)
+            } else {
+                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                Bytecode::PackGeneric(si_idx)
+            }
+        }
+        IRBytecode_::Unpack(n, tys) => {
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
+            let type_actuals_id = context.signature_index(tokens)?;
+            let def_idx = context.struct_definition_index(&n)?;
+            if tys.is_empty() {
+                Bytecode::Unpack(def_idx)
+            } else {
+                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                Bytecode::UnpackGeneric(si_idx)
+            }
+        }
+        IRBytecode_::ReadRef => Bytecode::ReadRef,
+        IRBytecode_::WriteRef => Bytecode::WriteRef,
+        IRBytecode_::FreezeRef => Bytecode::FreezeRef,
+        IRBytecode_::MutBorrowLoc(sp!(_, v_)) => {
+            Bytecode::MutBorrowLoc(function_frame.get_local(&v_)?)
+        }
+        IRBytecode_::ImmBorrowLoc(sp!(_, v_)) => {
+            Bytecode::ImmBorrowLoc(function_frame.get_local(&v_)?)
+        }
+        IRBytecode_::MutBorrowField(name, tys, sp!(_, field_)) => {
+            let qualified_struct_name = QualifiedStructIdent {
+                module: ModuleName::module_self(),
+                name,
+            };
+            let sh_idx = context.struct_handle_index(qualified_struct_name)?;
+            let (def_idx, _, field_offset) = context.field(sh_idx, field_)?;
+
+            let fh_idx = context.field_handle_index(def_idx, field_offset as u16)?;
+            if tys.is_empty() {
+                Bytecode::MutBorrowField(fh_idx)
+            } else {
+                let tokens = Signature(compile_types(
+                    context,
+                    function_frame.type_parameters(),
+                    &tys,
+                )?);
+                let type_actuals_id = context.signature_index(tokens)?;
+                let fi_idx = context.field_instantiation_index(fh_idx, type_actuals_id)?;
+                Bytecode::MutBorrowFieldGeneric(fi_idx)
+            }
+        }
+        IRBytecode_::ImmBorrowField(name, tys, sp!(_, field_)) => {
+            let qualified_struct_name = QualifiedStructIdent {
+                module: ModuleName::module_self(),
+                name,
+            };
+            let sh_idx = context.struct_handle_index(qualified_struct_name)?;
+            let (def_idx, _, field_offset) = context.field(sh_idx, field_)?;
+
+            let fh_idx = context.field_handle_index(def_idx, field_offset as u16)?;
+            if tys.is_empty() {
+                Bytecode::ImmBorrowField(fh_idx)
+            } else {
+                let tokens = Signature(compile_types(
+                    context,
+                    function_frame.type_parameters(),
+                    &tys,
+                )?);
+                let type_actuals_id = context.signature_index(tokens)?;
+                let fi_idx = context.field_instantiation_index(fh_idx, type_actuals_id)?;
+                Bytecode::ImmBorrowFieldGeneric(fi_idx)
+            }
+        }
+        IRBytecode_::MutBorrowGlobal(n, tys) => {
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
+            let type_actuals_id = context.signature_index(tokens)?;
+            let def_idx = context.struct_definition_index(&n)?;
+            if tys.is_empty() {
+                Bytecode::MutBorrowGlobal(def_idx)
+            } else {
+                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                Bytecode::MutBorrowGlobalGeneric(si_idx)
+            }
+        }
+        IRBytecode_::ImmBorrowGlobal(n, tys) => {
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
+            let type_actuals_id = context.signature_index(tokens)?;
+            let def_idx = context.struct_definition_index(&n)?;
+            if tys.is_empty() {
+                Bytecode::ImmBorrowGlobal(def_idx)
+            } else {
+                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                Bytecode::ImmBorrowGlobalGeneric(si_idx)
+            }
+        }
+        IRBytecode_::Add => Bytecode::Add,
+        IRBytecode_::Sub => Bytecode::Sub,
+        IRBytecode_::Mul => Bytecode::Mul,
+        IRBytecode_::Mod => Bytecode::Mod,
+        IRBytecode_::Div => Bytecode::Div,
+        IRBytecode_::BitOr => Bytecode::BitOr,
+        IRBytecode_::BitAnd => Bytecode::BitAnd,
+        IRBytecode_::Xor => Bytecode::Xor,
+        IRBytecode_::Or => Bytecode::Or,
+        IRBytecode_::And => Bytecode::And,
+        IRBytecode_::Not => Bytecode::Not,
+        IRBytecode_::Eq => Bytecode::Eq,
+        IRBytecode_::Neq => Bytecode::Neq,
+        IRBytecode_::Lt => Bytecode::Lt,
+        IRBytecode_::Gt => Bytecode::Gt,
+        IRBytecode_::Le => Bytecode::Le,
+        IRBytecode_::Ge => Bytecode::Ge,
+        IRBytecode_::Abort => Bytecode::Abort,
+        IRBytecode_::GetTxnSenderAddress => Bytecode::GetTxnSenderAddress,
+        IRBytecode_::Exists(n, tys) => {
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
+            let type_actuals_id = context.signature_index(tokens)?;
+            let def_idx = context.struct_definition_index(&n)?;
+            if tys.is_empty() {
+                Bytecode::Exists(def_idx)
+            } else {
+                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                Bytecode::ExistsGeneric(si_idx)
+            }
+        }
+        IRBytecode_::MoveFrom(n, tys) => {
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
+            let type_actuals_id = context.signature_index(tokens)?;
+            let def_idx = context.struct_definition_index(&n)?;
+            if tys.is_empty() {
+                Bytecode::MoveFrom(def_idx)
+            } else {
+                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                Bytecode::MoveFromGeneric(si_idx)
+            }
+        }
+        IRBytecode_::MoveToSender(n, tys) => {
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
+            let type_actuals_id = context.signature_index(tokens)?;
+            let def_idx = context.struct_definition_index(&n)?;
+            if tys.is_empty() {
+                Bytecode::MoveToSender(def_idx)
+            } else {
+                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                Bytecode::MoveToSenderGeneric(si_idx)
+            }
+        }
+        IRBytecode_::MoveTo(n, tys) => {
+            let tokens = Signature(compile_types(
+                context,
+                function_frame.type_parameters(),
+                &tys,
+            )?);
+            let type_actuals_id = context.signature_index(tokens)?;
+            let def_idx = context.struct_definition_index(&n)?;
+            if tys.is_empty() {
+                Bytecode::MoveTo(def_idx)
+            } else {
+                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
+                Bytecode::MoveToGeneric(si_idx)
+            }
+        }
+        IRBytecode_::Shl => Bytecode::Shl,
+        IRBytecode_::Shr => Bytecode::Shr,
+    };
+    push_instr!(loc, ff_instr);
+    Ok(())
+}
+
+fn remap_branch_offsets(code: &mut Vec<Bytecode>, fake_to_actual: &HashMap<u16, u16>) {
+    for instr in code {
+        match instr {
+            Bytecode::BrTrue(offset) | Bytecode::BrFalse(offset) | Bytecode::Branch(offset) => {
+                *offset = fake_to_actual[offset]
+            }
+            _ => (),
+        }
+    }
 }

@@ -4,74 +4,59 @@
 use crate::{
     peer::DisconnectReason,
     peer_manager::{
-        ConnectionNotification, PeerManager, PeerManagerNotification, PeerManagerRequest,
+        conn_notifs_channel, error::PeerManagerError, ConnectionNotification, ConnectionRequest,
+        PeerManager, PeerManagerNotification, PeerManagerRequest, TransportNotification,
     },
-    protocols::identity::{exchange_identity, Identity},
+    protocols::wire::{
+        handshake::v1::MessagingProtocolVersion,
+        messaging::v1::{NetworkMessage, Nonce},
+    },
+    transport,
+    transport::{Connection, ConnectionId, ConnectionMetadata},
     ProtocolId,
 };
-use channel;
-use channel::libra_channel;
-use channel::message_queues::QueueStyle;
-use futures::{channel::oneshot, stream::StreamExt};
+use channel::{libra_channel, message_queues::QueueStyle};
+use futures::{channel::oneshot, io::AsyncWriteExt, sink::SinkExt, stream::StreamExt};
 use libra_config::config::RoleType;
+use libra_network_address::NetworkAddress;
 use libra_types::PeerId;
 use memsocket::MemorySocket;
 use netcore::{
-    multiplexing::{
-        yamux::{Mode, Yamux},
-        StreamMultiplexer,
-    },
-    negotiate::negotiate_outbound_interactive,
+    compat::IoCompat,
     transport::{boxed::BoxedTransport, memory::MemoryTransport, ConnectionOrigin, TransportExt},
 };
-use parity_multiaddr::Multiaddr;
-use std::iter::FromIterator;
-use std::num::NonZeroUsize;
-use std::str::FromStr;
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-};
+use std::{collections::HashMap, iter::FromIterator, num::NonZeroUsize};
 use tokio::runtime::Handle;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-const HELLO_PROTOCOL: &[u8] = b"/hello-world/1.0.0";
+const TEST_PROTOCOL: ProtocolId = ProtocolId::ConsensusRpc;
 
 // Builds a concrete typed transport (instead of using impl Trait) for testing PeerManager.
 // Specifically this transport is compatible with the `build_test_connection` test helper making
 // it easy to build connections without going through the whole transport pipeline.
 pub fn build_test_transport(
-    own_identity: Identity,
-) -> BoxedTransport<(Identity, Yamux<MemorySocket>), impl ::std::error::Error + Sync + Send + 'static>
-{
+) -> BoxedTransport<Connection<MemorySocket>, impl ::std::error::Error + Sync + Send + 'static> {
     let memory_transport = MemoryTransport::default();
-    memory_transport
-        .and_then(|socket, origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok(muxer)
-            }
-        })
-        .and_then(move |muxer, origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
 
-                Ok((identity, muxer))
-            }
+    memory_transport
+        .and_then(move |socket, addr, origin| async move {
+            Ok(Connection {
+                socket,
+                metadata: ConnectionMetadata::new(
+                    PeerId::random(),
+                    ConnectionId::default(),
+                    addr,
+                    origin,
+                    MessagingProtocolVersion::V1,
+                    [TEST_PROTOCOL].iter().into(),
+                ),
+            })
         })
         .boxed()
 }
 
-fn build_test_connection() -> (Yamux<MemorySocket>, Yamux<MemorySocket>) {
-    let (dialer, listener) = MemorySocket::new_pair();
-
-    (
-        Yamux::new(dialer, Mode::Client),
-        Yamux::new(listener, Mode::Server),
-    )
-}
-
-fn build_test_identity(peer_id: PeerId) -> Identity {
-    Identity::new(peer_id, Vec::new(), RoleType::Validator)
+fn build_test_connection() -> (MemorySocket, MemorySocket) {
+    MemorySocket::new_pair()
 }
 
 fn ordered_peer_ids(num: usize) -> Vec<PeerId> {
@@ -88,42 +73,57 @@ fn build_test_peer_manager(
     peer_id: PeerId,
 ) -> (
     PeerManager<
-        BoxedTransport<
-            (Identity, Yamux<MemorySocket>),
-            impl std::error::Error + Sync + Send + 'static,
-        >,
-        Yamux<MemorySocket>,
+        BoxedTransport<Connection<MemorySocket>, impl std::error::Error + Sync + Send + 'static>,
+        MemorySocket,
     >,
     libra_channel::Sender<(PeerId, ProtocolId), PeerManagerRequest>,
+    libra_channel::Sender<PeerId, ConnectionRequest>,
     libra_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
+    conn_notifs_channel::Receiver,
 ) {
-    let hello_protocol = ProtocolId::from_static(HELLO_PROTOCOL);
     let (peer_manager_request_tx, peer_manager_request_rx) =
+        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(1).unwrap(), None);
+    let (connection_reqs_tx, connection_reqs_rx) =
         libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(1).unwrap(), None);
     let (hello_tx, hello_rx) =
         libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(1).unwrap(), None);
+    let (conn_status_tx, conn_status_rx) = conn_notifs_channel::new();
 
     let peer_manager = PeerManager::new(
         executor,
-        build_test_transport(Identity::new(peer_id, vec![], RoleType::Validator)),
+        build_test_transport(),
         peer_id,
+        RoleType::Validator,
         "/memory/0".parse().unwrap(),
         peer_manager_request_rx,
-        HashSet::from_iter([hello_protocol.clone()].iter().cloned()), /* rpc protocols */
-        HashSet::new(),                                               /* direct-send protocols */
-        HashMap::from_iter([(hello_protocol, hello_tx)].iter().cloned()),
-        vec![],
+        connection_reqs_rx,
+        HashMap::from_iter([(TEST_PROTOCOL, hello_tx)].iter().cloned()),
+        vec![conn_status_tx],
         1024, /* max concurrent network requests */
         1024, /* max concurrent network notifications */
         1024, /* channel size */
     );
 
-    (peer_manager, peer_manager_request_tx, hello_rx)
+    (
+        peer_manager,
+        peer_manager_request_tx,
+        connection_reqs_tx,
+        hello_rx,
+        conn_status_rx,
+    )
 }
 
-async fn open_hello_substream<T: StreamMultiplexer>(connection: &T) -> io::Result<()> {
-    let outbound = connection.open_outbound().await?;
-    let (_, _) = negotiate_outbound_interactive(outbound, [HELLO_PROTOCOL]).await?;
+async fn ping_pong(connection: &mut MemorySocket) -> Result<(), PeerManagerError> {
+    let mut connection = Framed::new(IoCompat::new(connection), LengthDelimitedCodec::new());
+    let ping = NetworkMessage::Ping(Nonce(42));
+    connection
+        .send(lcs::to_bytes(&ping).unwrap().into())
+        .await?;
+    let raw_pong = connection.next().await.ok_or_else(|| {
+        PeerManagerError::TransportError(anyhow::anyhow!("Failed to read pong msg"))
+    })??;
+    let pong: NetworkMessage = lcs::from_bytes(&raw_pong)?;
+    assert_eq!(pong, NetworkMessage::Pong(Nonce(42)));
     Ok(())
 }
 
@@ -132,24 +132,16 @@ async fn assert_peer_disconnected_event(
     origin: ConnectionOrigin,
     reason: DisconnectReason,
     peer_manager: &mut PeerManager<
-        BoxedTransport<
-            (Identity, Yamux<MemorySocket>),
-            impl std::error::Error + Sync + Send + 'static,
-        >,
-        Yamux<MemorySocket>,
+        BoxedTransport<Connection<MemorySocket>, impl std::error::Error + Sync + Send + 'static>,
+        MemorySocket,
     >,
 ) {
-    let connection_event = peer_manager.connection_notifs_rx.select_next_some().await;
+    let connection_event = peer_manager.transport_notifs_rx.select_next_some().await;
     match &connection_event {
-        ConnectionNotification::Disconnected(
-            ref actual_identity,
-            ref _actual_addr,
-            ref actual_origin,
-            ref actual_reason,
-        ) => {
-            assert_eq!(actual_identity.peer_id(), peer_id);
+        TransportNotification::Disconnected(ref actual_metadata, ref actual_reason) => {
+            assert_eq!(actual_metadata.peer_id(), peer_id);
             assert_eq!(*actual_reason, reason);
-            assert_eq!(*actual_origin, origin);
+            assert_eq!(actual_metadata.origin(), origin);
             peer_manager.handle_connection_event(connection_event);
         }
         event => {
@@ -162,18 +154,15 @@ async fn assert_peer_disconnected_event(
 // to simultaneous dial tie-breaking.  It also checks the correct events were sent from the
 // Peer actors to PeerManager's internal_event_rx.
 async fn check_correct_connection_is_live(
-    live_connection: Yamux<MemorySocket>,
-    dropped_connection: Yamux<MemorySocket>,
+    mut live_connection: MemorySocket,
+    mut dropped_connection: MemorySocket,
     live_connection_origin: ConnectionOrigin,
     dropped_connection_origin: ConnectionOrigin,
     expected_peer_id: PeerId,
     requested_shutdown: bool,
     peer_manager: &mut PeerManager<
-        BoxedTransport<
-            (Identity, Yamux<MemorySocket>),
-            impl std::error::Error + Sync + Send + 'static,
-        >,
-        Yamux<MemorySocket>,
+        BoxedTransport<Connection<MemorySocket>, impl std::error::Error + Sync + Send + 'static>,
+        MemorySocket,
     >,
 ) {
     // If PeerManager needed to kill the existing connection we'll see a Requested shutdown
@@ -187,11 +176,25 @@ async fn check_correct_connection_is_live(
         )
         .await;
     }
+    // TODO: There's a race here since the connection may not have actually been closed yet.
+    // We should not be able to send a ping on the dropped connection.
+    let f_open_stream_on_dropped_conn: Result<(), PeerManagerError> = async move {
+        // Send ping and wait for pong.
+        ping_pong(&mut dropped_connection).await?;
+        Ok(())
+    }
+    .await;
+    assert!(f_open_stream_on_dropped_conn.is_err());
 
-    assert!(open_hello_substream(&dropped_connection).await.is_err());
-    assert!(open_hello_substream(&live_connection).await.is_ok());
-
-    live_connection.close().await.unwrap();
+    let f_open_stream_on_live_conn: Result<(), PeerManagerError> = async move {
+        // Send ping and wait for pong.
+        ping_pong(&mut live_connection).await?;
+        // Close the connection.
+        live_connection.close().await?;
+        Ok(())
+    }
+    .await;
+    assert!(f_open_stream_on_live_conn.is_ok());
     assert_peer_disconnected_event(
         expected_peer_id,
         live_connection_origin,
@@ -201,14 +204,34 @@ async fn check_correct_connection_is_live(
     .await;
 }
 
+fn create_connection<TSocket: transport::TSocket>(
+    socket: TSocket,
+    peer_id: PeerId,
+    addr: NetworkAddress,
+    origin: ConnectionOrigin,
+    connection_id: ConnectionId,
+) -> Connection<TSocket> {
+    Connection {
+        socket,
+        metadata: ConnectionMetadata::new(
+            peer_id,
+            connection_id,
+            addr,
+            origin,
+            MessagingProtocolVersion::V1,
+            [TEST_PROTOCOL].iter().into(),
+        ),
+    }
+}
+
 #[test]
 fn peer_manager_simultaneous_dial_two_inbound() {
-    ::libra_logger::try_init_for_testing();
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx, _conn_statux_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -216,20 +239,22 @@ fn peer_manager_simultaneous_dial_two_inbound() {
         // Two inbound connections
         //
         let (outbound1, inbound1) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::from_str("/ip6/::1/tcp/8080").unwrap(),
-            ConnectionOrigin::Inbound,
+        peer_manager.add_peer(create_connection(
             inbound1,
-        );
+            ids[0],
+            "/ip6/::1/tcp/8080".parse().unwrap(),
+            ConnectionOrigin::Inbound,
+            ConnectionId::from(0),
+        ));
 
         let (outbound2, inbound2) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::from_str("/ip6/::1/tcp/8081").unwrap(),
-            ConnectionOrigin::Inbound,
+        peer_manager.add_peer(create_connection(
             inbound2,
-        );
+            ids[0],
+            "/ip6/::1/tcp/8081".parse().unwrap(),
+            ConnectionOrigin::Inbound,
+            ConnectionId::from(1),
+        ));
 
         // outbound1 should have been dropped since it was the older inbound connection
         check_correct_connection_is_live(
@@ -249,11 +274,12 @@ fn peer_manager_simultaneous_dial_two_inbound() {
 
 #[test]
 fn peer_manager_simultaneous_dial_inbound_outbound_remote_id_larger() {
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx, _conn_status_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[0]);
 
     let test = async move {
@@ -261,20 +287,22 @@ fn peer_manager_simultaneous_dial_inbound_outbound_remote_id_larger() {
         // Inbound first, outbound second with own_peer_id < remote_peer_id
         //
         let (outbound1, inbound1) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[1]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Inbound,
+        peer_manager.add_peer(create_connection(
             inbound1,
-        );
+            ids[1],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Inbound,
+            ConnectionId::from(0),
+        ));
 
         let (outbound2, inbound2) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[1]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Outbound,
+        peer_manager.add_peer(create_connection(
             outbound2,
-        );
+            ids[1],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Outbound,
+            ConnectionId::from(1),
+        ));
 
         // inbound2 should be dropped because for outbound1 the remote peer has a greater
         // PeerId and is the "dialer"
@@ -295,11 +323,12 @@ fn peer_manager_simultaneous_dial_inbound_outbound_remote_id_larger() {
 
 #[test]
 fn peer_manager_simultaneous_dial_inbound_outbound_own_id_larger() {
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx, _conn_status_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -307,20 +336,22 @@ fn peer_manager_simultaneous_dial_inbound_outbound_own_id_larger() {
         // Inbound first, outbound second with remote_peer_id < own_peer_id
         //
         let (outbound1, inbound1) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Inbound,
+        peer_manager.add_peer(create_connection(
             inbound1,
-        );
+            ids[0],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Inbound,
+            ConnectionId::from(0),
+        ));
 
         let (outbound2, inbound2) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Outbound,
+        peer_manager.add_peer(create_connection(
             outbound2,
-        );
+            ids[0],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Outbound,
+            ConnectionId::from(1),
+        ));
 
         // outbound1 should be dropped because for inbound2 PeerManager's PeerId is greater and
         // is the "dialer"
@@ -341,11 +372,12 @@ fn peer_manager_simultaneous_dial_inbound_outbound_own_id_larger() {
 
 #[test]
 fn peer_manager_simultaneous_dial_outbound_inbound_remote_id_larger() {
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx, _conn_status_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[0]);
 
     let test = async move {
@@ -353,20 +385,22 @@ fn peer_manager_simultaneous_dial_outbound_inbound_remote_id_larger() {
         // Outbound first, inbound second with own_peer_id < remote_peer_id
         //
         let (outbound1, inbound1) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[1]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Outbound,
+        peer_manager.add_peer(create_connection(
             outbound1,
-        );
+            ids[1],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Outbound,
+            ConnectionId::from(0),
+        ));
 
         let (outbound2, inbound2) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[1]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Inbound,
+        peer_manager.add_peer(create_connection(
             inbound2,
-        );
+            ids[1],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Inbound,
+            ConnectionId::from(1),
+        ));
 
         // inbound1 should be dropped because for outbound2 the remote peer has a greater
         // PeerID and is the "dialer"
@@ -387,11 +421,12 @@ fn peer_manager_simultaneous_dial_outbound_inbound_remote_id_larger() {
 
 #[test]
 fn peer_manager_simultaneous_dial_outbound_inbound_own_id_larger() {
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx, _conn_status_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -399,20 +434,22 @@ fn peer_manager_simultaneous_dial_outbound_inbound_own_id_larger() {
         // Outbound first, inbound second with remote_peer_id < own_peer_id
         //
         let (outbound1, inbound1) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Outbound,
+        peer_manager.add_peer(create_connection(
             outbound1,
-        );
+            ids[0],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Outbound,
+            ConnectionId::from(0),
+        ));
 
         let (outbound2, inbound2) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Inbound,
+        peer_manager.add_peer(create_connection(
             inbound2,
-        );
+            ids[0],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Inbound,
+            ConnectionId::from(1),
+        ));
 
         // outbound2 should be dropped because for inbound1 PeerManager's PeerId is greater and
         // is the "dialer"
@@ -433,11 +470,12 @@ fn peer_manager_simultaneous_dial_outbound_inbound_own_id_larger() {
 
 #[test]
 fn peer_manager_simultaneous_dial_two_outbound() {
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx, _conn_status_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -445,20 +483,22 @@ fn peer_manager_simultaneous_dial_two_outbound() {
         // Two Outbound connections
         //
         let (outbound1, inbound1) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Outbound,
+        peer_manager.add_peer(create_connection(
             outbound1,
-        );
+            ids[0],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Outbound,
+            ConnectionId::from(0),
+        ));
 
         let (outbound2, inbound2) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Outbound,
+        peer_manager.add_peer(create_connection(
             outbound2,
-        );
+            ids[0],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Outbound,
+            ConnectionId::from(1),
+        ));
         // inbound1 should have been dropped since it was the older outbound connection
         check_correct_connection_is_live(
             inbound2,
@@ -471,7 +511,6 @@ fn peer_manager_simultaneous_dial_two_outbound() {
         )
         .await;
     };
-
     runtime.block_on(test);
 }
 
@@ -481,29 +520,35 @@ fn peer_manager_simultaneous_dial_disconnect_event() {
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx, _conn_status_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
         let (outbound, _inbound) = build_test_connection();
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Outbound,
+        peer_manager.add_peer(create_connection(
             outbound,
-        );
+            ids[0],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Outbound,
+            ConnectionId::from(1),
+        ));
 
-        // Create a PeerDisconnect event with the opposite origin of the one stored in
-        // PeerManager to ensure that handling the event won't cause the PeerHandle to be
-        // removed from PeerManager. This would happen if the Disconnected event from a closed
-        // connection arrives after the new connection has been added to active_peers.
-        let event = ConnectionNotification::Disconnected(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Inbound,
+        // Create a PeerDisconnect event with an older connection_id.  This would happen if the
+        // Disconnected event from a closed connection arrives after the new connection has been
+        // added to active_peers.
+        let event = TransportNotification::Disconnected(
+            ConnectionMetadata::new(
+                ids[0],
+                ConnectionId::from(0),
+                NetworkAddress::mock(),
+                ConnectionOrigin::Inbound,
+                MessagingProtocolVersion::V1,
+                [TEST_PROTOCOL].iter().into(),
+            ),
             DisconnectReason::ConnectionLost,
         );
         peer_manager.handle_connection_event(event);
+        // The active connection should still remain.
         assert!(peer_manager.active_peers.contains_key(&ids[0]));
     };
 
@@ -512,43 +557,62 @@ fn peer_manager_simultaneous_dial_disconnect_event() {
 
 #[test]
 fn test_dial_disconnect() {
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx, mut conn_status_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
         let (outbound, _inbound) = build_test_connection();
         // Trigger add_peer function PeerManager.
-        peer_manager.add_peer(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Outbound,
+        peer_manager.add_peer(create_connection(
             outbound,
-        );
+            ids[0],
+            NetworkAddress::mock(),
+            ConnectionOrigin::Outbound,
+            ConnectionId::from(0),
+        ));
+
+        // Expect NewPeer notification from PeerManager.
+        let conn_notif = conn_status_rx.next().await.unwrap();
+        assert!(matches!(conn_notif, ConnectionNotification::NewPeer(_, _)));
 
         // Send DisconnectPeer request to PeerManager.
         let (disconnect_resp_tx, disconnect_resp_rx) = oneshot::channel();
         peer_manager
-            .handle_request(PeerManagerRequest::DisconnectPeer(
+            .handle_connection_request(ConnectionRequest::DisconnectPeer(
                 ids[0],
                 disconnect_resp_tx,
             ))
             .await;
 
         // Send disconnected event from Peer to PeerManaager
-        let event = ConnectionNotification::Disconnected(
-            build_test_identity(ids[0]),
-            Multiaddr::empty(),
-            ConnectionOrigin::Outbound,
+        let event = TransportNotification::Disconnected(
+            ConnectionMetadata::new(
+                ids[0],
+                ConnectionId::from(0),
+                NetworkAddress::mock(),
+                ConnectionOrigin::Outbound,
+                MessagingProtocolVersion::V1,
+                [TEST_PROTOCOL].iter().into(),
+            ),
             DisconnectReason::Requested,
         );
         peer_manager.handle_connection_event(event);
 
+        // Expect LostPeer notification from PeerManager.
+        let conn_notif = conn_status_rx.next().await.unwrap();
+        assert!(matches!(
+            conn_notif,
+            ConnectionNotification::LostPeer(_, _, _)
+        ));
+
         // Sender of disconnect request should receive acknowledgement once connection is closed.
         disconnect_resp_rx.await.unwrap().unwrap();
     };
+
     runtime.block_on(test);
 }

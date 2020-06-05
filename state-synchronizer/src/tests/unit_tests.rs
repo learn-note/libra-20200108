@@ -1,28 +1,23 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    peer_manager::{PeerManager, PeerScoreUpdateType},
-    PeerId,
-};
-use channel::{self, libra_channel, message_queues::QueueStyle};
-use network::validator_network::StateSynchronizerSender;
-use std::{collections::HashMap, num::NonZeroUsize};
+use crate::peer_manager::{PeerManager, PeerScoreUpdateType};
+use libra_config::config::{PeerNetworkId, UpstreamConfig};
+use std::collections::HashMap;
 
 #[test]
 fn test_peer_manager() {
     let peers = vec![
-        PeerId::random(),
-        PeerId::random(),
-        PeerId::random(),
-        PeerId::random(),
+        PeerNetworkId::random(),
+        PeerNetworkId::random(),
+        PeerNetworkId::random(),
+        PeerNetworkId::random(),
     ];
-    let mut peer_manager = PeerManager::new(peers.clone());
-    let (network_reqs_tx, _) =
-        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
-    let sender = StateSynchronizerSender::new(network_reqs_tx);
+    let mut upstream_config = UpstreamConfig::default();
+    upstream_config.upstream_peers = peers.iter().cloned().collect();
+    let mut peer_manager = PeerManager::new(upstream_config);
     for peer_id in peers.clone() {
-        peer_manager.enable_peer(peer_id, sender.clone());
+        peer_manager.enable_peer(peer_id);
     }
 
     for _ in 0..50 {
@@ -31,7 +26,7 @@ fn test_peer_manager() {
 
     let mut pick_counts = HashMap::new();
     for _ in 0..1000 {
-        let (picked_peer_id, _) = peer_manager.pick_peer().unwrap();
+        let picked_peer_id = peer_manager.pick_peer().unwrap();
         let counter = pick_counts.entry(picked_peer_id).or_insert(0);
         *counter += 1;
     }
@@ -45,8 +40,13 @@ fn test_peer_manager() {
 
 #[test]
 fn test_remove_requests() {
-    let peers = vec![PeerId::random(), PeerId::random()];
-    let mut peer_manager = PeerManager::new(peers.clone());
+    let peers = vec![PeerNetworkId::random(), PeerNetworkId::random()];
+    let mut upstream_config = UpstreamConfig::default();
+    upstream_config.upstream_peers = peers.iter().cloned().collect();
+    let mut peer_manager = PeerManager::new(upstream_config);
+    for peer in peers.iter() {
+        peer_manager.enable_peer(*peer);
+    }
 
     peer_manager.process_request(1, peers[0]);
     peer_manager.process_request(3, peers[1]);
@@ -65,8 +65,13 @@ fn test_remove_requests() {
 
 #[test]
 fn test_peer_manager_request_metadata() {
-    let peers = vec![PeerId::random(), PeerId::random()];
-    let mut peer_manager = PeerManager::new(peers.clone());
+    let peers = vec![PeerNetworkId::random(), PeerNetworkId::random()];
+    let mut upstream_config = UpstreamConfig::default();
+    upstream_config.upstream_peers = peers.iter().cloned().collect();
+    let mut peer_manager = PeerManager::new(upstream_config);
+    for peer in peers.iter() {
+        peer_manager.enable_peer(*peer);
+    }
     assert!(peer_manager.get_first_request_time(1).is_none());
     peer_manager.process_request(1, peers[0]);
     peer_manager.process_timeout(1, true);

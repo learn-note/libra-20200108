@@ -5,11 +5,11 @@ use crate::FuzzTargetImpl;
 use anyhow::{bail, Result};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use libra_proptest_helpers::ValueGenerator;
-use std::io::Cursor;
-use vm_runtime_types::{
-    loaded_data::{struct_def::StructDef, types::Type},
-    value::Value,
+use move_vm_types::{
+    loaded_data::types::FatType,
+    values::{prop::layout_and_value_strategy, Value},
 };
+use std::io::Cursor;
 
 #[derive(Clone, Debug, Default)]
 pub struct ValueTarget;
@@ -24,22 +24,18 @@ impl FuzzTargetImpl for ValueTarget {
     }
 
     fn generate(&self, _idx: usize, gen: &mut ValueGenerator) -> Option<Vec<u8>> {
-        let value = gen.generate(Value::struct_strategy());
-        let struct_def = match value.to_type_FOR_TESTING() {
-            Type::Struct(def) => def,
-            _ => unreachable!("must have returned a StructDef"),
-        };
+        let (layout, value) = gen.generate(layout_and_value_strategy());
 
         // Values as currently serialized are not self-describing, so store a serialized form of the
         // type along with the value as well.
-        let struct_def_blob = lcs::to_bytes(&struct_def).unwrap();
+        let layout_blob = lcs::to_bytes(&layout).unwrap();
+        let value_blob = value.simple_serialize(&layout).expect("must serialize");
 
-        let value_blob = value.simple_serialize().expect("must serialize");
         let mut blob = vec![];
-        // Prefix the struct def blob with its length.
-        blob.write_u64::<BigEndian>(struct_def_blob.len() as u64)
+        // Prefix the layout blob with its length.
+        blob.write_u64::<BigEndian>(layout_blob.len() as u64)
             .expect("writing should work");
-        blob.extend_from_slice(&struct_def_blob);
+        blob.extend_from_slice(&layout_blob);
         blob.extend_from_slice(&value_blob);
         Some(blob)
     }
@@ -49,9 +45,29 @@ impl FuzzTargetImpl for ValueTarget {
     }
 }
 
+fn is_valid_type(ty: &FatType) -> bool {
+    use FatType::*;
+
+    match ty {
+        Bool | U8 | U64 | U128 | Address | Signer => true,
+
+        Reference(_) | MutableReference(_) | TyParam(_) => false,
+
+        Vector(ty) => is_valid_type(ty),
+
+        Struct(struct_ty) => {
+            if struct_ty.layout.is_empty() {
+                return false;
+            }
+            struct_ty.layout.iter().all(is_valid_type)
+                && struct_ty.ty_args.iter().all(is_valid_type)
+        }
+    }
+}
+
 fn deserialize(data: &[u8]) -> Result<()> {
     let mut data = Cursor::new(data);
-    // Read the length of the struct def blob.
+    // Read the length of the layout blob.
     let len = data.read_u64::<BigEndian>()? as usize;
     let position = data.position() as usize;
     let data = &data.into_inner()[position..];
@@ -59,10 +75,16 @@ fn deserialize(data: &[u8]) -> Result<()> {
     if data.len() < len {
         bail!("too little data");
     }
-    let struct_def_data = &data[0..len];
+    let layout_data = &data[..len];
     let value_data = &data[len..];
 
-    let struct_def: StructDef = lcs::from_bytes(struct_def_data)?;
-    let _ = Value::simple_deserialize(value_data, struct_def);
+    let ty: FatType = lcs::from_bytes(layout_data)?;
+    // The fuzzer may alter the raw bytes, resulting in invalid layouts that will not
+    // pass the bytecode verifier. We need to filter these out as they can show up as
+    // false positives.
+    if !is_valid_type(&ty) {
+        bail!("invalid layout");
+    }
+    let _ = Value::simple_deserialize(value_data, &ty);
     Ok(())
 }

@@ -9,6 +9,7 @@ resource "aws_instance" "faucet" {
   subnet_id                   = element(aws_subnet.testnet.*.id, 0)
   depends_on                  = [aws_main_route_table_association.testnet]
   vpc_security_group_ids      = [aws_security_group.faucet-host.id]
+  private_ip                  = var.override_faucet_ip == "" ? null : var.override_faucet_ip
   associate_public_ip_address = local.instance_public_ip
   key_name                    = aws_key_pair.libra.key_name
   iam_instance_profile        = aws_iam_instance_profile.ecsInstanceRole.name
@@ -17,6 +18,7 @@ resource "aws_instance" "faucet" {
   tags = {
     Name      = "${terraform.workspace}-faucet"
     Role      = "faucet"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
 }
@@ -50,6 +52,7 @@ resource "aws_ecs_task_definition" "faucet" {
 
   tags = {
     Role      = "faucet"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
 }
@@ -64,6 +67,7 @@ resource "aws_ecs_service" "faucet" {
 
   tags = {
     Role      = "faucet"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
 }

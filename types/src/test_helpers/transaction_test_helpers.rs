@@ -3,16 +3,18 @@
 
 use crate::{
     account_address::AccountAddress,
+    account_config::LBR_NAME,
     transaction::{Module, RawTransaction, Script, SignatureCheckedTransaction, SignedTransaction},
     write_set::WriteSet,
 };
 use libra_crypto::{ed25519::*, hash::CryptoHash, traits::*};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-static PLACEHOLDER_SCRIPT: &[u8] = include_bytes!("fixtures/scripts/placeholder_script.mvbin");
+const MAX_GAS_AMOUNT: u64 = 1_000_000;
+const TEST_GAS_PRICE: u64 = 0;
 
-const MAX_GAS_AMOUNT: u64 = 140_000;
-const MAX_GAS_PRICE: u64 = 1;
+static EMPTY_SCRIPT: &[u8] =
+    include_bytes!("../../../language/stdlib/staged/transaction_scripts/empty_script.mv");
 
 // Test helper for transaction creation
 pub fn get_test_signed_module_publishing_transaction(
@@ -32,7 +34,8 @@ pub fn get_test_signed_module_publishing_transaction(
         sequence_number,
         module,
         MAX_GAS_AMOUNT,
-        MAX_GAS_PRICE,
+        TEST_GAS_PRICE,
+        LBR_NAME.to_owned(),
         Duration::from_secs(expiration_time),
     );
 
@@ -50,14 +53,16 @@ pub fn get_test_signed_transaction(
     script: Option<Script>,
     expiration_time: u64,
     gas_unit_price: u64,
+    gas_currency_code: String,
     max_gas_amount: Option<u64>,
 ) -> SignedTransaction {
     let raw_txn = RawTransaction::new_script(
         sender,
         sequence_number,
-        script.unwrap_or_else(placeholder_script),
+        script.unwrap_or_else(|| Script::new(EMPTY_SCRIPT.to_vec(), vec![], Vec::new())),
         max_gas_amount.unwrap_or(MAX_GAS_AMOUNT),
         gas_unit_price,
+        gas_currency_code,
         Duration::from_secs(expiration_time),
     );
 
@@ -75,14 +80,16 @@ pub fn get_test_unchecked_transaction(
     script: Option<Script>,
     expiration_time: u64,
     gas_unit_price: u64,
+    gas_currency_code: String,
     max_gas_amount: Option<u64>,
 ) -> SignedTransaction {
     let raw_txn = RawTransaction::new_script(
         sender,
         sequence_number,
-        script.unwrap_or_else(placeholder_script),
+        script.unwrap_or_else(|| Script::new(EMPTY_SCRIPT.to_vec(), vec![], Vec::new())),
         max_gas_amount.unwrap_or(MAX_GAS_AMOUNT),
         gas_unit_price,
+        gas_currency_code,
         Duration::from_secs(expiration_time),
     );
 
@@ -112,7 +119,8 @@ pub fn get_test_signed_txn(
         public_key,
         script,
         expiration_time,
-        MAX_GAS_PRICE,
+        TEST_GAS_PRICE,
+        LBR_NAME.to_owned(),
         None,
     )
 }
@@ -136,13 +144,10 @@ pub fn get_test_unchecked_txn(
         public_key,
         script,
         expiration_time,
-        MAX_GAS_PRICE,
+        TEST_GAS_PRICE,
+        LBR_NAME.to_owned(),
         None,
     )
-}
-
-pub fn placeholder_script() -> Script {
-    Script::new(PLACEHOLDER_SCRIPT.to_vec(), vec![])
 }
 
 pub fn get_write_set_txn(

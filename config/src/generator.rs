@@ -4,18 +4,12 @@
 //! Convenience structs and functions for generating a random set of Libra ndoes without the
 //! genesis.blob.
 
-use crate::{
-    config::{
-        NodeConfig, OnDiskStorageConfig, SafetyRulesBackend, SeedPeersConfig, VMPublishingOption,
-    },
-    utils,
-};
-use libra_types::crypto_proxies::{ValidatorPublicKeys, ValidatorSet};
+use crate::config::{NetworkConfig, NodeConfig, SeedPeersConfig, TestConfig, HANDSHAKE_VERSION};
+use libra_network_address::NetworkAddress;
 use rand::{rngs::StdRng, SeedableRng};
 
 pub struct ValidatorSwarm {
     pub nodes: Vec<NodeConfig>,
-    pub validator_set: ValidatorSet,
 }
 
 pub fn validator_swarm(
@@ -25,7 +19,6 @@ pub fn validator_swarm(
     randomize_ports: bool,
 ) -> ValidatorSwarm {
     let mut rng = StdRng::from_seed(seed);
-    let mut validator_keys = Vec::new();
     let mut nodes = Vec::new();
 
     for _index in 0..count {
@@ -34,52 +27,52 @@ pub fn validator_swarm(
             node.randomize_ports();
         }
 
-        let mut storage_config = OnDiskStorageConfig::default();
-        storage_config.default = true;
-        node.consensus.safety_rules.backend = SafetyRulesBackend::OnDiskStorage(storage_config);
-
+        // For a validator node, any of its validator peers are considered an upstream peer
         let network = node.validator_network.as_mut().unwrap();
-        network.listen_address = utils::get_available_port_in_multiaddr(true);
-        network.advertised_address = network.listen_address.clone();
-
-        let test = node.test.as_ref().unwrap();
-        let consensus_pubkey = test.consensus_keypair.as_ref().unwrap().public().clone();
-        let network_keypairs = network
-            .network_keypairs
-            .as_ref()
-            .expect("Network keypairs are not defined");
-
-        validator_keys.push(ValidatorPublicKeys::new(
-            network.peer_id,
-            consensus_pubkey,
-            1, // @TODO: Add support for dynamic weights
-            network_keypairs.signing_keys.public().clone(),
-            network_keypairs.identity_keys.public().clone(),
-        ));
+        node.upstream
+            .primary_networks
+            .push(network.identity.peer_id_from_config().unwrap());
 
         nodes.push(node);
     }
 
-    let mut seed_peers = SeedPeersConfig::default();
-    let network = nodes[0].validator_network.as_ref().unwrap();
-    seed_peers
-        .seed_peers
-        .insert(network.peer_id, vec![network.listen_address.clone()]);
-
+    // set the first validator as every validators' initial configured seed peer.
+    let seed_config = &nodes[0].validator_network.as_ref().unwrap();
+    let seed_peers = build_seed_peers(&seed_config, seed_config.advertised_address.clone());
     for node in &mut nodes {
         let network = node.validator_network.as_mut().unwrap();
         network.seed_peers = seed_peers.clone();
     }
 
-    validator_keys.sort_by(|k1, k2| k1.account_address().cmp(k2.account_address()));
-    ValidatorSwarm {
-        nodes,
-        validator_set: ValidatorSet::new(validator_keys),
-    }
+    ValidatorSwarm { nodes }
 }
 
 pub fn validator_swarm_for_testing(nodes: usize) -> ValidatorSwarm {
     let mut config = NodeConfig::default();
-    config.vm_config.publishing_options = VMPublishingOption::Open;
+    config.test = Some(TestConfig::open_module());
     validator_swarm(&NodeConfig::default(), nodes, [1u8; 32], true)
+}
+
+/// Convenience function that builds a `SeedPeersConfig` containing a single peer
+/// with a fully formatted `NetworkAddress` containing its network identity pubkey
+/// and handshake protocol version.
+pub fn build_seed_peers(
+    seed_config: &NetworkConfig,
+    seed_base_addr: NetworkAddress,
+) -> SeedPeersConfig {
+    let seed_pubkey = seed_config
+        .identity
+        .public_key_from_config()
+        .expect("Missing identity key");
+    let seed_addr = seed_base_addr.append_prod_protos(seed_pubkey, HANDSHAKE_VERSION);
+
+    let mut seed_peers = SeedPeersConfig::default();
+    seed_peers.seed_peers.insert(
+        seed_config.identity.peer_id_from_config().unwrap(),
+        vec![seed_addr],
+    );
+    seed_peers
+        .verify_libranet_addrs()
+        .expect("Expect LibraNet addresses");
+    seed_peers
 }

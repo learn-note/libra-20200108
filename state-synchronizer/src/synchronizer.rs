@@ -1,26 +1,36 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
-use crate::coordinator::EpochRetrievalRequest;
 use crate::{
     coordinator::{CoordinatorMessage, SyncCoordinator, SyncRequest},
     executor_proxy::{ExecutorProxy, ExecutorProxyTrait},
+    network::{StateSynchronizerEvents, StateSynchronizerSender},
     SynchronizerState,
 };
-use anyhow::Result;
-use executor::Executor;
+use anyhow::{format_err, Result};
+use executor_types::ChunkExecutor;
 use futures::{
     channel::{mpsc, oneshot},
     future::Future,
     SinkExt,
 };
-use libra_config::config::{NodeConfig, RoleType, StateSyncConfig};
-use libra_types::crypto_proxies::LedgerInfoWithSignatures;
-use libra_types::crypto_proxies::ValidatorChangeProof;
-use libra_types::waypoint::Waypoint;
-use network::validator_network::{StateSynchronizerEvents, StateSynchronizerSender};
-use std::sync::Arc;
-use tokio::runtime::{Builder, Runtime};
-use vm_runtime::LibraVM;
+use libra_config::config::{NodeConfig, RoleType, StateSyncConfig, UpstreamConfig};
+use libra_mempool::{CommitNotification, CommitResponse};
+use libra_types::{
+    contract_event::ContractEvent, ledger_info::LedgerInfoWithSignatures, transaction::Transaction,
+    waypoint::Waypoint, PeerId,
+};
+use std::{
+    boxed::Box,
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use storage_interface::DbReader;
+use subscription_service::ReconfigSubscription;
+use tokio::{
+    runtime::{Builder, Runtime},
+    time::timeout,
+};
 
 pub struct StateSynchronizer {
     _runtime: Runtime,
@@ -30,44 +40,63 @@ pub struct StateSynchronizer {
 impl StateSynchronizer {
     /// Setup state synchronizer. spawns coordinator and downloader routines on executor
     pub fn bootstrap(
-        network: Vec<(StateSynchronizerSender, StateSynchronizerEvents)>,
-        executor: Arc<Executor<LibraVM>>,
+        network: Vec<(PeerId, StateSynchronizerSender, StateSynchronizerEvents)>,
+        state_sync_to_mempool_sender: mpsc::Sender<CommitNotification>,
+        storage: Arc<dyn DbReader>,
+        executor: Box<dyn ChunkExecutor>,
         config: &NodeConfig,
+        waypoint: Waypoint,
+        reconfig_event_subscriptions: Vec<ReconfigSubscription>,
     ) -> Self {
-        let executor_proxy = ExecutorProxy::new(executor, config);
-        Self::bootstrap_with_executor_proxy(
-            network,
-            config.base.role,
-            config.base.waypoint,
-            &config.state_sync,
-            executor_proxy,
-        )
-    }
-
-    pub fn bootstrap_with_executor_proxy<E: ExecutorProxyTrait + 'static>(
-        network: Vec<(StateSynchronizerSender, StateSynchronizerEvents)>,
-        role: RoleType,
-        waypoint: Option<Waypoint>,
-        state_sync_config: &StateSyncConfig,
-        executor_proxy: E,
-    ) -> Self {
-        let mut runtime = Builder::new()
+        let runtime = Builder::new()
             .thread_name("state-sync-")
             .threaded_scheduler()
             .enable_all()
             .build()
             .expect("[state synchronizer] failed to create runtime");
 
+        let executor_proxy = ExecutorProxy::new(storage, executor, reconfig_event_subscriptions);
+        Self::bootstrap_with_executor_proxy(
+            runtime,
+            network,
+            state_sync_to_mempool_sender,
+            config.base.role,
+            Some(waypoint),
+            &config.state_sync,
+            config.upstream.clone(),
+            executor_proxy,
+        )
+    }
+
+    pub fn bootstrap_with_executor_proxy<E: ExecutorProxyTrait + 'static>(
+        runtime: Runtime,
+        network: Vec<(PeerId, StateSynchronizerSender, StateSynchronizerEvents)>,
+        state_sync_to_mempool_sender: mpsc::Sender<CommitNotification>,
+        role: RoleType,
+        waypoint: Option<Waypoint>,
+        state_sync_config: &StateSyncConfig,
+        upstream_config: UpstreamConfig,
+        executor_proxy: E,
+    ) -> Self {
         let (coordinator_sender, coordinator_receiver) = mpsc::unbounded();
 
-        let initial_state = runtime
-            .block_on(executor_proxy.get_local_storage_state())
+        let initial_state = executor_proxy
+            .get_local_storage_state()
             .expect("[state sync] Start failure: cannot sync with storage.");
+
+        let network_senders: HashMap<_, _> = network
+            .iter()
+            .map(|(network_id, sender, _events)| (*network_id, sender.clone()))
+            .collect();
+
         let coordinator = SyncCoordinator::new(
             coordinator_receiver,
+            state_sync_to_mempool_sender,
+            network_senders,
             role,
             waypoint,
             state_sync_config.clone(),
+            upstream_config,
             executor_proxy,
             initial_state,
         );
@@ -111,19 +140,50 @@ impl StateSyncClient {
     pub fn sync_to(&self, target: LedgerInfoWithSignatures) -> impl Future<Output = Result<()>> {
         let mut sender = self.coordinator_sender.clone();
         let (callback, cb_receiver) = oneshot::channel();
-        let request = SyncRequest { callback, target };
+        let request = SyncRequest {
+            callback,
+            target,
+            last_progress_tst: SystemTime::now(),
+        };
         async move {
-            sender.send(CoordinatorMessage::Request(request)).await?;
+            sender
+                .send(CoordinatorMessage::Request(Box::new(request)))
+                .await?;
             cb_receiver.await?
         }
     }
 
     /// Notifies state synchronizer about new version
-    pub fn commit(&self) -> impl Future<Output = Result<()>> {
+    pub fn commit(
+        &self,
+        // *successfully* committed transactions
+        committed_txns: Vec<Transaction>,
+        reconfig_events: Vec<ContractEvent>,
+    ) -> impl Future<Output = Result<()>> {
         let mut sender = self.coordinator_sender.clone();
         async move {
-            sender.send(CoordinatorMessage::Commit).await?;
-            Ok(())
+            let (callback, callback_rcv) = oneshot::channel();
+            sender
+                .send(CoordinatorMessage::Commit(
+                    committed_txns,
+                    reconfig_events,
+                    callback,
+                ))
+                .await?;
+
+            match timeout(Duration::from_secs(1), callback_rcv).await {
+                Err(_) => {
+                    Err(format_err!("[state sync client] failed to receive commit ACK from state synchronizer on time"))
+                }
+                Ok(resp) => {
+                    let CommitResponse { msg } = resp??;
+                    if msg != "" {
+                        Err(format_err!("[state sync client] commit failed: {:?}", msg))
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
         }
     }
 
@@ -135,26 +195,6 @@ impl StateSyncClient {
             sender.send(CoordinatorMessage::GetState(cb_sender)).await?;
             let info = cb_receiver.await?;
             Ok(info)
-        }
-    }
-
-    pub fn get_epoch_proof(
-        &self,
-        start_epoch: u64,
-        end_epoch: u64,
-    ) -> impl Future<Output = Result<ValidatorChangeProof>> {
-        let mut sender = self.coordinator_sender.clone();
-        let (cb_sender, cb_receiver) = oneshot::channel();
-        let request = EpochRetrievalRequest {
-            start_epoch,
-            end_epoch,
-            callback: cb_sender,
-        };
-        async move {
-            sender
-                .send(CoordinatorMessage::GetEpochProof(request))
-                .await?;
-            cb_receiver.await?
         }
     }
 }

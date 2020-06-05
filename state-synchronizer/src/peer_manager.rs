@@ -1,15 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{counters, PeerId};
+use crate::counters;
+use libra_config::config::{PeerNetworkId, UpstreamConfig};
 use libra_logger::prelude::*;
-use network::validator_network::StateSynchronizerSender;
 use rand::{
     distributions::{Distribution, WeightedIndex},
     thread_rng,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     time::SystemTime,
 };
 
@@ -19,17 +19,12 @@ const MIN_SCORE: f64 = 1.0;
 #[derive(Default, Debug, Clone)]
 pub struct PeerInfo {
     is_alive: bool,
-    is_upstream: bool,
     score: f64,
 }
 
 impl PeerInfo {
-    pub fn new(is_alive: bool, is_upstream: bool, score: f64) -> Self {
-        Self {
-            is_alive,
-            is_upstream,
-            score,
-        }
+    pub fn new(is_alive: bool, score: f64) -> Self {
+        Self { is_alive, score }
     }
 }
 
@@ -39,17 +34,17 @@ pub struct ChunkRequestInfo {
     version: u64,
     first_request_time: SystemTime,
     last_request_time: SystemTime,
-    last_request_peer: PeerId,
+    last_request_peer: PeerNetworkId,
 }
 
 impl ChunkRequestInfo {
-    pub fn new(version: u64, peer_id: PeerId) -> Self {
+    pub fn new(version: u64, peer: PeerNetworkId) -> Self {
         let now = SystemTime::now();
         Self {
             version,
             first_request_time: now,
             last_request_time: now,
-            last_request_peer: peer_id,
+            last_request_peer: peer,
         }
     }
 }
@@ -66,57 +61,39 @@ pub enum PeerScoreUpdateType {
 }
 
 pub struct PeerManager {
-    peers: HashMap<PeerId, PeerInfo>,
-    network_senders: HashMap<PeerId, StateSynchronizerSender>,
+    peers: HashMap<PeerNetworkId, PeerInfo>,
     requests: BTreeMap<u64, ChunkRequestInfo>,
     weighted_index: Option<WeightedIndex<f64>>,
+    upstream_config: UpstreamConfig,
 }
 
 impl PeerManager {
-    pub fn new(peer_ids: Vec<PeerId>) -> Self {
-        let peers = peer_ids
-            .into_iter()
-            .map(|peer_id| (peer_id, PeerInfo::new(false, true, MAX_SCORE)))
-            .collect();
+    pub fn new(upstream_config: UpstreamConfig) -> Self {
         Self {
-            peers,
-            network_senders: HashMap::new(),
+            peers: HashMap::new(),
             requests: BTreeMap::new(),
             weighted_index: None,
+            upstream_config,
         }
     }
 
-    pub fn set_peers(&mut self, peer_ids: Vec<PeerId>) {
-        let new_peer_ids: HashSet<_> = peer_ids.iter().collect();
-        for (peer_id, info) in self.peers.iter_mut() {
-            info.is_upstream = new_peer_ids.contains(peer_id);
+    pub fn enable_peer(&mut self, peer: PeerNetworkId) {
+        if !self.is_upstream_peer(peer) {
+            return;
         }
-        for peer_id in new_peer_ids {
-            if !self.peers.contains_key(peer_id) {
-                self.peers
-                    .insert(*peer_id, PeerInfo::new(false, true, MAX_SCORE));
-            }
-        }
-        self.compute_weighted_index();
-        debug!("[state sync] (set_peers) state: {:?}", self.peers);
-    }
 
-    pub fn enable_peer(&mut self, peer_id: PeerId, sender: StateSynchronizerSender) {
         debug!("[state sync] state before: {:?}", self.peers);
-        self.network_senders.insert(peer_id, sender);
-        if let Some(peer_info) = self.peers.get_mut(&peer_id) {
+        if let Some(peer_info) = self.peers.get_mut(&peer) {
             peer_info.is_alive = true;
         } else {
-            self.peers
-                .insert(peer_id, PeerInfo::new(true, false, MAX_SCORE));
+            self.peers.insert(peer, PeerInfo::new(true, MAX_SCORE));
         }
         self.compute_weighted_index();
         debug!("[state sync] state after: {:?}", self.peers);
     }
 
-    pub fn disable_peer(&mut self, peer_id: &PeerId) {
-        self.network_senders.remove(&peer_id);
-        if let Some(peer_info) = self.peers.get_mut(peer_id) {
+    pub fn disable_peer(&mut self, peer: &PeerNetworkId) {
+        if let Some(peer_info) = self.peers.get_mut(peer) {
             peer_info.is_alive = false;
         };
         self.compute_weighted_index();
@@ -126,8 +103,8 @@ impl PeerManager {
         self.get_active_upstream_peers().is_empty()
     }
 
-    pub fn update_score(&mut self, peer_id: &PeerId, update_type: PeerScoreUpdateType) {
-        if let Some(peer_info) = self.peers.get_mut(peer_id) {
+    pub fn update_score(&mut self, peer: &PeerNetworkId, update_type: PeerScoreUpdateType) {
+        if let Some(peer_info) = self.peers.get_mut(peer) {
             let old_score = peer_info.score;
             match update_type {
                 PeerScoreUpdateType::Success => {
@@ -173,42 +150,33 @@ impl PeerManager {
         }
     }
 
-    pub fn pick_peer(&self) -> Option<(PeerId, StateSynchronizerSender)> {
+    pub fn pick_peer(&self) -> Option<PeerNetworkId> {
         let active_peers = self.get_active_upstream_peers();
         debug!("[state sync] (pick_peer) state: {:?}", self.peers);
 
         if let Some(weighted_index) = &self.weighted_index {
             let mut rng = thread_rng();
             if let Some(peer) = active_peers.get(weighted_index.sample(&mut rng)) {
-                let peer_id = *peer.0;
-                if let Some(sender) = self.get_network_sender(&peer_id) {
-                    return Some((peer_id, sender));
-                } else {
-                    debug!("[state sync] (pick_peer) no sender for {}", peer_id);
-                }
+                return Some(*peer.0);
             }
         }
         None
     }
 
-    fn get_active_upstream_peers(&self) -> Vec<(&PeerId, &PeerInfo)> {
+    fn get_active_upstream_peers(&self) -> Vec<(&PeerNetworkId, &PeerInfo)> {
         self.peers
             .iter()
-            .filter(|&(_, peer_info)| peer_info.is_alive && peer_info.is_upstream)
+            .filter(|&(peer, peer_info)| peer_info.is_alive && self.is_upstream_peer(*peer))
             .collect()
     }
 
-    pub fn get_network_sender(&self, peer_id: &PeerId) -> Option<StateSynchronizerSender> {
-        self.network_senders.get(peer_id).cloned()
-    }
-
-    pub fn process_request(&mut self, version: u64, peer_id: PeerId) {
+    pub fn process_request(&mut self, version: u64, peer: PeerNetworkId) {
         if let Some(prev_request) = self.requests.get_mut(&version) {
-            prev_request.last_request_peer = peer_id;
+            prev_request.last_request_peer = peer;
             prev_request.last_request_time = SystemTime::now();
         } else {
             self.requests
-                .insert(version, ChunkRequestInfo::new(version, peer_id));
+                .insert(version, ChunkRequestInfo::new(version, peer));
         }
     }
 
@@ -242,8 +210,12 @@ impl PeerManager {
         self.update_score(&peer_to_penalize, PeerScoreUpdateType::TimeOut);
     }
 
+    fn is_upstream_peer(&self, peer: PeerNetworkId) -> bool {
+        self.upstream_config.is_upstream_peer(peer)
+    }
+
     #[cfg(test)]
-    pub fn peer_score(&self, peer_id: &PeerId) -> Option<f64> {
-        self.peers.get(peer_id).map(|p| p.score)
+    pub fn peer_score(&self, peer: &PeerNetworkId) -> Option<f64> {
+        self.peers.get(peer).map(|p| p.score)
     }
 }

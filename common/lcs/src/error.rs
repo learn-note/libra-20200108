@@ -11,6 +11,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum Error {
     #[error("unexpected end of input")]
     Eof,
+    #[error("I/O error: {0}")]
+    Io(String),
     #[error("exceeded max sequence length")]
     ExceededMaxLen(usize),
     #[error("expected boolean")]
@@ -19,6 +21,8 @@ pub enum Error {
     ExpectedMapKey,
     #[error("expected map value")]
     ExpectedMapValue,
+    #[error("keys of serialized maps must be unique and in increasing order")]
+    NonCanonicalMap,
     #[error("expected option type")]
     ExpectedOption,
     #[error("{0}")]
@@ -31,6 +35,16 @@ pub enum Error {
     RemainingInput,
     #[error("malformed utf8")]
     Utf8,
+    #[error("ULEB128 encoding was not minimal in size")]
+    NonCanonicalUleb128Encoding,
+    #[error("ULEB128-encoded integer did not fit in the target size")]
+    IntegerOverflowDuringUleb128Decoding,
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Io(err.to_string())
+    }
 }
 
 impl ser::Error for Error {

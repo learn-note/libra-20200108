@@ -1,5 +1,5 @@
 module M {
-    fn() {}
-    // Struct declarations must come before function declarations.
+    fun fn() {}
+    // Struct declarations can be intermixed with function declarations.
     struct S {}
 }

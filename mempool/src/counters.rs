@@ -1,8 +1,18 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use libra_metrics::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use once_cell::sync::Lazy;
-use prometheus::{IntCounter, IntCounterVec};
+
+/// Counter of pending network events to Mempool
+pub static PENDING_MEMPOOL_NETWORK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mempool_pending_network_events",
+        "Counters(queued,dequeued,dropped) related to pending network notifications to Mempool",
+        &["state"]
+    )
+    .unwrap()
+});
 
 pub static MEMPOOL_SERVICE: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
