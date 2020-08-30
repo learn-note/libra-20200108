@@ -15,7 +15,10 @@ mod check;
 mod clippy;
 mod config;
 mod context;
+mod diff_summary;
+mod fix;
 mod fmt;
+mod generate_summaries;
 mod lint;
 mod test;
 mod utils;
@@ -39,6 +42,9 @@ enum Command {
     #[structopt(name = "clippy")]
     /// Run `cargo clippy`
     Clippy(clippy::Args),
+    #[structopt(name = "fix")]
+    /// Run `cargo fix`
+    Fix(fix::Args),
     #[structopt(name = "fmt")]
     /// Run `cargo fmt`
     Fmt(fmt::Args),
@@ -48,6 +54,12 @@ enum Command {
     #[structopt(name = "lint")]
     /// Run lints
     Lint(lint::Args),
+    #[structopt(name = "generate-summaries")]
+    /// Generate build summaries for important subsets
+    GenerateSummaries(generate_summaries::Args),
+    #[structopt(name = "diff-summary")]
+    /// Diff build summaries for important subsets
+    DiffSummary(diff_summary::Args),
 }
 
 fn main() -> Result<()> {
@@ -79,8 +91,11 @@ fn main() -> Result<()> {
         Command::Test(args) => test::run(args, xctx),
         Command::Check(args) => check::run(args, xctx),
         Command::Clippy(args) => clippy::run(args, xctx),
+        Command::Fix(args) => fix::run(args, xctx),
         Command::Fmt(args) => fmt::run(args, xctx),
         Command::Bench(args) => bench::run(args, xctx),
         Command::Lint(args) => lint::run(args, xctx),
+        Command::GenerateSummaries(args) => generate_summaries::run(args, xctx),
+        Command::DiffSummary(args) => diff_summary::run(args, xctx),
     }
 }

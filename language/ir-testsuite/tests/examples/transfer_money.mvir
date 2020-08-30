@@ -2,15 +2,16 @@
 //! account: Bob, 1000000
 
 //! sender: Alice
-import 0x0.LibraAccount;
-import 0x0.LBR;
-import 0x0.Libra;
+import 0x1.LibraAccount;
+import 0x1.LBR;
+import 0x1.Libra;
 
-main() {
-    let coins: Libra.T<LBR.T>;
+main(account: &signer) {
+    let with_cap: LibraAccount.WithdrawCapability;
 
-    coins = LibraAccount.withdraw_from_sender<LBR.T>(42);
-    LibraAccount.deposit<LBR.T>({{bob}}, move(coins));
+    with_cap = LibraAccount.extract_withdraw_capability(copy(account));
+    LibraAccount.pay_from<LBR.LBR>(&with_cap, {{bob}}, 42, h"", h"");
+    LibraAccount.restore_withdraw_capability(move(with_cap));
 
     return;
 }

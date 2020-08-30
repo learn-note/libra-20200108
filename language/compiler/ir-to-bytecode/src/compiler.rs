@@ -23,6 +23,7 @@ use std::{
 };
 use vm::{
     access::ModuleAccess,
+    errors::Location as VMErrorLocation,
     file_format::{
         Bytecode, CodeOffset, CodeUnit, CompiledModule, CompiledModuleMut, CompiledScript,
         CompiledScriptMut, Constant, FieldDefinition, FunctionDefinition, FunctionSignature, Kind,
@@ -78,6 +79,9 @@ macro_rules! record_src_loc {
         $context
             .source_map
             .add_top_level_struct_mapping($context.current_struct_definition_index(), $location)?;
+    };
+    (const_decl: $context:expr, $const_index:expr, $name:expr) => {
+        $context.source_map.add_const_mapping($const_index, $name)?;
     };
 }
 
@@ -414,12 +418,23 @@ pub fn compile_script<'a, T: 'a + ModuleAccess>(
         &mut context,
         script.explicit_dependency_declarations,
     )?;
+    for ir_constant in script.constants {
+        let constant = compile_constant(&mut context, ir_constant.signature, ir_constant.value)?;
+        context.declare_constant(ir_constant.name.clone(), constant.clone())?;
+        let const_idx = context.constant_index(constant)?;
+        record_src_loc!(const_decl: context, const_idx, ir_constant.name);
+    }
+
     let function = script.main;
 
     let sig = function_signature(&mut context, &function.value.signature)?;
     let parameters_sig_idx = context.signature_index(Signature(sig.parameters))?;
 
     record_src_loc!(function_decl: context, function.loc, 0);
+    record_src_loc!(
+        function_type_formals: context,
+        &function.value.signature.type_formals
+    );
     let code = compile_function_body_impl(&mut context, function.value)?.unwrap();
 
     let (
@@ -452,7 +467,9 @@ pub fn compile_script<'a, T: 'a + ModuleAccess>(
     };
     compiled_script
         .freeze()
-        .map_err(|err| InternalCompilerError::BoundsCheckErrors(err).into())
+        .map_err(|e| {
+            InternalCompilerError::BoundsCheckErrors(e.finish(VMErrorLocation::Undefined)).into()
+        })
         .map(|frozen_script| (frozen_script, source_map))
 }
 
@@ -488,6 +505,13 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
         module.explicit_dependency_declarations,
     )?;
 
+    for ir_constant in module.constants {
+        let constant = compile_constant(&mut context, ir_constant.signature, ir_constant.value)?;
+        context.declare_constant(ir_constant.name.clone(), constant.clone())?;
+        let const_idx = context.constant_index(constant)?;
+        record_src_loc!(const_decl: context, const_idx, ir_constant.name);
+    }
+
     for (name, function) in &module.functions {
         let sig = function_signature(&mut context, &function.value.signature)?;
         context.declare_function(self_name.clone(), name.clone(), sig)?;
@@ -496,7 +520,6 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
     // Current module
 
     let struct_defs = compile_structs(&mut context, &self_name, module.structs)?;
-
     let function_defs = compile_functions(&mut context, &self_name, module.functions)?;
 
     let (
@@ -533,7 +556,9 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
     };
     compiled_module
         .freeze()
-        .map_err(|err| InternalCompilerError::BoundsCheckErrors(err).into())
+        .map_err(|e| {
+            InternalCompilerError::BoundsCheckErrors(e.finish(VMErrorLocation::Undefined)).into()
+        })
         .map(|frozen_module| (frozen_module, source_map))
 }
 
@@ -1190,7 +1215,7 @@ fn compile_expression(
         Exp_::Value(cv) => match cv.value {
             CopyableVal_::Address(address) => {
                 let address_value = MoveValue::Address(address);
-                let constant = compile_constant(context, MoveTypeLayout::Address, address_value)?;
+                let constant = compile_constant(context, Type::Address, address_value)?;
                 let idx = context.constant_index(constant)?;
                 push_instr!(exp.loc, Bytecode::LdConst(idx));
                 function_frame.push()?;
@@ -1213,8 +1238,8 @@ fn compile_expression(
             }
             CopyableVal_::ByteArray(buf) => {
                 let vec_value = MoveValue::vector_u8(buf);
-                let type_ = MoveTypeLayout::Vector(Box::new(MoveTypeLayout::U8));
-                let constant = compile_constant(context, type_, vec_value)?;
+                let ty = Type::Vector(Box::new(Type::U8));
+                let constant = compile_constant(context, ty, vec_value)?;
                 let idx = context.constant_index(constant)?;
                 push_instr!(exp.loc, Bytecode::LdConst(idx));
                 function_frame.push()?;
@@ -1441,11 +1466,6 @@ fn compile_call(
     Ok(match call.value {
         FunctionCall_::Builtin(function) => {
             match function {
-                Builtin::GetTxnSender => {
-                    push_instr!(call.loc, Bytecode::GetTxnSenderAddress);
-                    function_frame.push()?;
-                    vec_deque![InferredType::Address]
-                }
                 Builtin::Exists(name, tys) => {
                     let tokens = Signature(compile_types(
                         context,
@@ -1531,24 +1551,6 @@ fn compile_call(
                     };
                     let sh_idx = context.struct_handle_index(ident)?;
                     vec_deque![InferredType::Struct(sh_idx, tys)]
-                }
-                Builtin::MoveToSender(name, tys) => {
-                    let tokens = Signature(compile_types(
-                        context,
-                        function_frame.type_parameters(),
-                        &tys,
-                    )?);
-                    let type_actuals_id = context.signature_index(tokens)?;
-                    let def_idx = context.struct_definition_index(&name)?;
-                    if tys.is_empty() {
-                        push_instr!(call.loc, Bytecode::MoveToSender(def_idx));
-                    } else {
-                        let si_idx =
-                            context.struct_instantiation_index(def_idx, type_actuals_id)?;
-                        push_instr!(call.loc, Bytecode::MoveToSenderGeneric(si_idx));
-                    }
-                    function_frame.push()?;
-                    vec_deque![]
                 }
                 Builtin::MoveTo(name, tys) => {
                     let tokens = Signature(compile_types(
@@ -1637,12 +1639,27 @@ fn compile_call(
     })
 }
 
-fn compile_constant(
-    _context: &mut Context,
-    type_: MoveTypeLayout,
-    value: MoveValue,
-) -> Result<Constant> {
-    Constant::serialize_constant(&type_, &value)
+fn compile_constant(_context: &mut Context, ty: Type, value: MoveValue) -> Result<Constant> {
+    fn type_layout(ty: Type) -> Result<MoveTypeLayout> {
+        Ok(match ty {
+            Type::Address => MoveTypeLayout::Address,
+            Type::Signer => MoveTypeLayout::Signer,
+            Type::U8 => MoveTypeLayout::U8,
+            Type::U64 => MoveTypeLayout::U64,
+            Type::U128 => MoveTypeLayout::U128,
+            Type::Bool => MoveTypeLayout::Bool,
+            Type::Vector(inner_type) => MoveTypeLayout::Vector(Box::new(type_layout(*inner_type)?)),
+            Type::Reference(_, _) => bail!("References are not supported in constant type layouts"),
+            Type::TypeParameter(_) => {
+                bail!("Type parameters are not supported in constant type layouts")
+            }
+            Type::Struct(_ident, _tys) => {
+                bail!("TODO Structs are not *yet* supported in constant type layouts")
+            }
+        })
+    }
+
+    Constant::serialize_constant(&type_layout(ty)?, &value)
         .ok_or_else(|| format_err!("Could not serialize constant"))
 }
 
@@ -1726,17 +1743,18 @@ fn compile_bytecode(
         IRBytecode_::CastU128 => Bytecode::CastU128,
         IRBytecode_::LdByteArray(b) => {
             let vec_value = MoveValue::vector_u8(b);
-            let type_ = MoveTypeLayout::Vector(Box::new(MoveTypeLayout::U8));
-            let constant = compile_constant(context, type_, vec_value)?;
+            let ty = Type::Vector(Box::new(Type::U8));
+            let constant = compile_constant(context, ty, vec_value)?;
             Bytecode::LdConst(context.constant_index(constant)?)
         }
         IRBytecode_::LdAddr(a) => {
             let address_value = MoveValue::Address(a);
-            let constant = compile_constant(context, MoveTypeLayout::Address, address_value)?;
+            let constant = compile_constant(context, Type::Address, address_value)?;
             Bytecode::LdConst(context.constant_index(constant)?)
         }
         IRBytecode_::LdTrue => Bytecode::LdTrue,
         IRBytecode_::LdFalse => Bytecode::LdFalse,
+        IRBytecode_::LdConst(c) => Bytecode::LdConst(context.named_constant_index(&c)?),
         IRBytecode_::CopyLoc(sp!(_, v_)) => Bytecode::CopyLoc(function_frame.get_local(&v_)?),
         IRBytecode_::MoveLoc(sp!(_, v_)) => Bytecode::MoveLoc(function_frame.get_local(&v_)?),
         IRBytecode_::StLoc(sp!(_, v_)) => Bytecode::StLoc(function_frame.get_local(&v_)?),
@@ -1886,7 +1904,6 @@ fn compile_bytecode(
         IRBytecode_::Le => Bytecode::Le,
         IRBytecode_::Ge => Bytecode::Ge,
         IRBytecode_::Abort => Bytecode::Abort,
-        IRBytecode_::GetTxnSenderAddress => Bytecode::GetTxnSenderAddress,
         IRBytecode_::Exists(n, tys) => {
             let tokens = Signature(compile_types(
                 context,
@@ -1915,21 +1932,6 @@ fn compile_bytecode(
             } else {
                 let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
                 Bytecode::MoveFromGeneric(si_idx)
-            }
-        }
-        IRBytecode_::MoveToSender(n, tys) => {
-            let tokens = Signature(compile_types(
-                context,
-                function_frame.type_parameters(),
-                &tys,
-            )?);
-            let type_actuals_id = context.signature_index(tokens)?;
-            let def_idx = context.struct_definition_index(&n)?;
-            if tys.is_empty() {
-                Bytecode::MoveToSender(def_idx)
-            } else {
-                let si_idx = context.struct_instantiation_index(def_idx, type_actuals_id)?;
-                Bytecode::MoveToSenderGeneric(si_idx)
             }
         }
         IRBytecode_::MoveTo(n, tys) => {

@@ -27,7 +27,7 @@ const MAX_UVI_PREFIX_BYTES: usize = 19;
 const MAX_SMALL_MSG_BYTES: usize = 32;
 const MAX_MEDIUM_MSG_BYTES: usize = 280;
 
-const MOCK_PEER_ID: PeerId = PeerId::DEFAULT;
+const MOCK_PEER_ID: PeerId = PeerId::ZERO;
 const TEST_PROTOCOL: ProtocolId = ProtocolId::ConsensusRpc;
 
 #[test]
@@ -122,7 +122,11 @@ pub fn fuzzer(data: &[u8]) {
 
     let f = future::try_join(f_handle_inbound, f_respond_inbound);
     // we need to use tokio runtime since Rpc uses tokio timers
-    let res = runtime::Runtime::new().unwrap().block_on(f);
+    let res = runtime::Builder::new()
+        .basic_scheduler()
+        .build()
+        .unwrap()
+        .block_on(f);
 
     // there should be no errors when testing with well-formed inputs
     if cfg!(test) {

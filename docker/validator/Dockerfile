@@ -1,4 +1,4 @@
-FROM debian:buster AS toolchain
+FROM debian:buster-20200803@sha256:a44ab0cca6cd9411032d180bc396f19bc98f71972d2398d50460145cab81c5ab AS toolchain
 
 # To use http/https proxy while building, use:
 # docker build --build-arg https_proxy=http://fwdproxy:8080 --build-arg http_proxy=http://fwdproxy:8080
@@ -12,13 +12,14 @@ WORKDIR /libra
 COPY rust-toolchain /libra/rust-toolchain
 RUN rustup install $(cat rust-toolchain)
 
+COPY cargo-toolchain /libra/cargo-toolchain
+RUN rustup install $(cat cargo-toolchain)
+
 FROM toolchain AS builder
 
 COPY . /libra
 
-ENV RUSTFLAGS "-Ctarget-cpu=skylake -Ctarget-feature=+aes,+sse2,+sse4.1,+ssse3"
-RUN cargo build --release -p libra-node -p cli -p config-builder -p safety-rules && cd target/release && rm -r build deps incremental
-RUN strip /libra/target/release/config-builder
+RUN ./docker/build-common.sh
 
 ### Production Image ###
 FROM debian:buster AS prod
@@ -29,6 +30,9 @@ RUN mkdir -p /opt/libra/bin /opt/libra/etc
 COPY docker/install-tools.sh /root
 COPY --from=builder /libra/target/release/libra-node /opt/libra/bin
 COPY --from=builder /libra/target/release/config-builder /opt/libra/bin
+COPY --from=builder /libra/target/release/db-backup /opt/libra/bin
+COPY --from=builder /libra/target/release/db-bootstrapper /opt/libra/bin
+COPY --from=builder /libra/target/release/db-restore /opt/libra/bin
 
 # Admission control
 EXPOSE 8000
@@ -36,6 +40,8 @@ EXPOSE 8000
 EXPOSE 6180
 # Metrics
 EXPOSE 9101
+# Backup
+EXPOSE 6186
 
 # Capture backtrace on error
 ENV RUST_BACKTRACE 1

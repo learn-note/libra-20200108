@@ -12,8 +12,10 @@
 //! It's used to compress mostly indexes into the main binary tables.
 use crate::file_format::Bytecode;
 use anyhow::{bail, Result};
-use byteorder::ReadBytesExt;
-use std::{io::Cursor, mem::size_of};
+use std::{
+    io::{Cursor, Read},
+    mem::size_of,
+};
 
 /// Constant values for the binary format header.
 ///
@@ -23,13 +25,54 @@ impl BinaryConstants {
     /// The blob that must start a binary.
     pub const LIBRA_MAGIC_SIZE: usize = 4;
     pub const LIBRA_MAGIC: [u8; BinaryConstants::LIBRA_MAGIC_SIZE] = [0xA1, 0x1C, 0xEB, 0x0B];
-    /// The `LIBRA_MAGIC` size, 1 byte for major version, 1 byte for minor version and 1 byte
+    /// The `LIBRA_MAGIC` size, 4 byte for major version and 1 byte
     /// for table count.
-    pub const HEADER_SIZE: usize = BinaryConstants::LIBRA_MAGIC_SIZE + 3;
+    pub const HEADER_SIZE: usize = BinaryConstants::LIBRA_MAGIC_SIZE + 5;
     /// A (Table Type, Start Offset, Byte Count) size, which is 1 byte for the type and
     /// 4 bytes for the offset/count.
     pub const TABLE_HEADER_SIZE: u8 = size_of::<u32>() as u8 * 2 + 1;
 }
+
+pub const TABLE_COUNT_MAX: u64 = 255;
+
+pub const TABLE_OFFSET_MAX: u64 = 0xffff_ffff;
+pub const TABLE_SIZE_MAX: u64 = 0xffff_ffff;
+pub const TABLE_CONTENT_SIZE_MAX: u64 = 0xffff_ffff;
+
+pub const TABLE_INDEX_MAX: u64 = 65535;
+pub const SIGNATURE_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const ADDRESS_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const IDENTIFIER_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const MODULE_HANDLE_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const STRUCT_HANDLE_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const STRUCT_DEF_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const FUNCTION_HANDLE_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const FUNCTION_INST_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const FIELD_HANDLE_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const FIELD_INST_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const STRUCT_DEF_INST_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+pub const CONSTANT_INDEX_MAX: u64 = TABLE_INDEX_MAX;
+
+pub const BYTECODE_COUNT_MAX: u64 = 65535;
+pub const BYTECODE_INDEX_MAX: u64 = 65535;
+
+pub const LOCAL_INDEX_MAX: u64 = 255;
+
+pub const IDENTIFIER_SIZE_MAX: u64 = 65535;
+
+pub const CONSTANT_SIZE_MAX: u64 = 65535;
+
+pub const SIGNATURE_SIZE_MAX: u64 = 255;
+
+pub const ACQUIRES_COUNT_MAX: u64 = 255;
+
+pub const FIELD_COUNT_MAX: u64 = 255;
+pub const FIELD_OFFSET_MAX: u64 = 255;
+
+pub const TYPE_PARAMETER_COUNT_MAX: u64 = 255;
+pub const TYPE_PARAMETER_INDEX_MAX: u64 = 65536;
+
+pub const SIGNATURE_TOKEN_DEPTH_MAX: usize = 256;
 
 /// Constants for table types in the binary.
 ///
@@ -48,13 +91,11 @@ pub enum TableType {
     CONSTANT_POOL           = 0x6,
     IDENTIFIERS             = 0x7,
     ADDRESS_IDENTIFIERS     = 0x8,
-    MAIN                    = 0x9,
     STRUCT_DEFS             = 0xA,
     STRUCT_DEF_INST         = 0xB,
     FUNCTION_DEFS           = 0xC,
     FIELD_HANDLE            = 0xD,
     FIELD_INST              = 0xE,
-    MISC                    = 0xF,
 }
 
 /// Constants for signature blob values.
@@ -150,12 +191,12 @@ pub enum Opcodes {
     LE                          = 0x25,
     GE                          = 0x26,
     ABORT                       = 0x27,
-    GET_TXN_SENDER              = 0x28,
+    NOP                         = 0x28,
     EXISTS                      = 0x29,
     MUT_BORROW_GLOBAL           = 0x2A,
     IMM_BORROW_GLOBAL           = 0x2B,
     MOVE_FROM                   = 0x2C,
-    MOVE_TO_SENDER              = 0x2D,
+    MOVE_TO                     = 0x2D,
     FREEZE_REF                  = 0x2E,
     SHL                         = 0x2F,
     SHR                         = 0x30,
@@ -173,18 +214,15 @@ pub enum Opcodes {
     MUT_BORROW_GLOBAL_GENERIC   = 0x3C,
     IMM_BORROW_GLOBAL_GENERIC   = 0x3D,
     MOVE_FROM_GENERIC           = 0x3E,
-    MOVE_TO_SENDER_GENERIC      = 0x3F,
-    NOP                         = 0x40,
-    MOVE_TO                     = 0x41,
-    MOVE_TO_GENERIC             = 0x42,
+    MOVE_TO_GENERIC             = 0x3F,
 }
 
 /// Upper limit on the binary size
 pub const BINARY_SIZE_LIMIT: usize = usize::max_value();
 
 /// A wrapper for the binary vector
-#[derive(Default)]
-pub struct BinaryData {
+#[derive(Default, Debug)]
+pub(crate) struct BinaryData {
     _binary: Vec<u8>,
 }
 
@@ -236,10 +274,12 @@ impl BinaryData {
         self._binary.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self._binary.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self._binary.clear();
     }
@@ -251,23 +291,14 @@ impl From<Vec<u8>> for BinaryData {
     }
 }
 
-/// Take a `Vec<u8>` and a value to write to that vector and applies LEB128 logic to
-/// compress the u16.
-pub fn write_u16_as_uleb128(binary: &mut BinaryData, value: u16) -> Result<()> {
-    write_u32_as_uleb128(binary, u32::from(value))
-}
-
-/// Take a `Vec<u8>` and a value to write to that vector and applies LEB128 logic to
-/// compress the u32.
-pub fn write_u32_as_uleb128(binary: &mut BinaryData, value: u32) -> Result<()> {
-    let mut val = value;
+pub(crate) fn write_u64_as_uleb128(binary: &mut BinaryData, mut val: u64) -> Result<()> {
     loop {
-        let v: u8 = (val & 0x7f) as u8;
-        if u32::from(v) != val {
-            binary.push(v | 0x80)?;
+        let cur = val & 0x7f;
+        if cur != val {
+            binary.push((cur | 0x80) as u8)?;
             val >>= 7;
         } else {
-            binary.push(v)?;
+            binary.push(cur as u8)?;
             break;
         }
     }
@@ -275,77 +306,61 @@ pub fn write_u32_as_uleb128(binary: &mut BinaryData, value: u32) -> Result<()> {
 }
 
 /// Write a `u16` in Little Endian format.
-pub fn write_u16(binary: &mut BinaryData, value: u16) -> Result<()> {
+#[allow(dead_code)]
+pub(crate) fn write_u16(binary: &mut BinaryData, value: u16) -> Result<()> {
     binary.extend(&value.to_le_bytes())
 }
 
 /// Write a `u32` in Little Endian format.
-pub fn write_u32(binary: &mut BinaryData, value: u32) -> Result<()> {
+pub(crate) fn write_u32(binary: &mut BinaryData, value: u32) -> Result<()> {
     binary.extend(&value.to_le_bytes())
 }
 
 /// Write a `u64` in Little Endian format.
-pub fn write_u64(binary: &mut BinaryData, value: u64) -> Result<()> {
+pub(crate) fn write_u64(binary: &mut BinaryData, value: u64) -> Result<()> {
     binary.extend(&value.to_le_bytes())
 }
 
 /// Write a `u128` in Little Endian format.
-pub fn write_u128(binary: &mut BinaryData, value: u128) -> Result<()> {
+pub(crate) fn write_u128(binary: &mut BinaryData, value: u128) -> Result<()> {
     binary.extend(&value.to_le_bytes())
 }
 
-/// Reads a `u16` in ULEB128 format from a `binary`.
-///
-/// Takes a `&mut Cursor<&[u8]>` and returns a pair:
-///
-/// u16 - value read
-///
-/// Return an error on an invalid representation.
-pub fn read_uleb128_as_u16(cursor: &mut Cursor<&[u8]>) -> Result<u16> {
-    let mut value: u32 = 0;
-    let mut shift: u8 = 0;
-    while let Ok(byte) = cursor.read_u8() {
-        let val = byte & 0x7f;
-        value |= u32::from(val) << shift;
-        if val == byte {
-            if (shift > 0 && val == 0) || value > u32::from(std::u16::MAX) {
-                bail!("invalid ULEB128 representation for u16");
-            }
-            return Ok(value as u16);
-        }
-        shift += 7;
-        if shift > 14 {
-            break;
-        }
-    }
-    bail!("invalid ULEB128 representation for u16")
+pub fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
+    let mut buf = [0; 4];
+    cursor.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
 }
 
-/// Reads a `u32` in ULEB128 format from a `binary`.
-///
-/// Takes a `&mut Cursor<&[u8]>` and returns a pair:
-///
-/// u32 - value read
-///
-/// Return an error on an invalid representation.
-pub fn read_uleb128_as_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
+pub fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8> {
+    let mut buf = [0; 1];
+    cursor.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+pub fn read_uleb128_as_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     let mut value: u64 = 0;
-    let mut shift: u8 = 0;
-    while let Ok(byte) = cursor.read_u8() {
-        let val = byte & 0x7f;
-        value |= u64::from(val) << shift;
-        if val == byte {
-            if (shift > 0 && val == 0) || value > std::u32::MAX.into() {
-                bail!("invalid ULEB128 representation for u32");
-            }
-            return Ok(value as u32);
+    let mut shift = 0;
+    while let Ok(byte) = read_u8(cursor) {
+        let cur = (byte & 0x7f) as u64;
+        if (cur << shift) >> shift != cur {
+            bail!("invalid ULEB128 repr for usize");
         }
+        value |= cur << shift;
+
+        if (byte & 0x80) == 0 {
+            if shift > 0 && cur == 0 {
+                bail!("invalid ULEB128 repr for usize");
+            }
+            return Ok(value);
+        }
+
         shift += 7;
-        if shift > 28 {
+        if shift > size_of::<u64>() * 8 {
             break;
         }
     }
-    bail!("invalid ULEB128 representation for u32")
+    bail!("invalid ULEB128 repr for usize");
 }
 
 /// The encoding of the instruction is the serialized form of it, but disregarding the
@@ -409,14 +424,11 @@ pub fn instruction_key(instruction: &Bytecode) -> u8 {
         Le => Opcodes::LE,
         Ge => Opcodes::GE,
         Abort => Opcodes::ABORT,
-        GetTxnSenderAddress => Opcodes::GET_TXN_SENDER,
+        Nop => Opcodes::NOP,
         Exists(_) => Opcodes::EXISTS,
         ExistsGeneric(_) => Opcodes::EXISTS_GENERIC,
         MoveFrom(_) => Opcodes::MOVE_FROM,
         MoveFromGeneric(_) => Opcodes::MOVE_FROM_GENERIC,
-        MoveToSender(_) => Opcodes::MOVE_TO_SENDER,
-        MoveToSenderGeneric(_) => Opcodes::MOVE_TO_SENDER_GENERIC,
-        Nop => Opcodes::NOP,
         MoveTo(_) => Opcodes::MOVE_TO,
         MoveToGeneric(_) => Opcodes::MOVE_TO_GENERIC,
     };

@@ -77,6 +77,7 @@ pub enum Tok {
     RBrace,
     Fun,
     Script,
+    Const,
 }
 
 impl fmt::Display for Tok {
@@ -152,6 +153,7 @@ impl fmt::Display for Tok {
             RBrace => "}",
             Fun => "fun",
             Script => "script",
+            Const => "const",
         };
         fmt::Display::fmt(s, formatter)
     }
@@ -213,6 +215,18 @@ impl<'input> Lexer<'input> {
         let offset = self.text.len() - text.len();
         let (tok, _) = find_token(self.file, text, offset)?;
         Ok(tok)
+    }
+
+    // Look ahead to the next two tokens after the current one and return them without advancing
+    // the state of the lexer.
+    pub fn lookahead2(&self) -> Result<(Tok, Tok), Error> {
+        let text = self.text[self.cur_end..].trim_start();
+        let offset = self.text.len() - text.len();
+        let (first, length) = find_token(self.file, text, offset)?;
+        let text2 = self.text[offset + length..].trim_start();
+        let offset2 = self.text.len() - text2.len();
+        let (second, _) = find_token(self.file, text2, offset2)?;
+        Ok((first, second))
     }
 
     // Matches the doc comments after the last token (or the beginning of the file) to the position
@@ -474,6 +488,7 @@ fn get_name_token(name: &str) -> Tok {
         "acquires" => Tok::Acquires,
         "as" => Tok::As,
         "break" => Tok::Break,
+        "const" => Tok::Const,
         "continue" => Tok::Continue,
         "copy" => Tok::Copy,
         "copyable" => Tok::Copyable,

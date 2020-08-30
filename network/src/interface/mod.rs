@@ -12,7 +12,7 @@
 //! [`NetworkProvider`] actor. Inbound RPC requests are forwarded to the appropriate
 //! handler, determined using the protocol negotiated on the RPC substream.
 use crate::{
-    counters,
+    constants, counters,
     peer::{Peer, PeerHandle, PeerNotification},
     peer_manager::TransportNotification,
     protocols::{
@@ -20,7 +20,7 @@ use crate::{
         rpc::{InboundRpcRequest, OutboundRpcRequest, Rpc, RpcNotification},
     },
     transport::Connection,
-    validator_network, ProtocolId,
+    ProtocolId,
 };
 use channel::{self, libra_channel, message_queues::QueueStyle};
 use futures::{
@@ -69,11 +69,12 @@ where
         max_concurrent_reqs: usize,
         max_concurrent_notifs: usize,
         channel_size: usize,
+        max_frame_size: usize,
     ) -> (
         libra_channel::Sender<ProtocolId, NetworkRequest>,
         libra_channel::Receiver<ProtocolId, NetworkNotification>,
     ) {
-        let peer_id = connection.metadata.peer_id();
+        let peer_id = connection.metadata.peer_id;
 
         // Setup and start Peer actor.
         let (peer_reqs_tx, peer_reqs_rx) = channel::new(
@@ -110,6 +111,7 @@ where
             peer_notifs_tx,
             peer_rpc_notifs_tx,
             peer_ds_notifs_tx,
+            max_frame_size,
         );
         executor.spawn(peer.start());
 
@@ -129,9 +131,9 @@ where
             rpc_reqs_rx,
             peer_rpc_notifs_rx,
             rpc_notifs_tx,
-            Duration::from_millis(validator_network::network_builder::INBOUND_RPC_TIMEOUT_MS),
-            validator_network::network_builder::MAX_CONCURRENT_OUTBOUND_RPCS,
-            validator_network::network_builder::MAX_CONCURRENT_INBOUND_RPCS,
+            Duration::from_millis(constants::INBOUND_RPC_TIMEOUT_MS),
+            constants::MAX_CONCURRENT_OUTBOUND_RPCS,
+            constants::MAX_CONCURRENT_INBOUND_RPCS,
         );
         executor.spawn(rpc.start());
 
@@ -302,7 +304,10 @@ where
                 }
             }
             _ => {
-                unreachable!("Unexpected notification received from Peer actor");
+                warn!(
+                    "Unexpected notification received from Peer actor: {:?}",
+                    notif
+                );
             }
         }
     }

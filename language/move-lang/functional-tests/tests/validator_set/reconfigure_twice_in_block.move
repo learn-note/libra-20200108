@@ -14,24 +14,24 @@
 // check: EXECUTED
 
 //! new-transaction
-//! sender: alice
+//! sender: libraroot
 script {
-use 0x0::LibraSystem;
-fun main() {
-    LibraSystem::remove_validator({{alice}});
-}
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{alice}});
+    }
 }
 
 // check: NewEpochEvent
 // check: EXECUTED
 
 //! new-transaction
-//! sender: bob
+//! sender: libraroot
 script {
-use 0x0::LibraSystem;
-fun main() {
-    LibraSystem::remove_validator({{bob}});
-}
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{bob}});
+    }
 }
 
 // check: ABORTED
@@ -43,12 +43,12 @@ fun main() {
 // check: EXECUTED
 
 //! new-transaction
-//! sender: bob
+//! sender: libraroot
 script {
-use 0x0::LibraSystem;
-fun main() {
-    LibraSystem::remove_validator({{bob}});
-}
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{bob}});
+    }
 }
 
 // check: NewEpochEvent

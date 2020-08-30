@@ -2,105 +2,122 @@
 // are executed, and the order in which they are executed in genesis. Note
 // however, that there are certain calls that remain in Rust code in
 // genesis (for now).
-address 0x0 {
+address 0x1 {
 module Genesis {
-    use 0x0::Association;
-    use 0x0::Coin1;
-    use 0x0::Coin2;
-    use 0x0::Event;
-    use 0x0::LBR;
-    use 0x0::Libra;
-    use 0x0::LibraAccount;
-    use 0x0::LibraBlock;
-    use 0x0::LibraConfig;
-    use 0x0::LibraSystem;
-    use 0x0::LibraTimestamp;
-    use 0x0::LibraTransactionTimeout;
-    use 0x0::LibraVersion;
-    use 0x0::LibraWriteSetManager;
-    use 0x0::Signer;
-    use 0x0::Testnet;
-    use 0x0::TransactionFee;
-    use 0x0::Unhosted;
+    use 0x1::AccountFreezing;
+    use 0x1::VASP;
+    use 0x1::ChainId;
+    use 0x1::Coin1;
+    use 0x1::Coin2;
+    use 0x1::DualAttestation;
+    use 0x1::Event;
+    use 0x1::LBR;
+    use 0x1::Libra;
+    use 0x1::LibraAccount;
+    use 0x1::LibraBlock;
+    use 0x1::LibraConfig;
+    use 0x1::LibraSystem;
+    use 0x1::LibraTimestamp;
+    use 0x1::LibraTransactionPublishingOption;
+    use 0x1::LibraVersion;
+    use 0x1::LibraWriteSetManager;
+    use 0x1::Signer;
+    use 0x1::TransactionFee;
+    use 0x1::Roles;
+    use 0x1::LibraVMConfig;
 
     fun initialize(
-        association: &signer,
-        config_account: &signer,
-        fee_account: &signer,
+        lr_account: &signer,
         tc_account: &signer,
+        lr_auth_key: vector<u8>,
         tc_addr: address,
-        tc_auth_key_prefix: vector<u8>,
-        genesis_auth_key: vector<u8>,
-        _fee_auth_key: vector<u8>,
+        tc_auth_key: vector<u8>,
+        initial_script_allow_list: vector<vector<u8>>,
+        is_open_module: bool,
+        instruction_schedule: vector<u8>,
+        native_schedule: vector<u8>,
+        chain_id: u8,
     ) {
         let dummy_auth_key_prefix = x"00000000000000000000000000000000";
 
-        // Association root setup
-        Association::initialize(association);
-        Association::grant_privilege<Libra::AddCurrency>(association, association);
+        ChainId::initialize(lr_account, chain_id);
 
-        // On-chain config setup
-        Event::publish_generator(config_account);
-        LibraConfig::initialize(config_account, association);
+        Roles::grant_libra_root_role(lr_account);
+        Roles::grant_treasury_compliance_role(tc_account, lr_account);
+
+        // Event and On-chain config setup
+        Event::publish_generator(lr_account);
+        LibraConfig::initialize(lr_account);
+
+        // Currency and VASP setup
+        Libra::initialize(lr_account);
+        VASP::initialize(lr_account);
 
         // Currency setup
-        Libra::initialize(config_account);
+        Coin1::initialize(lr_account, tc_account);
+        Coin2::initialize(lr_account, tc_account);
 
-        // Set that this is testnet
-        Testnet::initialize(association);
+        LBR::initialize(
+            lr_account,
+            tc_account,
+        );
 
-        // Event and currency setup
-        Event::publish_generator(association);
-        let (coin1_mint_cap, coin1_burn_cap) = Coin1::initialize(association);
-        let (coin2_mint_cap, coin2_burn_cap) = Coin2::initialize(association);
-        LBR::initialize(association);
-
-        LibraAccount::initialize(association);
-        Unhosted::publish_global_limits_definition(association);
-        LibraAccount::create_genesis_account<LBR::T>(
-            Signer::address_of(association),
+        AccountFreezing::initialize(lr_account);
+        LibraAccount::initialize(lr_account);
+        LibraAccount::create_libra_root_account(
+            Signer::address_of(lr_account),
             copy dummy_auth_key_prefix,
         );
-        Libra::grant_mint_capability_to_association<Coin1::T>(association);
-        Libra::grant_mint_capability_to_association<Coin2::T>(association);
 
-        // Register transaction fee accounts
-        LibraAccount::create_testnet_account<LBR::T>(0xFEE, copy dummy_auth_key_prefix);
-        TransactionFee::add_txn_fee_currency(fee_account, &coin1_burn_cap);
-        TransactionFee::add_txn_fee_currency(fee_account, &coin2_burn_cap);
-        TransactionFee::initialize(tc_account, fee_account);
+        // Register transaction fee resource
+        TransactionFee::initialize(
+            lr_account,
+            tc_account,
+        );
 
         // Create the treasury compliance account
-        LibraAccount::create_treasury_compliance_account<LBR::T>(
-            association,
+        LibraAccount::create_treasury_compliance_account(
+            lr_account,
             tc_addr,
-            tc_auth_key_prefix,
-            coin1_mint_cap,
-            coin1_burn_cap,
-            coin2_mint_cap,
-            coin2_burn_cap,
+            copy dummy_auth_key_prefix,
         );
 
-        // Create the config account
-        LibraAccount::create_genesis_account<LBR::T>(
-            LibraConfig::default_config_address(),
-            dummy_auth_key_prefix
+        LibraSystem::initialize_validator_set(
+            lr_account,
+        );
+        LibraVersion::initialize(
+            lr_account,
+        );
+        DualAttestation::initialize(
+            lr_account,
+        );
+        LibraBlock::initialize_block_metadata(lr_account);
+        LibraWriteSetManager::initialize(lr_account);
+        LibraTimestamp::initialize(lr_account);
+
+        let lr_rotate_key_cap = LibraAccount::extract_key_rotation_capability(lr_account);
+        LibraAccount::rotate_authentication_key(&lr_rotate_key_cap, lr_auth_key);
+        LibraAccount::restore_key_rotation_capability(lr_rotate_key_cap);
+
+        LibraTransactionPublishingOption::initialize(
+            lr_account,
+            initial_script_allow_list,
+            is_open_module,
         );
 
-        LibraTransactionTimeout::initialize(association);
-        LibraSystem::initialize_validator_set(config_account);
-        LibraVersion::initialize(config_account);
+        LibraVMConfig::initialize(
+            lr_account,
+            instruction_schedule,
+            native_schedule,
+        );
 
-        LibraBlock::initialize_block_metadata(association);
-        LibraWriteSetManager::initialize(association);
-        LibraTimestamp::initialize(association);
-        LibraAccount::rotate_authentication_key(copy genesis_auth_key);
+        let tc_rotate_key_cap = LibraAccount::extract_key_rotation_capability(tc_account);
+        LibraAccount::rotate_authentication_key(&tc_rotate_key_cap, tc_auth_key);
+        LibraAccount::restore_key_rotation_capability(tc_rotate_key_cap);
+
+        // Mark that genesis has finished. This must appear as the last call.
+        LibraTimestamp::set_time_has_started(lr_account);
     }
 
-    // TODO: combine with the above once `rotate_authentication_key` and
-    // `publish_preburn` take a `signer` parameter.
-    fun initialize_txn_fee_account(_fee_account: &signer, auth_key: vector<u8>) {
-        LibraAccount::rotate_authentication_key(auth_key);
-    }
 }
 }

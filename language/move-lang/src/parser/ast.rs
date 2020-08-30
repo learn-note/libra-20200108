@@ -66,6 +66,7 @@ pub enum Definition {
 pub struct Script {
     pub loc: Loc,
     pub uses: Vec<Use>,
+    pub constants: Vec<Constant>,
     pub function: Function,
     pub specs: Vec<SpecBlock>,
 }
@@ -103,6 +104,7 @@ pub enum ModuleMember {
     Struct(StructDefinition),
     Spec(SpecBlock),
     Use(Use),
+    Constant(Constant),
 }
 
 //**************************************************************************************************
@@ -170,6 +172,20 @@ pub struct Function {
 }
 
 //**************************************************************************************************
+// Constants
+//**************************************************************************************************
+
+new_name!(ConstantName);
+
+#[derive(PartialEq, Debug)]
+pub struct Constant {
+    pub loc: Loc,
+    pub signature: Type,
+    pub name: ConstantName,
+    pub value: Exp,
+}
+
+//**************************************************************************************************
 // Specification Blocks
 //**************************************************************************************************
 
@@ -225,9 +241,12 @@ pub type SpecApplyFragment = Spanned<SpecApplyFragment_>;
 pub enum SpecBlockMember_ {
     Condition {
         kind: SpecConditionKind,
+        properties: Vec<PragmaProperty>,
         exp: Exp,
+        additional_exps: Vec<Exp>,
     },
     Function {
+        uninterpreted: bool,
         name: FunctionName,
         signature: FunctionSignature,
         body: FunctionBody,
@@ -237,6 +256,10 @@ pub enum SpecBlockMember_ {
         name: Name,
         type_parameters: Vec<(Name, Kind)>,
         type_: Type,
+    },
+    Let {
+        name: Name,
+        def: Exp,
     },
     Include {
         exp: Exp,
@@ -260,6 +283,9 @@ pub enum SpecConditionKind {
     Assume,
     Decreases,
     AbortsIf,
+    AbortsWith,
+    SucceedsIf,
+    Modifies,
     Ensures,
     Requires,
     RequiresModule,
@@ -270,7 +296,7 @@ pub enum SpecConditionKind {
     InvariantModule,
 }
 
-// Specification invaiant kind.
+// Specification invariant kind.
 #[derive(Debug, PartialEq)]
 pub enum InvariantKind {
     Data,
@@ -290,8 +316,6 @@ pub enum InvariantKind {
 pub enum ModuleAccess_ {
     // N
     Name(Name),
-    // ::N
-    Global(Name),
     // M.S
     ModuleAccess(ModuleName, Name),
     // OxADDR.M.S
@@ -368,14 +392,14 @@ pub enum Value_ {
 }
 pub type Value = Spanned<Value_>;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum UnaryOp_ {
     // !
     Not,
 }
 pub type UnaryOp = Spanned<UnaryOp_>;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum BinOp_ {
     // Int ops
     // +
@@ -505,7 +529,7 @@ pub type Exp = Spanned<Exp_>;
 // { e1; ... ; en }
 // { e1; ... ; en; }
 // The Loc field holds the source location of the final semicolon, if there is one.
-pub type Sequence = (Vec<SequenceItem>, Option<Loc>, Box<Option<Exp>>);
+pub type Sequence = (Vec<Use>, Vec<SequenceItem>, Option<Loc>, Box<Option<Exp>>);
 #[derive(Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum SequenceItem_ {
@@ -736,11 +760,17 @@ impl AstDebug for Script {
         let Script {
             loc: _loc,
             uses,
+            constants,
             function,
             specs,
         } = self;
         for u in uses {
             u.ast_debug(w);
+            w.new_line();
+        }
+        w.new_line();
+        for cdef in constants {
+            cdef.ast_debug(w);
             w.new_line();
         }
         w.new_line();
@@ -775,6 +805,7 @@ impl AstDebug for ModuleMember {
             ModuleMember::Struct(s) => s.ast_debug(w),
             ModuleMember::Spec(s) => s.ast_debug(w),
             ModuleMember::Use(u) => u.ast_debug(w),
+            ModuleMember::Constant(c) => c.ast_debug(w),
         }
     }
 }
@@ -872,6 +903,9 @@ impl AstDebug for SpecConditionKind {
             Assume => w.write("assume "),
             Decreases => w.write("decreases "),
             AbortsIf => w.write("aborts_if "),
+            AbortsWith => w.write("aborts_with "),
+            SucceedsIf => w.write("succeeds_if "),
+            Modifies => w.write("modifies "),
             Ensures => w.write("ensures "),
             Requires => w.write("requires "),
             RequiresModule => w.write("requires module "),
@@ -887,16 +921,28 @@ impl AstDebug for SpecConditionKind {
 impl AstDebug for SpecBlockMember_ {
     fn ast_debug(&self, w: &mut AstWriter) {
         match self {
-            SpecBlockMember_::Condition { kind, exp } => {
+            SpecBlockMember_::Condition {
+                kind,
+                properties: _,
+                exp,
+                additional_exps,
+            } => {
                 kind.ast_debug(w);
                 exp.ast_debug(w);
+                w.list(additional_exps, ",", |w, e| {
+                    e.ast_debug(w);
+                    true
+                });
             }
             SpecBlockMember_::Function {
+                uninterpreted,
                 signature,
                 name,
                 body,
             } => {
-                if let FunctionBody_::Native = &body.value {
+                if *uninterpreted {
+                    w.write("uninterpreted ");
+                } else if let FunctionBody_::Native = &body.value {
                     w.write("native ");
                 }
                 w.write("fun ");
@@ -922,6 +968,10 @@ impl AstDebug for SpecBlockMember_ {
                 type_parameters.ast_debug(w);
                 w.write(": ");
                 type_.ast_debug(w);
+            }
+            SpecBlockMember_::Let { name, def } => {
+                w.write(&format!("let {} = ", name));
+                def.ast_debug(w);
             }
             SpecBlockMember_::Include { exp } => {
                 w.write("include ");
@@ -1005,7 +1055,7 @@ impl AstDebug for Function {
         if let FunctionBody_::Native = &body.value {
             w.write("native ");
         }
-        w.write(&format!("{}", name));
+        w.write(&format!("fun {}", name));
         signature.ast_debug(w);
         if !acquires.is_empty() {
             w.write(" acquires ");
@@ -1044,6 +1094,22 @@ impl AstDebug for FunctionSignature {
         w.write(")");
         w.write(": ");
         return_type.ast_debug(w)
+    }
+}
+
+impl AstDebug for Constant {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        let Constant {
+            loc: _loc,
+            name,
+            signature,
+            value,
+        } = self;
+        w.write(&format!("const {}:", name));
+        signature.ast_debug(w);
+        w.write(" = ");
+        value.ast_debug(w);
+        w.write(";");
     }
 }
 
@@ -1127,16 +1193,19 @@ impl AstDebug for ModuleAccess_ {
     fn ast_debug(&self, w: &mut AstWriter) {
         w.write(&match self {
             ModuleAccess_::Name(n) => format!("{}", n),
-            ModuleAccess_::Global(n) => format!("::{}", n),
             ModuleAccess_::ModuleAccess(m, n) => format!("{}::{}", m, n),
             ModuleAccess_::QualifiedModuleAccess(m, n) => format!("{}::{}", m, n),
         })
     }
 }
 
-impl AstDebug for (Vec<SequenceItem>, Option<Loc>, Box<Option<Exp>>) {
+impl AstDebug for (Vec<Use>, Vec<SequenceItem>, Option<Loc>, Box<Option<Exp>>) {
     fn ast_debug(&self, w: &mut AstWriter) {
-        let (seq, _, last_e) = self;
+        let (uses, seq, _, last_e) = self;
+        for u in uses {
+            u.ast_debug(w);
+            w.new_line();
+        }
         w.semicolon(seq, |w, item| item.ast_debug(w));
         if !seq.is_empty() {
             w.writeln(";")

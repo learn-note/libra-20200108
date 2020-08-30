@@ -1,3 +1,4 @@
+//! new-transaction
 module Test {
     struct T { b: bool }
 
@@ -13,9 +14,7 @@ use {{default}}::Test;
 
 fun main() {
     let t = Test::new_t();
-    Test::T { b: _ } = t;
+    Test { b: _ } = t;
 }
 }
-
-// check: error:
-// check: Status(Failure)
+// check: MoveSourceCompilerError

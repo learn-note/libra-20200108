@@ -3,15 +3,15 @@
 
 use anyhow::Result;
 use libra_config::config::{KeyManagerConfig as KMConfig, SecureBackend, Token, VaultConfig};
-use libra_types::account_address::AccountAddress;
+use libra_types::chain_id::ChainId;
 
 pub struct KeyManagerConfig {
     pub rotation_period_secs: Option<u64>,
     pub sleep_period_secs: Option<u64>,
     pub txn_expiration_secs: Option<u64>,
 
+    pub chain_id: ChainId,
     pub json_rpc_endpoint: String,
-    pub validator_account: AccountAddress,
 
     pub vault_host: String,
     pub vault_namespace: Option<String>,
@@ -27,8 +27,8 @@ impl Default for KeyManagerConfig {
             rotation_period_secs: None,
             sleep_period_secs: None,
             txn_expiration_secs: None,
+            chain_id: ChainId::test(),
             json_rpc_endpoint: template.json_rpc_endpoint.clone(),
-            validator_account: template.validator_account,
             vault_host: "127.0.0.1:8200".to_string(),
             vault_namespace: None,
             vault_token: "root_token".to_string(),
@@ -44,14 +44,15 @@ impl KeyManagerConfig {
 
     pub fn build(&self) -> Result<KMConfig> {
         let mut key_manager_config = self.template.clone();
+        key_manager_config.chain_id = self.chain_id;
         key_manager_config.json_rpc_endpoint = self.json_rpc_endpoint.clone();
         key_manager_config.secure_backend = SecureBackend::Vault(VaultConfig {
             ca_certificate: None,
             namespace: self.vault_namespace.clone(),
             server: self.vault_host.clone(),
-            token: Token::new_config(self.vault_token.clone()),
+            token: Token::FromConfig(self.vault_token.clone()),
+            renew_ttl_secs: None,
         });
-        key_manager_config.validator_account = self.validator_account;
 
         if let Some(rotation_period_secs) = &self.rotation_period_secs {
             key_manager_config.rotation_period_secs = *rotation_period_secs;
@@ -73,23 +74,23 @@ mod test {
 
     #[test]
     fn verify_generation() {
+        let chain_id = ChainId::test();
         let json_rpc_endpoint = "http://127.12.12.12:7873";
         let rotation_period_secs = 100;
-        let validator_account = AccountAddress::default();
         let vault_host = "182.0.0.1:8080";
         let vault_token = "root_token";
 
         let mut key_manager_config = KeyManagerConfig::new();
+        key_manager_config.chain_id = chain_id;
         key_manager_config.json_rpc_endpoint = json_rpc_endpoint.into();
         key_manager_config.rotation_period_secs = Some(rotation_period_secs);
-        key_manager_config.validator_account = validator_account;
         key_manager_config.vault_host = vault_host.into();
         key_manager_config.vault_token = vault_token.into();
 
         let key_manager_config = key_manager_config.build().unwrap();
 
+        assert_eq!(chain_id, key_manager_config.chain_id);
         assert_eq!(json_rpc_endpoint, key_manager_config.json_rpc_endpoint);
-        assert_eq!(validator_account, key_manager_config.validator_account);
         assert_eq!(
             rotation_period_secs,
             key_manager_config.rotation_period_secs

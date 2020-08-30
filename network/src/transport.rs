@@ -2,41 +2,54 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    common::NetworkPublicKeys,
-    noise_wrapper::{AntiReplayTimestamps, NoiseWrapper},
+    logging::network_events,
+    noise::{stream::NoiseStream, AntiReplayTimestamps, HandshakeAuthMode, NoiseUpgrader},
     protocols::{
-        identity::{exchange_handshake, exchange_peerid},
+        identity::exchange_handshake,
         wire::handshake::v1::{HandshakeMsg, MessagingProtocolVersion, SupportedProtocols},
     },
 };
-use futures::io::{AsyncRead, AsyncWrite};
-use libra_config::network_id::NetworkId;
-use libra_crypto::{traits::ValidCryptoMaterial, x25519};
+use futures::{
+    future::{Future, FutureExt},
+    io::{AsyncRead, AsyncWrite},
+    stream::{Stream, StreamExt, TryStreamExt},
+};
+use libra_config::{
+    config::HANDSHAKE_VERSION,
+    network_id::{NetworkContext, NetworkId},
+};
+use libra_crypto::x25519;
 use libra_logger::prelude::*;
-use libra_network_address::NetworkAddress;
-use libra_security_logger::{security_log, SecurityEvent};
-use libra_types::PeerId;
-use netcore::transport::{boxed, memory, tcp, ConnectionOrigin, TransportExt};
-use once_cell::sync::Lazy;
+use libra_network_address::{parse_dns_tcp, parse_ip_tcp, parse_memory, NetworkAddress};
+use libra_types::{chain_id::ChainId, PeerId};
+use netcore::transport::{tcp, ConnectionOrigin, Transport};
+use serde::{export::Formatter, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     convert::TryFrom,
     fmt::Debug,
     io,
-    sync::{Arc, Mutex, RwLock},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
+use tokio::time::timeout;
 
 /// A timeout for the connection to open and complete all of the upgrade steps.
 pub const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Currently supported messaging protocol version.
 /// TODO: Add ability to support more than one messaging protocol.
 pub const SUPPORTED_MESSAGING_PROTOCOL: MessagingProtocolVersion = MessagingProtocolVersion::V1;
-/// Global connection-id generator.
-static CONNECTION_ID_GENERATOR: Lazy<Arc<Mutex<ConnectionIdGenerator>>> =
-    Lazy::new(|| Arc::new(Mutex::new(ConnectionIdGenerator::new())));
 
-const LIBRA_TCP_TRANSPORT: tcp::TcpTransport = tcp::TcpTransport {
+/// Global connection-id generator.
+static CONNECTION_ID_GENERATOR: ConnectionIdGenerator = ConnectionIdGenerator::new();
+
+/// tcp::Transport with Libra-specific configuration applied.
+pub const LIBRA_TCP_TRANSPORT: tcp::TcpTransport = tcp::TcpTransport {
     // Use default options.
     recv_buffer_size: None,
     send_buffer_size: None,
@@ -46,12 +59,13 @@ const LIBRA_TCP_TRANSPORT: tcp::TcpTransport = tcp::TcpTransport {
     nodelay: Some(true),
 };
 
+/// A trait alias for "socket-like" things.
 pub trait TSocket: AsyncRead + AsyncWrite + Send + Debug + Unpin + 'static {}
 
 impl<T> TSocket for T where T: AsyncRead + AsyncWrite + Send + Debug + Unpin + 'static {}
 
 /// Unique local identifier for a connection.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize)]
 pub struct ConnectionId(u32);
 
 impl From<u32> for ConnectionId {
@@ -60,34 +74,33 @@ impl From<u32> for ConnectionId {
     }
 }
 
-/// Generator of unique ConnectionIds.
+/// Generator of unique ConnectionId's.
 struct ConnectionIdGenerator {
-    next: ConnectionId,
+    ctr: AtomicU32,
 }
 
 impl ConnectionIdGenerator {
-    fn new() -> ConnectionIdGenerator {
+    const fn new() -> ConnectionIdGenerator {
         Self {
-            next: ConnectionId(0),
+            ctr: AtomicU32::new(0),
         }
     }
 
-    fn next(&mut self) -> ConnectionId {
-        let ret = self.next;
-        self.next = ConnectionId(ret.0.wrapping_add(1));
-        ret
+    fn next(&self) -> ConnectionId {
+        let next = self.ctr.fetch_add(1, Ordering::Relaxed);
+        ConnectionId::from(next)
     }
 }
 
-/// Metadata associated with an established connection.
-#[derive(Clone, Debug)]
+/// Metadata associated with an established and fully upgraded connection.
+#[derive(Clone, Serialize)]
 pub struct ConnectionMetadata {
-    peer_id: PeerId,
-    connection_id: ConnectionId,
-    addr: NetworkAddress,
-    origin: ConnectionOrigin,
-    messaging_protocol: MessagingProtocolVersion,
-    application_protocols: SupportedProtocols,
+    pub peer_id: PeerId,
+    pub connection_id: ConnectionId,
+    pub addr: NetworkAddress,
+    pub origin: ConnectionOrigin,
+    pub messaging_protocol: MessagingProtocolVersion,
+    pub application_protocols: SupportedProtocols,
 }
 
 impl ConnectionMetadata {
@@ -108,21 +121,25 @@ impl ConnectionMetadata {
             application_protocols,
         }
     }
+}
 
-    pub fn peer_id(&self) -> PeerId {
-        self.peer_id
+impl std::fmt::Debug for ConnectionMetadata {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
     }
+}
 
-    pub fn connection_id(&self) -> ConnectionId {
-        self.connection_id
-    }
-
-    pub fn addr(&self) -> &NetworkAddress {
-        &self.addr
-    }
-
-    pub fn origin(&self) -> ConnectionOrigin {
-        self.origin
+impl std::fmt::Display for ConnectionMetadata {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{},{},{},{},{:?}]",
+            self.peer_id,
+            self.addr,
+            self.origin,
+            self.messaging_protocol,
+            self.application_protocols
+        )
     }
 }
 
@@ -134,340 +151,390 @@ pub struct Connection<TSocket> {
     pub metadata: ConnectionMetadata,
 }
 
-fn identity_key_to_peer_id(
-    trusted_peers: &RwLock<HashMap<PeerId, NetworkPublicKeys>>,
-    remote_static_key: &[u8],
-) -> Option<PeerId> {
-    for (peer_id, public_keys) in trusted_peers.read().unwrap().iter() {
-        if public_keys.identity_public_key.to_bytes() == remote_static_key {
-            return Some(*peer_id);
+/// Convenience function for adding a timeout to a Future that returns an `io::Result`.
+async fn timeout_io<F, T>(duration: Duration, fut: F) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    let res = timeout(duration, fut).await;
+    match res {
+        Ok(out) => out,
+        Err(err) => Err(io::Error::new(io::ErrorKind::TimedOut, err)),
+    }
+}
+
+/// Common context for performing both inbound and outbound connection upgrades.
+struct UpgradeContext {
+    noise: NoiseUpgrader,
+    handshake_version: u8,
+    supported_protocols: BTreeMap<MessagingProtocolVersion, SupportedProtocols>,
+    chain_id: ChainId,
+    network_id: NetworkId,
+}
+
+/// Upgrade an inbound connection. This means we run a Noise IK handshake for
+/// authentication and then negotiate common supported protocols. If
+/// `ctxt.trusted_peers` is `Some(_)`, then we will only allow connections from
+/// peers with a pubkey in this set. Otherwise, we will allow inbound connections
+/// from any pubkey.
+async fn upgrade_inbound<T: TSocket>(
+    ctxt: Arc<UpgradeContext>,
+    fut_socket: impl Future<Output = io::Result<T>>,
+    addr: NetworkAddress,
+) -> io::Result<Connection<NoiseStream<T>>> {
+    let origin = ConnectionOrigin::Inbound;
+    let socket = fut_socket.await?;
+
+    // try authenticating via noise handshake
+    let (mut socket, remote_peer_id) = ctxt.noise.upgrade_inbound(socket).await.map_err(|err| {
+        // security logging
+        sl_warn!(security_log(security_events::INVALID_NETWORK_PEER)
+            .data_display("error", &err)
+            .field(network_events::NETWORK_ADDRESS, &addr));
+        err
+    })?;
+    let remote_pubkey = socket.get_remote_static();
+    let addr = addr.append_prod_protos(remote_pubkey, HANDSHAKE_VERSION);
+
+    // exchange HandshakeMsg
+    let handshake_msg = HandshakeMsg {
+        supported_protocols: ctxt.supported_protocols.clone(),
+        chain_id: ctxt.chain_id,
+        network_id: ctxt.network_id.clone(),
+    };
+    let remote_handshake = exchange_handshake(&handshake_msg, &mut socket).await?;
+
+    // try to negotiate common libranet version and supported application protocols
+    let (messaging_protocol, application_protocols) = handshake_msg
+        .perform_handshake(&remote_handshake)
+        .map_err(|err| {
+            sl_warn!(security_log(security_events::INVALID_NETWORK_HANDSHAKE_MSG)
+                .data_display("error", &err)
+                .data("origin", "inbound")
+                .data("remote_peer", remote_peer_id));
+            let err = format!(
+                "handshake negotiation with peer {} failed: {}",
+                remote_peer_id, err
+            );
+            io::Error::new(io::ErrorKind::Other, err)
+        })?;
+
+    // return successful connection
+    Ok(Connection {
+        socket,
+        metadata: ConnectionMetadata::new(
+            remote_peer_id,
+            CONNECTION_ID_GENERATOR.next(),
+            addr,
+            origin,
+            messaging_protocol,
+            application_protocols,
+        ),
+    })
+}
+
+/// Upgrade an inbound connection. This means we run a Noise IK handshake for
+/// authentication and then negotiate common supported protocols.
+async fn upgrade_outbound<T: TSocket>(
+    ctxt: Arc<UpgradeContext>,
+    fut_socket: impl Future<Output = io::Result<T>>,
+    addr: NetworkAddress,
+    remote_peer_id: PeerId,
+    remote_pubkey: x25519::PublicKey,
+) -> io::Result<Connection<NoiseStream<T>>> {
+    let origin = ConnectionOrigin::Outbound;
+    let socket = fut_socket.await?;
+
+    // noise handshake
+    let mut socket = ctxt
+        .noise
+        .upgrade_outbound(socket, remote_pubkey, AntiReplayTimestamps::now)
+        .await?;
+
+    // sanity check: Noise IK should always guarantee this is true
+    debug_assert_eq!(remote_pubkey, socket.get_remote_static());
+
+    // exchange HandshakeMsg
+    let handshake_msg = HandshakeMsg {
+        supported_protocols: ctxt.supported_protocols.clone(),
+        chain_id: ctxt.chain_id,
+        network_id: ctxt.network_id.clone(),
+    };
+    let remote_handshake = exchange_handshake(&handshake_msg, &mut socket).await?;
+
+    // try to negotiate common libranet version and supported application protocols
+    let (messaging_protocol, application_protocols) = handshake_msg
+        .perform_handshake(&remote_handshake)
+        .map_err(|e| {
+            // TODO(mimoo): security log?
+            let e = format!(
+                "handshake negotiation with peer {} failed: {}",
+                remote_peer_id, e
+            );
+            io::Error::new(io::ErrorKind::Other, e)
+        })?;
+
+    // return successful connection
+    Ok(Connection {
+        socket,
+        metadata: ConnectionMetadata::new(
+            remote_peer_id,
+            CONNECTION_ID_GENERATOR.next(),
+            addr,
+            origin,
+            messaging_protocol,
+            application_protocols,
+        ),
+    })
+}
+
+/// The common LibraNet Transport.
+///
+/// The base transport layer is pluggable, so long as it provides a reliable,
+/// ordered, connection-oriented, byte-stream abstraction (e.g., TCP). We currently
+/// use either `MemoryTransport` or `TcpTransport` as this base layer.
+///
+/// Inbound and outbound connections are first established with the `base_transport`
+/// and then negotiate a secure, authenticated transport layer (currently Noise
+/// protocol). Finally, we negotiate common supported application protocols with
+/// the `Handshake` protocol.
+// TODO(philiphayes): rework Transport trait, possibly include Upgrade trait.
+// ideas in this PR thread: https://github.com/libra/libra/pull/3478#issuecomment-617385633
+pub struct LibraNetTransport<TTransport> {
+    base_transport: TTransport,
+    ctxt: Arc<UpgradeContext>,
+    identity_pubkey: x25519::PublicKey,
+}
+
+impl<TTransport> LibraNetTransport<TTransport>
+where
+    TTransport: Transport<Error = io::Error>,
+    TTransport::Output: TSocket,
+    TTransport::Outbound: Send + 'static,
+    TTransport::Inbound: Send + 'static,
+    TTransport::Listener: Send + 'static,
+{
+    pub fn new(
+        base_transport: TTransport,
+        network_context: Arc<NetworkContext>,
+        identity_key: x25519::PrivateKey,
+        trusted_peers: Option<Arc<RwLock<HashMap<PeerId, HashSet<x25519::PublicKey>>>>>,
+        handshake_version: u8,
+        chain_id: ChainId,
+        application_protocols: SupportedProtocols,
+    ) -> Self {
+        // build supported protocols
+        let mut supported_protocols = BTreeMap::new();
+        supported_protocols.insert(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
+
+        // create upgrade context
+        // TODO(mimoo): should we build this based on the networkid, and not on trusted peers
+        let auth_mode = match trusted_peers.as_ref() {
+            Some(trusted_peers) => HandshakeAuthMode::mutual(trusted_peers.clone()),
+            None => HandshakeAuthMode::ServerOnly,
+        };
+        let identity_pubkey = identity_key.public_key();
+        let network_id = network_context.network_id().clone();
+
+        let upgrade_context = UpgradeContext {
+            noise: NoiseUpgrader::new(network_context, identity_key, auth_mode),
+            handshake_version,
+            supported_protocols,
+            chain_id,
+            network_id,
+        };
+
+        Self {
+            ctxt: Arc::new(upgrade_context),
+            base_transport,
+            identity_pubkey,
         }
     }
 
-    None
-}
+    fn parse_dial_addr(
+        addr: &NetworkAddress,
+    ) -> io::Result<(NetworkAddress, x25519::PublicKey, u8)> {
+        use libra_network_address::Protocol::*;
 
-/// temporary checks to make sure noise pubkeys are actually getting propagated correctly.
-// TODO(philiphayes): remove this after Transport refactor
-#[allow(dead_code)]
-fn verify_noise_pubkey(
-    addr: &NetworkAddress,
-    remote_static_key: &[u8],
-    origin: ConnectionOrigin,
-) -> Result<(), io::Error> {
-    if let ConnectionOrigin::Outbound = origin {
-        let expected_remote_static_key = addr.find_noise_proto().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid NetworkAddress, no NoiseIK protocol: '{}'", addr),
-            )
-        })?;
+        let protos = addr.as_slice();
 
-        if remote_static_key != expected_remote_static_key.as_slice() {
+        // parse out the base transport protocol(s), which we will just ignore
+        // and leave for the base_transport to actually parse and dial.
+        // TODO(philiphayes): protos[..X] is kinda hacky. `Transport` trait
+        // should handle this.
+        let (base_transport_protos, base_transport_suffix) = parse_ip_tcp(protos)
+            .map(|x| (&protos[..2], x.1))
+            .or_else(|| parse_dns_tcp(protos).map(|x| (&protos[..2], x.1)))
+            .or_else(|| parse_memory(protos).map(|x| (&protos[..1], x.1)))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Unexpected dialing network address: '{}', expected: \
+                         memory, ip+tcp, or dns+tcp",
+                        addr
+                    ),
+                )
+            })?;
+
+        // parse out the libranet protocols (noise ik and handshake)
+        match base_transport_suffix {
+            [NoiseIK(pubkey), Handshake(version)] => {
+                let base_addr = NetworkAddress::try_from(base_transport_protos.to_vec())
+                    .expect("base_transport_protos is always non-empty");
+                Ok((base_addr, *pubkey, *version))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Unexpected dialing network address: '{}', expected: \
+                     '/../ln-noise-ik/<pubkey>/ln-handshake/<version>'",
+                    addr
+                ),
+            )),
+        }
+    }
+
+    /// Dial a peer at `addr`. If the `addr` is not supported or formatted correctly,
+    /// return `Err`. Otherwise, return a `Future` that resolves to `Err` if there
+    /// was some issue dialing the peer and `Ok` with a fully upgraded connection
+    /// to that peer if our dial was successful.
+    ///
+    /// ### Dialing `NetworkAddress` format
+    ///
+    /// We parse the dial address like:
+    ///
+    /// `/<base_transport>` + `/ln-noise-ik/<pubkey>/ln-handshake/<version>`
+    ///
+    /// If the base transport is `MemoryTransport`, then `/<base_transport>` is:
+    ///
+    /// `/memory/<port>`
+    ///
+    /// If the base transport is `TcpTransport`, then `/<base_transport>` is:
+    ///
+    /// `/ip4/<ipaddr>/tcp/<port>` or
+    /// `/ip6/<ipaddr>/tcp/<port>` or
+    /// `/dns/<ipaddr>/tcp/<port>` or
+    /// `/dns4/<ipaddr>/tcp/<port>` or
+    /// `/dns6/<ipaddr>/tcp/<port>`
+    pub fn dial(
+        &self,
+        peer_id: PeerId,
+        addr: NetworkAddress,
+    ) -> io::Result<
+        impl Future<Output = io::Result<Connection<NoiseStream<TTransport::Output>>>> + Send + 'static,
+    > {
+        // parse libranet protocols
+        // TODO(philiphayes): `Transport` trait should include parsing in `dial`?
+        let (base_addr, pubkey, handshake_version) = Self::parse_dial_addr(&addr)?;
+
+        // Check that the parsed handshake version from the dial addr is supported.
+        if self.ctxt.handshake_version != handshake_version {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "remote static pubkey did not match expected: actual: {:?}, expected: {:?}",
-                    remote_static_key, expected_remote_static_key,
+                    "Attempting to dial remote with unsupported handshake version: {}, expected: {}",
+                    handshake_version, self.ctxt.handshake_version,
                 ),
             ));
         }
+
+        // try to connect socket
+        let fut_socket = self.base_transport.dial(peer_id, base_addr)?;
+
+        // outbound dial upgrade task
+        let upgrade_fut = upgrade_outbound(self.ctxt.clone(), fut_socket, addr, peer_id, pubkey);
+        let upgrade_fut = timeout_io(TRANSPORT_TIMEOUT, upgrade_fut);
+        Ok(upgrade_fut)
     }
 
-    Ok(())
+    /// Listen on address `addr`. If the `addr` is not supported or formatted correctly,
+    /// return `Err`. Otherwise, return a `Stream` of fully upgraded inbound connections
+    /// and the dialer's observed network address.
+    ///
+    /// ### Listening `NetworkAddress` format
+    ///
+    /// When listening, we only expect the base transport format. For example,
+    /// if the base transport is `MemoryTransport`, then we expect:
+    ///
+    /// `/memory/<port>`
+    ///
+    /// If the base transport is `TcpTransport`, then we expect:
+    ///
+    /// `/ip4/<ipaddr>/tcp/<port>` or
+    /// `/ip6/<ipaddr>/tcp/<port>`
+    pub fn listen_on(
+        &self,
+        addr: NetworkAddress,
+    ) -> io::Result<(
+        impl Stream<
+                Item = io::Result<(
+                    impl Future<Output = io::Result<Connection<NoiseStream<TTransport::Output>>>>
+                        + Send
+                        + 'static,
+                    NetworkAddress,
+                )>,
+            > + Send
+            + 'static,
+        NetworkAddress,
+    )> {
+        // listen on base transport. for example, this could be a tcp socket or
+        // in-memory socket
+        //
+        // note: base transport should only accept its specific protocols
+        // (e.g., `/memory/<port>` with no trailers), so we don't need to do any
+        // parsing here.
+        let (listener, listen_addr) = self.base_transport.listen_on(addr)?;
+        let listen_addr =
+            listen_addr.append_prod_protos(self.identity_pubkey, self.ctxt.handshake_version);
+
+        // need to move a ctxt into stream task
+        let ctxt = self.ctxt.clone();
+
+        // stream of inbound upgrade tasks
+        let inbounds = listener.map_ok(move |(fut_socket, addr)| {
+            // inbound upgrade task
+            let fut_upgrade = upgrade_inbound(ctxt.clone(), fut_socket, addr.clone());
+            let fut_upgrade = timeout_io(TRANSPORT_TIMEOUT, fut_upgrade);
+            (fut_upgrade, addr)
+        });
+
+        Ok((inbounds, listen_addr))
+    }
 }
 
-pub async fn perform_handshake<T: TSocket>(
-    peer_id: PeerId,
-    mut socket: T,
-    addr: NetworkAddress,
-    origin: ConnectionOrigin,
-    own_handshake: &HandshakeMsg,
-) -> Result<Connection<T>, io::Error> {
-    let handshake_other = exchange_handshake(&own_handshake, &mut socket).await?;
-    if own_handshake.network_id != handshake_other.network_id {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "network_ids don't match own: {:?} received: {:?}",
-                own_handshake.network_id, handshake_other.network_id
-            ),
-        ));
+// If using `LibraNetTransport` as a `Transport` trait, then all upgrade futures
+// and listening streams must be boxed, since `upgrade_inbound` and `upgrade_outbound`
+// are async fns (and therefore unnamed types).
+//
+// TODO(philiphayes): We can change these `Pin<Box<dyn Future<..>>> to `impl Future<..>`
+// when/if this rust feature is stabilized: https://github.com/rust-lang/rust/issues/63063
+
+impl<TTransport: Transport> Transport for LibraNetTransport<TTransport>
+where
+    TTransport: Transport<Error = io::Error> + Send + 'static,
+    TTransport::Output: TSocket,
+    TTransport::Outbound: Send + 'static,
+    TTransport::Inbound: Send + 'static,
+    TTransport::Listener: Send + 'static,
+{
+    type Output = Connection<NoiseStream<TTransport::Output>>;
+    type Error = io::Error;
+    type Inbound = Pin<Box<dyn Future<Output = io::Result<Self::Output>> + Send + 'static>>;
+    type Outbound = Pin<Box<dyn Future<Output = io::Result<Self::Output>> + Send + 'static>>;
+    type Listener =
+        Pin<Box<dyn Stream<Item = io::Result<(Self::Inbound, NetworkAddress)>> + Send + 'static>>;
+
+    fn dial(&self, peer_id: PeerId, addr: NetworkAddress) -> io::Result<Self::Outbound> {
+        self.dial(peer_id, addr)
+            .map(|upgrade_fut| upgrade_fut.boxed())
     }
 
-    let intersecting_protocols = own_handshake.find_common_protocols(&handshake_other);
-    match intersecting_protocols {
-        None => {
-            info!("No matching protocols found for connection with peer: {:?}. Handshake received: {:?}",
-                  peer_id.short_str(), handshake_other);
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "no matching messaging protocol",
-            ))
-        }
-        Some((messaging_protocol, application_protocols)) => Ok(Connection {
-            socket,
-            metadata: ConnectionMetadata::new(
-                peer_id,
-                CONNECTION_ID_GENERATOR.lock().unwrap().next(),
-                addr,
-                origin,
-                messaging_protocol,
-                application_protocols,
-            ),
-        }),
-    }
-}
-
-pub fn build_memory_noise_transport(
-    network_id: NetworkId,
-    identity_key: x25519::PrivateKey,
-    trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
-    application_protocols: SupportedProtocols,
-) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
-    let memory_transport = memory::MemoryTransport::default();
-    let noise_config = Arc::new(NoiseWrapper::new(identity_key));
-    let noise_timestamps = Arc::new(RwLock::new(AntiReplayTimestamps::default()));
-    let mut own_handshake = HandshakeMsg::new(network_id);
-    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
-
-    memory_transport
-        .and_then(move |socket, addr, origin| async move {
-            let remote_public_key = addr.find_noise_proto();
-            let (remote_static_key, socket) = noise_config
-                .upgrade_connection(
-                    socket,
-                    origin,
-                    Some(noise_timestamps),
-                    remote_public_key,
-                    Some(&trusted_peers),
-                )
-                .await?;
-
-            if let Some(peer_id) =
-                identity_key_to_peer_id(&trusted_peers, remote_static_key.as_slice())
-            {
-                Ok((peer_id, socket))
-            } else {
-                Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
-            }
-        })
-        .and_then(move |(peer_id, socket), addr, origin| async move {
-            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
-        })
-        .with_timeout(TRANSPORT_TIMEOUT)
-        .boxed()
-}
-
-pub fn build_unauthenticated_memory_noise_transport(
-    network_id: NetworkId,
-    identity_key: x25519::PrivateKey,
-    application_protocols: SupportedProtocols,
-) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
-    let memory_transport = memory::MemoryTransport::default();
-    let noise_config = Arc::new(NoiseWrapper::new(identity_key));
-    let mut own_handshake = HandshakeMsg::new(network_id);
-    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
-
-    memory_transport
-        .and_then(move |socket, addr, origin| {
-            async move {
-                let remote_public_key = addr.find_noise_proto();
-                let (remote_static_key, socket) = noise_config
-                    .upgrade_connection(socket, origin, None, remote_public_key, None)
-                    .await?;
-
-                // Generate PeerId from x25519::PublicKey.
-                // Note: This is inconsistent with current types because AccountAddress is derived
-                // from consensus key which is of type Ed25519PublicKey. Since AccountAddress does
-                // not mean anything in a setting without remote authentication, we use the network
-                // public key to generate a peer_id for the peer. The only reason this works is
-                // that both are 32 bytes in size. If/when this condition no longer holds, we will
-                // receive an error.
-                let peer_id = PeerId::try_from(remote_static_key.as_slice()).unwrap();
-                Ok((peer_id, socket))
-            }
-        })
-        .and_then(move |(peer_id, socket), addr, origin| async move {
-            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
-        })
-        .with_timeout(TRANSPORT_TIMEOUT)
-        .boxed()
-}
-
-pub fn build_memory_transport(
-    network_id: NetworkId,
-    own_peer_id: PeerId,
-    application_protocols: SupportedProtocols,
-) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
-    let memory_transport = memory::MemoryTransport::default();
-    let mut own_handshake = HandshakeMsg::new(network_id);
-    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
-
-    memory_transport
-        .and_then(move |mut socket, _addr, _origin| async move {
-            Ok((exchange_peerid(&own_peer_id, &mut socket).await?, socket))
-        })
-        .and_then(move |(peer_id, socket), addr, origin| async move {
-            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
-        })
-        .with_timeout(TRANSPORT_TIMEOUT)
-        .boxed()
-}
-
-//TODO(bmwill) Maybe create an Either Transport so we can merge the building of Memory + Tcp
-pub fn build_tcp_noise_transport(
-    network_id: NetworkId,
-    identity_key: x25519::PrivateKey,
-    trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
-    application_protocols: SupportedProtocols,
-) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
-    let noise_config = Arc::new(NoiseWrapper::new(identity_key));
-    let noise_timestamps = Arc::new(RwLock::new(AntiReplayTimestamps::default()));
-    let mut own_handshake = HandshakeMsg::new(network_id);
-    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
-
-    LIBRA_TCP_TRANSPORT
-        .and_then(move |socket, addr, origin| async move {
-            let remote_public_key = addr.find_noise_proto();
-            let (remote_static_key, socket) = noise_config
-                .upgrade_connection(
-                    socket,
-                    origin,
-                    Some(noise_timestamps),
-                    remote_public_key,
-                    Some(&trusted_peers),
-                )
-                .await?;
-
-            if let Some(peer_id) =
-                identity_key_to_peer_id(&trusted_peers, &remote_static_key.as_slice())
-            {
-                Ok((peer_id, socket))
-            } else {
-                security_log(SecurityEvent::InvalidNetworkPeer)
-                    .error("UntrustedPeer")
-                    .data(&trusted_peers)
-                    .data(&remote_static_key)
-                    .log();
-                Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
-            }
-        })
-        .and_then(move |(peer_id, socket), addr, origin| async move {
-            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
-        })
-        .with_timeout(TRANSPORT_TIMEOUT)
-        .boxed()
-}
-
-// Transport based on TCP + Noise, but without remote authentication (i.e., any
-// node is allowed to connect).
-pub fn build_unauthenticated_tcp_noise_transport(
-    network_id: NetworkId,
-    identity_key: x25519::PrivateKey,
-    application_protocols: SupportedProtocols,
-) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
-    let noise_config = Arc::new(NoiseWrapper::new(identity_key));
-    let mut own_handshake = HandshakeMsg::new(network_id);
-    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
-
-    LIBRA_TCP_TRANSPORT
-        .and_then(move |socket, addr, origin| {
-            async move {
-                let remote_public_key = addr.find_noise_proto();
-                let (remote_static_key, socket) = noise_config
-                    .upgrade_connection(socket, origin, None, remote_public_key, None)
-                    .await?;
-
-                // Generate PeerId from x25519::PublicKey.
-                // Note: This is inconsistent with current types because AccountAddress is derived
-                // from consensus key which is of type Ed25519PublicKey. Since AccountAddress does
-                // not mean anything in a setting without remote authentication, we use the network
-                // public key to generate a peer_id for the peer. The only reason this works is that
-                // both are 32 bytes in size. If/when this condition no longer holds, we will receive
-                // an error.
-                let peer_id = PeerId::try_from(remote_static_key.as_slice()).unwrap();
-                Ok((peer_id, socket))
-            }
-        })
-        .and_then(move |(peer_id, socket), addr, origin| async move {
-            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
-        })
-        .with_timeout(TRANSPORT_TIMEOUT)
-        .boxed()
-}
-
-pub fn build_tcp_transport(
-    network_id: NetworkId,
-    own_peer_id: PeerId,
-    application_protocols: SupportedProtocols,
-) -> boxed::BoxedTransport<Connection<impl TSocket>, impl ::std::error::Error> {
-    let mut own_handshake = HandshakeMsg::new(network_id);
-    own_handshake.add(SUPPORTED_MESSAGING_PROTOCOL, application_protocols);
-
-    LIBRA_TCP_TRANSPORT
-        .and_then(move |mut socket, _addr, _origin| async move {
-            Ok((exchange_peerid(&own_peer_id, &mut socket).await?, socket))
-        })
-        .and_then(move |(peer_id, socket), addr, origin| async move {
-            perform_handshake(peer_id, socket, addr, origin, &own_handshake).await
-        })
-        .with_timeout(TRANSPORT_TIMEOUT)
-        .boxed()
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        protocols::wire::handshake::v1::{HandshakeMsg, MessagingProtocolVersion},
-        transport::perform_handshake,
-        ProtocolId,
-    };
-    use futures::{executor::block_on, future::join};
-    use libra_config::network_id::NetworkId;
-    use libra_network_address::NetworkAddress;
-    use libra_types::PeerId;
-    use memsocket::MemorySocket;
-    use netcore::transport::ConnectionOrigin;
-
-    #[test]
-    fn handshake_network_id_mismatch() {
-        let (outbound, inbound) = MemorySocket::new_pair();
-
-        let mut server_handshake = HandshakeMsg::new(NetworkId::Validator);
-        // This is required to ensure that test doesn't get an error for a different reason
-        server_handshake.add(
-            MessagingProtocolVersion::V1,
-            [ProtocolId::ConsensusDirectSend].iter().into(),
-        );
-        let mut client_handshake = server_handshake.clone();
-        // Ensure client doesn't match networks
-        client_handshake.network_id = NetworkId::Public;
-
-        let server = async move {
-            perform_handshake(
-                PeerId::random(),
-                inbound,
-                NetworkAddress::mock(),
-                ConnectionOrigin::Inbound,
-                &server_handshake,
-            )
-            .await
-            .unwrap_err()
-        };
-
-        let client = async move {
-            perform_handshake(
-                PeerId::random(),
-                outbound,
-                NetworkAddress::mock(),
-                ConnectionOrigin::Outbound,
-                &client_handshake,
-            )
-            .await
-            .unwrap_err()
-        };
-
-        block_on(join(server, client));
+    fn listen_on(&self, addr: NetworkAddress) -> io::Result<(Self::Listener, NetworkAddress)> {
+        let (listener, listen_addr) = self.listen_on(addr)?;
+        let listener = listener
+            .map_ok(|(upgrade_fut, addr)| (upgrade_fut.boxed(), addr))
+            .boxed();
+        Ok((listener, listen_addr))
     }
 }

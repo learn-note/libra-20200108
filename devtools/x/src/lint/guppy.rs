@@ -52,7 +52,7 @@ impl<'cfg> ProjectLinter for BannedDeps<'cfg> {
             // Look at the reverse direct dependencies of this package.
             for link in package.reverse_direct_links() {
                 let from = link.from();
-                if let Some(workspace_path) = from.workspace_path() {
+                if let Some(workspace_path) = from.source().workspace_path() {
                     out.write_kind(
                         LintKind::Package {
                             name: from.name(),
@@ -371,16 +371,17 @@ impl<'cfg> PackageLinter for OverlayFeatures<'cfg> {
         let mut overlays: Vec<(Option<&str>, &str, Option<&str>)> = vec![];
 
         feature_query.resolve_with_fn(|_, link| {
-            // Consider the dependency even if it's dev-only since the v1 resolver unifies these.
-            // TODO: might be able to relax this for the v2 resolver.
-            let (from, to) = link.endpoints();
-            let to_package = to.package();
-            if to_package.in_workspace() && self.is_overlay(to.feature_id().feature()) {
-                overlays.push((
-                    from.feature_id().feature(),
-                    to_package.name(),
-                    to.feature_id().feature(),
-                ));
+            // We now use the v2 resolver, so dev-only links can be skipped.
+            if !link.dev_only() {
+                let (from, to) = link.endpoints();
+                let to_package = to.package();
+                if to_package.in_workspace() && self.is_overlay(to.feature_id().feature()) {
+                    overlays.push((
+                        from.feature_id().feature(),
+                        to_package.name(),
+                        to.feature_id().feature(),
+                    ));
+                }
             }
 
             // Don't need to traverse past direct dependencies.

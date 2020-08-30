@@ -1,22 +1,21 @@
 
-<a name="0x0_Genesis"></a>
+<a name="0x1_Genesis"></a>
 
-# Module `0x0::Genesis`
+# Module `0x1::Genesis`
 
 ### Table of Contents
 
--  [Function `initialize`](#0x0_Genesis_initialize)
--  [Function `initialize_txn_fee_account`](#0x0_Genesis_initialize_txn_fee_account)
+-  [Function `initialize`](#0x1_Genesis_initialize)
 
 
 
-<a name="0x0_Genesis_initialize"></a>
+<a name="0x1_Genesis_initialize"></a>
 
 ## Function `initialize`
 
 
 
-<pre><code><b>fun</b> <a href="#0x0_Genesis_initialize">initialize</a>(association: &signer, config_account: &signer, fee_account: &signer, tc_account: &signer, tc_addr: address, tc_auth_key_prefix: vector&lt;u8&gt;, genesis_auth_key: vector&lt;u8&gt;, _fee_auth_key: vector&lt;u8&gt;)
+<pre><code><b>fun</b> <a href="#0x1_Genesis_initialize">initialize</a>(lr_account: &signer, tc_account: &signer, lr_auth_key: vector&lt;u8&gt;, tc_addr: address, tc_auth_key: vector&lt;u8&gt;, initial_script_allow_list: vector&lt;vector&lt;u8&gt;&gt;, is_open_module: bool, instruction_schedule: vector&lt;u8&gt;, native_schedule: vector&lt;u8&gt;, chain_id: u8)
 </code></pre>
 
 
@@ -25,102 +24,97 @@
 <summary>Implementation</summary>
 
 
-<pre><code><b>fun</b> <a href="#0x0_Genesis_initialize">initialize</a>(
-    association: &signer,
-    config_account: &signer,
-    fee_account: &signer,
+<pre><code><b>fun</b> <a href="#0x1_Genesis_initialize">initialize</a>(
+    lr_account: &signer,
     tc_account: &signer,
+    lr_auth_key: vector&lt;u8&gt;,
     tc_addr: address,
-    tc_auth_key_prefix: vector&lt;u8&gt;,
-    genesis_auth_key: vector&lt;u8&gt;,
-    _fee_auth_key: vector&lt;u8&gt;,
+    tc_auth_key: vector&lt;u8&gt;,
+    initial_script_allow_list: vector&lt;vector&lt;u8&gt;&gt;,
+    is_open_module: bool,
+    instruction_schedule: vector&lt;u8&gt;,
+    native_schedule: vector&lt;u8&gt;,
+    chain_id: u8,
 ) {
     <b>let</b> dummy_auth_key_prefix = x"00000000000000000000000000000000";
 
-    // <a href="Association.md#0x0_Association">Association</a> root setup
-    <a href="Association.md#0x0_Association_initialize">Association::initialize</a>(association);
-    <a href="Association.md#0x0_Association_grant_privilege">Association::grant_privilege</a>&lt;<a href="Libra.md#0x0_Libra_AddCurrency">Libra::AddCurrency</a>&gt;(association, association);
+    <a href="ChainId.md#0x1_ChainId_initialize">ChainId::initialize</a>(lr_account, chain_id);
 
-    // On-chain config setup
-    <a href="Event.md#0x0_Event_publish_generator">Event::publish_generator</a>(config_account);
-    <a href="LibraConfig.md#0x0_LibraConfig_initialize">LibraConfig::initialize</a>(config_account, association);
+    <a href="Roles.md#0x1_Roles_grant_libra_root_role">Roles::grant_libra_root_role</a>(lr_account);
+    <a href="Roles.md#0x1_Roles_grant_treasury_compliance_role">Roles::grant_treasury_compliance_role</a>(tc_account, lr_account);
+
+    // <a href="Event.md#0x1_Event">Event</a> and On-chain config setup
+    <a href="Event.md#0x1_Event_publish_generator">Event::publish_generator</a>(lr_account);
+    <a href="LibraConfig.md#0x1_LibraConfig_initialize">LibraConfig::initialize</a>(lr_account);
+
+    // Currency and <a href="VASP.md#0x1_VASP">VASP</a> setup
+    <a href="Libra.md#0x1_Libra_initialize">Libra::initialize</a>(lr_account);
+    <a href="VASP.md#0x1_VASP_initialize">VASP::initialize</a>(lr_account);
 
     // Currency setup
-    <a href="Libra.md#0x0_Libra_initialize">Libra::initialize</a>(config_account);
+    <a href="Coin1.md#0x1_Coin1_initialize">Coin1::initialize</a>(lr_account, tc_account);
+    <a href="Coin2.md#0x1_Coin2_initialize">Coin2::initialize</a>(lr_account, tc_account);
 
-    // Set that this is testnet
-    <a href="Testnet.md#0x0_Testnet_initialize">Testnet::initialize</a>(association);
+    <a href="LBR.md#0x1_LBR_initialize">LBR::initialize</a>(
+        lr_account,
+        tc_account,
+    );
 
-    // <a href="Event.md#0x0_Event">Event</a> and currency setup
-    <a href="Event.md#0x0_Event_publish_generator">Event::publish_generator</a>(association);
-    <b>let</b> (coin1_mint_cap, coin1_burn_cap) = <a href="Coin1.md#0x0_Coin1_initialize">Coin1::initialize</a>(association);
-    <b>let</b> (coin2_mint_cap, coin2_burn_cap) = <a href="Coin2.md#0x0_Coin2_initialize">Coin2::initialize</a>(association);
-    <a href="LBR.md#0x0_LBR_initialize">LBR::initialize</a>(association);
-
-    <a href="LibraAccount.md#0x0_LibraAccount_initialize">LibraAccount::initialize</a>(association);
-    <a href="Unhosted.md#0x0_Unhosted_publish_global_limits_definition">Unhosted::publish_global_limits_definition</a>(association);
-    <a href="LibraAccount.md#0x0_LibraAccount_create_genesis_account">LibraAccount::create_genesis_account</a>&lt;<a href="LBR.md#0x0_LBR_T">LBR::T</a>&gt;(
-        <a href="Signer.md#0x0_Signer_address_of">Signer::address_of</a>(association),
+    <a href="AccountFreezing.md#0x1_AccountFreezing_initialize">AccountFreezing::initialize</a>(lr_account);
+    <a href="LibraAccount.md#0x1_LibraAccount_initialize">LibraAccount::initialize</a>(lr_account);
+    <a href="LibraAccount.md#0x1_LibraAccount_create_libra_root_account">LibraAccount::create_libra_root_account</a>(
+        <a href="Signer.md#0x1_Signer_address_of">Signer::address_of</a>(lr_account),
         <b>copy</b> dummy_auth_key_prefix,
     );
-    <a href="Libra.md#0x0_Libra_grant_mint_capability_to_association">Libra::grant_mint_capability_to_association</a>&lt;<a href="Coin1.md#0x0_Coin1_T">Coin1::T</a>&gt;(association);
-    <a href="Libra.md#0x0_Libra_grant_mint_capability_to_association">Libra::grant_mint_capability_to_association</a>&lt;<a href="Coin2.md#0x0_Coin2_T">Coin2::T</a>&gt;(association);
 
-    // Register transaction fee accounts
-    <a href="LibraAccount.md#0x0_LibraAccount_create_testnet_account">LibraAccount::create_testnet_account</a>&lt;<a href="LBR.md#0x0_LBR_T">LBR::T</a>&gt;(0xFEE, <b>copy</b> dummy_auth_key_prefix);
-    <a href="TransactionFee.md#0x0_TransactionFee_add_txn_fee_currency">TransactionFee::add_txn_fee_currency</a>(fee_account, &coin1_burn_cap);
-    <a href="TransactionFee.md#0x0_TransactionFee_add_txn_fee_currency">TransactionFee::add_txn_fee_currency</a>(fee_account, &coin2_burn_cap);
-    <a href="TransactionFee.md#0x0_TransactionFee_initialize">TransactionFee::initialize</a>(tc_account, fee_account);
+    // Register transaction fee <b>resource</b>
+    <a href="TransactionFee.md#0x1_TransactionFee_initialize">TransactionFee::initialize</a>(
+        lr_account,
+        tc_account,
+    );
 
     // Create the treasury compliance account
-    <a href="LibraAccount.md#0x0_LibraAccount_create_treasury_compliance_account">LibraAccount::create_treasury_compliance_account</a>&lt;<a href="LBR.md#0x0_LBR_T">LBR::T</a>&gt;(
-        association,
+    <a href="LibraAccount.md#0x1_LibraAccount_create_treasury_compliance_account">LibraAccount::create_treasury_compliance_account</a>(
+        lr_account,
         tc_addr,
-        tc_auth_key_prefix,
-        coin1_mint_cap,
-        coin1_burn_cap,
-        coin2_mint_cap,
-        coin2_burn_cap,
+        <b>copy</b> dummy_auth_key_prefix,
     );
 
-    // Create the config account
-    <a href="LibraAccount.md#0x0_LibraAccount_create_genesis_account">LibraAccount::create_genesis_account</a>&lt;<a href="LBR.md#0x0_LBR_T">LBR::T</a>&gt;(
-        <a href="LibraConfig.md#0x0_LibraConfig_default_config_address">LibraConfig::default_config_address</a>(),
-        dummy_auth_key_prefix
+    <a href="LibraSystem.md#0x1_LibraSystem_initialize_validator_set">LibraSystem::initialize_validator_set</a>(
+        lr_account,
+    );
+    <a href="LibraVersion.md#0x1_LibraVersion_initialize">LibraVersion::initialize</a>(
+        lr_account,
+    );
+    <a href="DualAttestation.md#0x1_DualAttestation_initialize">DualAttestation::initialize</a>(
+        lr_account,
+    );
+    <a href="LibraBlock.md#0x1_LibraBlock_initialize_block_metadata">LibraBlock::initialize_block_metadata</a>(lr_account);
+    <a href="LibraWriteSetManager.md#0x1_LibraWriteSetManager_initialize">LibraWriteSetManager::initialize</a>(lr_account);
+    <a href="LibraTimestamp.md#0x1_LibraTimestamp_initialize">LibraTimestamp::initialize</a>(lr_account);
+
+    <b>let</b> lr_rotate_key_cap = <a href="LibraAccount.md#0x1_LibraAccount_extract_key_rotation_capability">LibraAccount::extract_key_rotation_capability</a>(lr_account);
+    <a href="LibraAccount.md#0x1_LibraAccount_rotate_authentication_key">LibraAccount::rotate_authentication_key</a>(&lr_rotate_key_cap, lr_auth_key);
+    <a href="LibraAccount.md#0x1_LibraAccount_restore_key_rotation_capability">LibraAccount::restore_key_rotation_capability</a>(lr_rotate_key_cap);
+
+    <a href="LibraTransactionPublishingOption.md#0x1_LibraTransactionPublishingOption_initialize">LibraTransactionPublishingOption::initialize</a>(
+        lr_account,
+        initial_script_allow_list,
+        is_open_module,
     );
 
-    <a href="LibraTransactionTimeout.md#0x0_LibraTransactionTimeout_initialize">LibraTransactionTimeout::initialize</a>(association);
-    <a href="LibraSystem.md#0x0_LibraSystem_initialize_validator_set">LibraSystem::initialize_validator_set</a>(config_account);
-    <a href="LibraVersion.md#0x0_LibraVersion_initialize">LibraVersion::initialize</a>(config_account);
+    <a href="LibraVMConfig.md#0x1_LibraVMConfig_initialize">LibraVMConfig::initialize</a>(
+        lr_account,
+        instruction_schedule,
+        native_schedule,
+    );
 
-    <a href="LibraBlock.md#0x0_LibraBlock_initialize_block_metadata">LibraBlock::initialize_block_metadata</a>(association);
-    <a href="LibraWriteSetManager.md#0x0_LibraWriteSetManager_initialize">LibraWriteSetManager::initialize</a>(association);
-    <a href="LibraTimestamp.md#0x0_LibraTimestamp_initialize">LibraTimestamp::initialize</a>(association);
-    <a href="LibraAccount.md#0x0_LibraAccount_rotate_authentication_key">LibraAccount::rotate_authentication_key</a>(<b>copy</b> genesis_auth_key);
-}
-</code></pre>
+    <b>let</b> tc_rotate_key_cap = <a href="LibraAccount.md#0x1_LibraAccount_extract_key_rotation_capability">LibraAccount::extract_key_rotation_capability</a>(tc_account);
+    <a href="LibraAccount.md#0x1_LibraAccount_rotate_authentication_key">LibraAccount::rotate_authentication_key</a>(&tc_rotate_key_cap, tc_auth_key);
+    <a href="LibraAccount.md#0x1_LibraAccount_restore_key_rotation_capability">LibraAccount::restore_key_rotation_capability</a>(tc_rotate_key_cap);
 
-
-
-</details>
-
-<a name="0x0_Genesis_initialize_txn_fee_account"></a>
-
-## Function `initialize_txn_fee_account`
-
-
-
-<pre><code><b>fun</b> <a href="#0x0_Genesis_initialize_txn_fee_account">initialize_txn_fee_account</a>(_fee_account: &signer, auth_key: vector&lt;u8&gt;)
-</code></pre>
-
-
-
-<details>
-<summary>Implementation</summary>
-
-
-<pre><code><b>fun</b> <a href="#0x0_Genesis_initialize_txn_fee_account">initialize_txn_fee_account</a>(_fee_account: &signer, auth_key: vector&lt;u8&gt;) {
-    <a href="LibraAccount.md#0x0_LibraAccount_rotate_authentication_key">LibraAccount::rotate_authentication_key</a>(auth_key);
+    // Mark that genesis has finished. This must appear <b>as</b> the last call.
+    <a href="LibraTimestamp.md#0x1_LibraTimestamp_set_time_has_started">LibraTimestamp::set_time_has_started</a>(lr_account);
 }
 </code></pre>
 

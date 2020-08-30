@@ -7,10 +7,10 @@ use crate::{
     cluster::Cluster,
     health::{log_tail::TraceTail, Commit, Event, LogTail, ValidatorEvent},
     instance::Instance,
-    util::unix_timestamp_now,
 };
-use debug_interface::{json_log::JsonLogEntry as DebugInterfaceEvent, NodeDebugClient};
-use libra_logger::*;
+use debug_interface::AsyncNodeDebugClient;
+use libra_logger::{json_log::JsonLogEntry as DebugInterfaceEvent, *};
+use libra_time::duration_since_epoch;
 use serde_json::{self, value as json};
 use std::{
     env,
@@ -18,13 +18,13 @@ use std::{
         atomic::{AtomicBool, AtomicI64, Ordering},
         mpsc, Arc, Mutex,
     },
-    thread,
     time::Duration,
 };
+use tokio::{runtime::Handle, time};
 
-pub struct DebugPortLogThread {
+pub struct DebugPortLogWorker {
     instance: Instance,
-    client: NodeDebugClient,
+    client: AsyncNodeDebugClient,
     event_sender: mpsc::Sender<ValidatorEvent>,
     started_sender: Option<mpsc::Sender<()>>,
     pending_messages: Arc<AtomicI64>,
@@ -32,18 +32,19 @@ pub struct DebugPortLogThread {
     trace_enabled: Arc<AtomicBool>,
 }
 
-impl DebugPortLogThread {
+impl DebugPortLogWorker {
     pub fn spawn_new(cluster: &Cluster) -> (LogTail, TraceTail) {
+        let runtime = Handle::current();
         let (event_sender, event_receiver) = mpsc::channel();
         let mut started_receivers = vec![];
         let pending_messages = Arc::new(AtomicI64::new(0));
         let (trace_sender, trace_receiver) = mpsc::channel();
         let trace_enabled = Arc::new(AtomicBool::new(false));
-        for instance in cluster.all_instances() {
+        for instance in cluster.validator_and_fullnode_instances() {
             let (started_sender, started_receiver) = mpsc::channel();
             started_receivers.push(started_receiver);
-            let client = NodeDebugClient::new(instance.ip(), 6191);
-            let debug_port_log_thread = DebugPortLogThread {
+            let client = instance.debug_interface_client();
+            let debug_port_log_worker = DebugPortLogWorker {
                 instance: instance.clone(),
                 client,
                 event_sender: event_sender.clone(),
@@ -52,10 +53,7 @@ impl DebugPortLogThread {
                 trace_sender: trace_sender.clone(),
                 trace_enabled: trace_enabled.clone(),
             };
-            thread::Builder::new()
-                .name(format!("log-tail-{}", instance.peer_name()))
-                .spawn(move || debug_port_log_thread.run())
-                .expect("Failed to spawn log tail thread");
+            runtime.spawn(debug_port_log_worker.run());
         }
         for r in started_receivers {
             if let Err(e) = r.recv() {
@@ -75,16 +73,16 @@ impl DebugPortLogThread {
     }
 }
 
-impl DebugPortLogThread {
-    pub fn run(mut self) {
+impl DebugPortLogWorker {
+    pub async fn run(mut self) {
         let print_failures = env::var("VERBOSE").is_ok();
         loop {
-            match self.client.get_events() {
+            match self.client.get_events().await {
                 Err(e) => {
                     if print_failures {
                         info!("Failed to get events from {}: {:?}", self.instance, e);
                     }
-                    thread::sleep(Duration::from_secs(1));
+                    time::delay_for(Duration::from_secs(1)).await;
                 }
                 Ok(resp) => {
                     let mut sent_events = 0i64;
@@ -96,7 +94,7 @@ impl DebugPortLogThread {
                     }
                     self.pending_messages
                         .fetch_add(sent_events, Ordering::Relaxed);
-                    thread::sleep(Duration::from_millis(100));
+                    time::delay_for(Duration::from_millis(100)).await;
                 }
             }
             if let Some(started_sender) = self.started_sender.take() {
@@ -120,7 +118,7 @@ impl DebugPortLogThread {
         Some(ValidatorEvent {
             validator: self.instance.peer_name().clone(),
             timestamp: Duration::from_millis(event.timestamp as u64),
-            received_timestamp: unix_timestamp_now(),
+            received_timestamp: duration_since_epoch(),
             event: e,
         })
     }

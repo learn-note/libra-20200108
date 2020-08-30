@@ -65,6 +65,7 @@ use futures::{
 };
 use libra_logger::prelude::*;
 use libra_types::PeerId;
+use serde::Serialize;
 use std::{collections::HashMap, fmt::Debug, time::Duration};
 
 pub mod error;
@@ -102,18 +103,20 @@ pub struct InboundRpcRequest {
 }
 
 /// A wrapper struct for an outbound rpc request and its associated context.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct OutboundRpcRequest {
     /// Rpc method identifier, e.g., `/libra/rpc/0.1.0/consensus/0.1.0`. This is the
     /// protocol we will negotiate our outbound substream to.
     pub protocol: ProtocolId,
     /// The serialized request data to be sent to the receiver.
+    #[serde(skip)]
     pub data: Bytes,
     /// Channel over which the rpc response is sent from the rpc layer to the
     /// upper client layer.
     ///
     /// If there is an error while performing the rpc protocol, e.g., the remote
     /// peer drops the connection, we will send an [`RpcError`] over the channel.
+    #[serde(skip)]
     pub res_tx: oneshot::Sender<Result<Bytes, RpcError>>,
     /// The timeout duration for the entire rpc call. If the timeout elapses, the
     /// rpc layer will send an [`RpcError::TimedOut`] error over the
@@ -153,7 +156,7 @@ impl RequestIdGenerator {
             match self.next_id.overflowing_add(1) {
                 (next_id, true) => {
                     info!(
-                        "Request ids with peer: {:?} wrapped around to 0",
+                        "Request ids with peer: {} wrapped around to 0",
                         self.peer_id.short_str(),
                     );
                     next_id
@@ -289,7 +292,7 @@ impl Rpc {
             );
             if let Err(e) = response_tx.send(response) {
                 warn!(
-                    "Failed to handle inbount RPC response from peer: {} for protocol: {:?}. Error: {:?}",
+                    "Failed to handle inbount RPC response from peer: {} for protocol: {}. Error: {:?}",
                     peer_id.short_str(),
                     protocol,
                     e
@@ -303,7 +306,7 @@ impl Rpc {
         } else {
             // TODO: add ability to log protocol id as well
             info!(
-                "Received response for expired request from {:?}. Discarding.",
+                "Received response for expired request from {}. Discarding.",
                 peer_id.short_str()
             )
         }

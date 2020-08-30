@@ -1,35 +1,58 @@
-address 0x0 {
+address 0x1 {
 
 module LibraVersion {
-    use 0x0::LibraConfig;
-    use 0x0::Signer;
-    use 0x0::Transaction;
+    use 0x1::CoreAddresses;
+    use 0x1::Errors;
+    use 0x1::LibraConfig;
+    use 0x1::LibraTimestamp;
 
-    struct T {
+    struct LibraVersion {
         major: u64,
     }
 
-    public fun initialize(account: &signer) {
-        Transaction::assert(Signer::address_of(account) == LibraConfig::default_config_address(), 1);
+    spec module {
+    }
 
-        LibraConfig::publish_new_config<Self::T>(
-            account,
-            T { major: 1 },
+    /// Tried to set an invalid major version for the VM. Major versions must be strictly increasing
+    const EINVALID_MAJOR_VERSION_NUMBER: u64 = 0;
+
+    public fun initialize(
+        lr_account: &signer,
+    ) {
+        LibraTimestamp::assert_genesis();
+        CoreAddresses::assert_libra_root(lr_account);
+        LibraConfig::publish_new_config<LibraVersion>(
+            lr_account,
+            LibraVersion { major: 1 },
         );
     }
 
     public fun set(account: &signer, major: u64) {
-        let old_config = LibraConfig::get<Self::T>();
+        LibraTimestamp::assert_operating();
 
-        Transaction::assert(
+        // TODO: is this restricted to be called from libra root?
+        // CoreAddresses::assert_libra_root(account);
+
+        let old_config = LibraConfig::get<LibraVersion>();
+
+        assert(
             old_config.major < major,
-            25
+            Errors::invalid_argument(EINVALID_MAJOR_VERSION_NUMBER)
         );
 
-        LibraConfig::set<Self::T>(
+        LibraConfig::set<LibraVersion>(
             account,
-            T { major }
+            LibraVersion { major }
         );
+    }
+
+    spec module {
+        /// After genesis, version is published.
+        invariant [global] LibraTimestamp::is_operating() ==> LibraConfig::spec_is_published<LibraVersion>();
+
+        /// The permission "UpdateLibraProtocolVersion" is granted to LibraRoot [B20].
+        invariant [global, isolated] forall addr: address where exists<LibraVersion>(addr):
+            addr == CoreAddresses::LIBRA_ROOT_ADDRESS();
     }
 }
 

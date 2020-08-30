@@ -9,9 +9,11 @@ use futures::{
     sink::SinkExt,
     stream::{Stream, StreamExt},
 };
+use libra_config::network_id::NetworkContext;
 use libra_crypto::{test_utils::TEST_SEED, x25519, Uniform as _};
 use libra_logger::prelude::*;
 use libra_network_address::NetworkAddress;
+use libra_types::PeerId;
 use memsocket::MemorySocket;
 use netcore::{
     compat::IoCompat,
@@ -21,7 +23,7 @@ use netcore::{
         Transport, TransportExt,
     },
 };
-use network::noise_wrapper::{stream::NoiseStream, NoiseWrapper};
+use network::noise::{stream::NoiseStream, HandshakeAuthMode, NoiseUpgrader};
 use rand::prelude::*;
 use std::{env, ffi::OsString, sync::Arc};
 use tokio::runtime::Handle;
@@ -80,10 +82,16 @@ pub fn build_memsocket_noise_transport() -> impl Transport<Output = NoiseStream<
     MemoryTransport::default().and_then(move |socket, addr, origin| async move {
         let mut rng: StdRng = SeedableRng::from_seed(TEST_SEED);
         let private = x25519::PrivateKey::generate(&mut rng);
-        let noise_config = Arc::new(NoiseWrapper::new(private));
+        let public = private.public_key();
+        let peer_id = PeerId::from_identity_public_key(public);
+        let noise_config = Arc::new(NoiseUpgrader::new(
+            NetworkContext::mock_with_peer_id(peer_id),
+            private,
+            HandshakeAuthMode::ServerOnly,
+        ));
         let remote_public_key = addr.find_noise_proto();
         let (_remote_static_key, socket) = noise_config
-            .upgrade_connection(socket, origin, None, remote_public_key, None)
+            .upgrade_with_noise(socket, origin, remote_public_key)
             .await?;
         Ok(socket)
     })
@@ -94,10 +102,16 @@ pub fn build_tcp_noise_transport() -> impl Transport<Output = NoiseStream<TcpSoc
     TcpTransport::default().and_then(move |socket, addr, origin| async move {
         let mut rng: StdRng = SeedableRng::from_seed(TEST_SEED);
         let private = x25519::PrivateKey::generate(&mut rng);
-        let noise_config = Arc::new(NoiseWrapper::new(private));
+        let public = private.public_key();
+        let peer_id = PeerId::from_identity_public_key(public);
+        let noise_config = Arc::new(NoiseUpgrader::new(
+            NetworkContext::mock_with_peer_id(peer_id),
+            private,
+            HandshakeAuthMode::ServerOnly,
+        ));
         let remote_public_key = addr.find_noise_proto();
         let (_remote_static_key, socket) = noise_config
-            .upgrade_connection(socket, origin, None, remote_public_key, None)
+            .upgrade_with_noise(socket, origin, remote_public_key)
             .await?;
         Ok(socket)
     })

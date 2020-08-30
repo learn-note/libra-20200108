@@ -1,15 +1,16 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use compiled_stdlib::StdLibOptions;
 use libra_types::{
     access_path::AccessPath,
+    account_address::AccountAddress,
     contract_event::ContractEvent,
     transaction::ChangeSet,
     write_set::{WriteOp, WriteSet},
 };
 use resource_viewer::{MoveValueAnnotator, NullStateView};
 use std::collections::{BTreeMap, BTreeSet};
-use stdlib::StdLibOptions;
 use structopt::StructOpt;
 use vm::CompiledModule;
 
@@ -61,6 +62,8 @@ pub struct Args {
     ws_keys: bool,
     #[structopt(short = "s", long, help = "Print WriteSet keys sorted")]
     ws_sorted_keys: bool,
+    #[structopt(short = "c", long, help = "Print the resources under each account")]
+    print_account_states: bool,
 }
 
 pub fn main() {
@@ -70,7 +73,7 @@ pub fn main() {
     // we default to `all`
     let arg_count = std::env::args().len();
     let args = Args::from_args();
-    let ws = vm_genesis::generate_genesis_change_set_for_testing(StdLibOptions::Staged);
+    let ws = vm_genesis::generate_genesis_change_set_for_testing(StdLibOptions::Compiled);
     if args.all || arg_count == 3 {
         print_all(&ws);
     } else {
@@ -100,6 +103,9 @@ pub fn main() {
         }
         if args.ws_sorted_keys {
             print_keys_sorted(ws.write_set());
+        }
+        if args.print_account_states {
+            print_account_states(ws.write_set());
         }
     }
 }
@@ -206,5 +212,36 @@ fn print_resources(ws: &WriteSet) {
             Err(e) => println!("Unable To parse blobs: {:?}", e),
         };
         println!("RawData: {:?}", v);
+    }
+}
+
+fn print_account_states(ws: &WriteSet) {
+    let mut accounts: BTreeMap<AccountAddress, Vec<(AccessPath, Vec<u8>)>> = BTreeMap::new();
+    for (k, v) in ws {
+        match v {
+            WriteOp::Deletion => panic!("found WriteOp::Deletion in WriteSet"),
+            WriteOp::Value(blob) => {
+                let tag = k.path.get(0).expect("empty blob in WriteSet");
+                if *tag == 1 {
+                    accounts
+                        .entry(k.address)
+                        .or_insert_with(Vec::new)
+                        .push((k.clone(), blob.clone()));
+                }
+            }
+        }
+    }
+    let view = NullStateView::default();
+    let annotator = MoveValueAnnotator::new(&view);
+    for (k, v) in &accounts {
+        println!("Address: {}", k);
+        for (ap, resource) in v {
+            println!(
+                "\tData: {}",
+                annotator
+                    .view_access_path(ap.clone(), resource.as_ref())
+                    .unwrap()
+            )
+        }
     }
 }

@@ -3,7 +3,7 @@
 
 use crate::{libra_interface::JsonRpcLibraInterface, Action, Error, KeyManager, LibraInterface};
 use anyhow::Result;
-use executor::{db_bootstrapper, Executor};
+use executor::Executor;
 use executor_types::BlockExecutor;
 use futures::{channel::mpsc::channel, StreamExt};
 use libra_config::{
@@ -12,8 +12,10 @@ use libra_config::{
     utils::get_genesis_txn,
 };
 use libra_crypto::{ed25519::Ed25519PrivateKey, HashValue, PrivateKey, Uniform};
-use libra_global_constants::OPERATOR_KEY;
-use libra_secure_storage::{InMemoryStorageInternal, KVStorage, Value};
+use libra_global_constants::{
+    CONSENSUS_KEY, OPERATOR_ACCOUNT, OPERATOR_KEY, OWNER_ACCOUNT, OWNER_KEY,
+};
+use libra_secure_storage::{InMemoryStorageInternal, KVStorage};
 use libra_secure_time::{MockTimeService, TimeService};
 use libra_types::{
     account_address::AccountAddress,
@@ -31,15 +33,16 @@ use libra_types::{
 use libra_vm::LibraVM;
 use libradb::LibraDB;
 use rand::{rngs::StdRng, SeedableRng};
-use std::{cell::RefCell, collections::BTreeMap, convert::TryFrom, sync::Arc, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, convert::TryFrom, sync::Arc};
 use storage_interface::{DbReader, DbReaderWriter};
 use tokio::runtime::Runtime;
 use vm_validator::{
     mocks::mock_vm_validator::MockVMValidator, vm_validator::TransactionValidation,
 };
 
+const TXN_EXPIRATION_SECS: u64 = 100;
+
 struct Node<T: LibraInterface> {
-    account: AccountAddress,
     executor: Executor<LibraVM>,
     libra: LibraInterfaceTestHarness<T>,
     key_manager: KeyManager<
@@ -52,7 +55,6 @@ struct Node<T: LibraInterface> {
 
 impl<T: LibraInterface> Node<T> {
     pub fn new(
-        account: AccountAddress,
         executor: Executor<LibraVM>,
         libra: LibraInterfaceTestHarness<T>,
         key_manager: KeyManager<
@@ -63,7 +65,6 @@ impl<T: LibraInterface> Node<T> {
         time: MockTimeService,
     ) -> Self {
         Self {
-            account,
             executor,
             libra,
             key_manager,
@@ -82,8 +83,9 @@ impl<T: LibraInterface> Node<T> {
         // Clock is supposed to be in microseconds
         let clock = self.time.now() * 1_000_000;
 
+        let owner_account = self.get_account_from_storage(OWNER_ACCOUNT);
         let block_id = HashValue::zero();
-        let block_metadata = BlockMetadata::new(block_id, 0, clock, vec![], self.account);
+        let block_metadata = BlockMetadata::new(block_id, 0, clock, vec![], owner_account);
         let prologue = Transaction::BlockMetadata(block_metadata);
         block.insert(0, prologue);
 
@@ -110,6 +112,22 @@ impl<T: LibraInterface> Node<T> {
         self.executor
             .commit_blocks(vec![block_id], ledger_info_with_sigs)
             .unwrap();
+    }
+
+    fn get_account_from_storage(&mut self, account_name: &str) -> AccountAddress {
+        self.key_manager
+            .storage
+            .get::<AccountAddress>(account_name)
+            .unwrap()
+            .value
+    }
+
+    fn get_key_from_storage(&mut self, key_name: &str) -> Ed25519PrivateKey {
+        self.key_manager
+            .storage
+            .get::<Ed25519PrivateKey>(key_name)
+            .unwrap()
+            .value
     }
 }
 
@@ -141,7 +159,7 @@ impl<T: LibraInterface> LibraInterfaceTestHarness<T> {
 
     /// Returns the libra block resource associated with the association address.
     fn retrieve_libra_block_resource(&self) -> Result<LibraBlockResource, Error> {
-        let account = account_config::association_address();
+        let account = account_config::libra_root_address();
         let account_state = self.libra.retrieve_account_state(account)?;
         account_state
             .get_libra_block_resource()?
@@ -215,7 +233,7 @@ impl MockLibraInterface {
 
 impl LibraInterface for MockLibraInterface {
     fn libra_timestamp(&self) -> Result<u64, Error> {
-        let account = account_config::association_address();
+        let account = account_config::libra_root_address();
         let blob = self
             .storage
             .get_latest_account_state(account)?
@@ -289,19 +307,16 @@ impl LibraInterface for MockLibraInterface {
 }
 
 // Creates and returns NodeConfig and KeyManagerConfig structs that are consistent for testing.
-fn create_test_configs() -> (NodeConfig, KeyManagerConfig) {
-    let (node_config, _genesis_key) = config_builder::test_config();
-
-    let mut key_manager_config = KeyManagerConfig::default();
-    key_manager_config.validator_account = node_config.validator_network.clone().unwrap().peer_id();
-
+fn get_test_configs() -> (NodeConfig, KeyManagerConfig) {
+    let (node_config, _) = config_builder::test_config();
+    let key_manager_config = KeyManagerConfig::default();
     (node_config, key_manager_config)
 }
 
 // Creates and returns a test node that uses the JsonRpcLibraInterface.
 // This setup is useful for testing nodes as they operate in a production environment.
 fn setup_node_using_json_rpc() -> (Node<JsonRpcLibraInterface>, Runtime) {
-    let (node_config, key_manager_config) = create_test_configs();
+    let (node_config, key_manager_config) = get_test_configs();
 
     let (_storage, db_rw) = setup_libra_db(&node_config);
     let (libra, server) = setup_libra_interface_and_json_server(db_rw.clone());
@@ -316,8 +331,7 @@ fn setup_node_using_json_rpc() -> (Node<JsonRpcLibraInterface>, Runtime) {
 // Creates and returns a Node using the MockLibraInterface implementation.
 // This setup is useful for testing and verifying new development features quickly.
 fn setup_node_using_test_mocks() -> Node<MockLibraInterface> {
-    let (node_config, key_manager_config) = create_test_configs();
-
+    let (node_config, key_manager_config) = get_test_configs();
     let (storage, db_rw) = setup_libra_db(&node_config);
     let libra = MockLibraInterface { storage };
     let executor = Executor::new(db_rw);
@@ -328,7 +342,7 @@ fn setup_node_using_test_mocks() -> Node<MockLibraInterface> {
 // Creates and returns a libra database and database reader/writer pair bootstrapped with genesis.
 fn setup_libra_db(config: &NodeConfig) -> (Arc<LibraDB>, DbReaderWriter) {
     let (storage, db_rw) = DbReaderWriter::wrap(LibraDB::new_for_test(&config.storage.dir()));
-    db_bootstrapper::bootstrap_db_if_empty::<LibraVM>(&db_rw, get_genesis_txn(config).unwrap())
+    executor_test_helpers::bootstrap_genesis::<LibraVM>(&db_rw, get_genesis_txn(config).unwrap())
         .expect("Failed to execute genesis");
 
     (storage, db_rw)
@@ -342,21 +356,21 @@ fn setup_node<T: LibraInterface + Clone>(
     executor: Executor<LibraVM>,
     libra: T,
 ) -> Node<T> {
-    let account = key_manager_config.validator_account;
     let time = MockTimeService::new();
     let libra_test_harness = LibraInterfaceTestHarness::new(libra);
+    let storage = setup_secure_storage(&node_config, time.clone());
 
     let key_manager = KeyManager::new(
-        account,
         libra_test_harness.clone(),
-        setup_secure_storage(&node_config, time.clone()),
+        storage,
         time.clone(),
         key_manager_config.rotation_period_secs,
         key_manager_config.sleep_period_secs,
         key_manager_config.txn_expiration_secs,
+        libra_types::chain_id::ChainId::test(),
     );
 
-    Node::new(account, executor, libra_test_harness, key_manager, time)
+    Node::new(executor, libra_test_harness, key_manager, time)
 }
 
 // Creates and returns a secure storage implementation (based on an in memory storage engine) for
@@ -368,21 +382,30 @@ fn setup_secure_storage(
     let mut sec_storage = InMemoryStorageInternal::new_with_time_service(time);
     let test_config = config.clone().test.unwrap();
 
-    let mut a_keypair = test_config.operator_keypair.unwrap();
-    let a_prikey = Value::Ed25519PrivateKey(a_keypair.take_private().unwrap());
+    // Initialize the owner key and account address in storage
+    let owner_key = test_config.owner_key.unwrap();
+    sec_storage.set(OWNER_KEY, owner_key.private_key()).unwrap();
 
-    sec_storage.set(OPERATOR_KEY, a_prikey).unwrap();
+    let owner_account = libra_types::account_address::from_public_key(&owner_key.public_key());
+    sec_storage.set(OWNER_ACCOUNT, owner_account).unwrap();
 
-    let mut c_keypair = test_config.consensus_keypair.unwrap();
-    let c_prikey = c_keypair.take_private().unwrap();
-    let c_prikey0 = Value::Ed25519PrivateKey(c_prikey.clone());
-    let c_prikey1 = Value::Ed25519PrivateKey(c_prikey);
+    // Initialize the operator key and account address in storage
+    let operator_key = test_config.operator_key.unwrap();
+    sec_storage
+        .set(OPERATOR_KEY, operator_key.private_key())
+        .unwrap();
 
-    sec_storage.set(crate::CONSENSUS_KEY, c_prikey0).unwrap();
-    // Ugly hack but we need this until we support retrieving a policy from within storage and that
-    // currently is not easy, since we would need to convert from Vault -> Libra policy.
-    let previous = format!("{}_previous", crate::CONSENSUS_KEY);
-    sec_storage.set(&previous, c_prikey1).unwrap();
+    let operator_account =
+        libra_types::account_address::from_public_key(&operator_key.public_key());
+    sec_storage.set(OPERATOR_ACCOUNT, operator_account).unwrap();
+
+    // Initialize the consensus key in storage
+    let sr_test_config = config.consensus.safety_rules.test.as_ref().unwrap();
+    let consensus_prikey = sr_test_config.consensus_key.as_ref().unwrap().private_key();
+    sec_storage
+        .set(crate::CONSENSUS_KEY, consensus_prikey)
+        .unwrap();
+
     sec_storage
 }
 
@@ -431,11 +454,13 @@ fn test_ability_to_read_move_data() {
     verify_ability_to_read_move_data(node);
 }
 
-fn verify_ability_to_read_move_data<T: LibraInterface>(node: Node<T>) {
+fn verify_ability_to_read_move_data<T: LibraInterface>(mut node: Node<T>) {
+    let owner_account = node.get_account_from_storage(OWNER_ACCOUNT);
+
     node.libra.last_reconfiguration().unwrap();
     node.libra.retrieve_validator_set().unwrap();
-    node.libra.retrieve_validator_config(node.account).unwrap();
-    node.libra.retrieve_validator_info(node.account).unwrap();
+    node.libra.retrieve_validator_config(owner_account).unwrap();
+    node.libra.retrieve_validator_info(owner_account).unwrap();
     node.libra.retrieve_libra_block_resource().unwrap();
 }
 
@@ -454,46 +479,44 @@ fn test_manual_rotation_on_chain() {
 }
 
 fn verify_manual_rotation_on_chain<T: LibraInterface>(mut node: Node<T>) {
-    let (node_config, _) = create_test_configs();
-    let test_config = node_config.test.unwrap();
-    let account_prikey = test_config
-        .operator_keypair
-        .unwrap()
-        .take_private()
-        .unwrap();
-    let genesis_pubkey = test_config
-        .consensus_keypair
-        .unwrap()
-        .take_private()
-        .unwrap()
-        .public_key();
-
-    let genesis_config = node.libra.retrieve_validator_config(node.account).unwrap();
-    let genesis_info = node.libra.retrieve_validator_info(node.account).unwrap();
+    let owner_account = node.get_account_from_storage(OWNER_ACCOUNT);
+    let genesis_config = node.libra.retrieve_validator_config(owner_account).unwrap();
+    let genesis_info = node.libra.retrieve_validator_info(owner_account).unwrap();
 
     // Check on-chain consensus state matches the genesis state
-    assert_eq!(genesis_pubkey, genesis_config.consensus_public_key);
-    assert_eq!(&genesis_pubkey, genesis_info.consensus_public_key());
-    assert_eq!(&node.account, genesis_info.account_address());
+    let consensus_pubkey = node.get_key_from_storage(CONSENSUS_KEY).public_key();
+    assert_eq!(consensus_pubkey, genesis_config.consensus_public_key);
+    assert_eq!(&consensus_pubkey, genesis_info.consensus_public_key());
+    assert_eq!(&owner_account, genesis_info.account_address());
 
     // Perform on-chain rotation
+    let operator_privkey = node.get_key_from_storage(OPERATOR_KEY);
+    let operator_account = node.get_account_from_storage(OPERATOR_ACCOUNT);
     let mut rng = StdRng::from_seed([44u8; 32]);
     let new_privkey = Ed25519PrivateKey::generate(&mut rng);
     let new_pubkey = new_privkey.public_key();
-    let txn = crate::build_rotation_transaction(
-        node.account,
+    let txn1 = crate::build_rotation_transaction(
+        owner_account,
+        operator_account,
         0,
-        &account_prikey,
         &new_pubkey,
-        Duration::from_secs(node.time.now() + 100),
+        Vec::new(),
+        Vec::new(),
+        node.time.now() + TXN_EXPIRATION_SECS,
+        libra_types::chain_id::ChainId::test(),
     );
-    node.execute_and_commit(vec![txn]);
+    let txn1 = txn1
+        .sign(&operator_privkey, operator_privkey.public_key())
+        .unwrap();
+    let txn1 = Transaction::UserTransaction(txn1.into_inner());
 
-    let new_config = node.libra.retrieve_validator_config(node.account).unwrap();
-    let new_info = node.libra.retrieve_validator_info(node.account).unwrap();
+    node.execute_and_commit(vec![txn1]);
+
+    let new_config = node.libra.retrieve_validator_config(owner_account).unwrap();
+    let new_info = node.libra.retrieve_validator_info(owner_account).unwrap();
 
     // Check on-chain consensus state has been rotated
-    assert_ne!(new_pubkey, genesis_pubkey);
+    assert_ne!(new_pubkey, consensus_pubkey);
     assert_eq!(new_pubkey, new_config.consensus_public_key);
     assert_eq!(&new_pubkey, new_info.consensus_public_key());
 }
@@ -520,9 +543,10 @@ fn verify_init_and_basic_rotation<T: LibraInterface>(mut node: Node<T>) {
     assert_eq!(0, node.key_manager.libra_timestamp().unwrap());
 
     // Perform key rotation locally
-    let genesis_info = node.libra.retrieve_validator_info(node.account).unwrap();
+    let owner_account = node.get_account_from_storage(OWNER_ACCOUNT);
+    let genesis_info = node.libra.retrieve_validator_info(owner_account).unwrap();
     let new_key = node.key_manager.rotate_consensus_key().unwrap();
-    let pre_exe_rotated_info = node.libra.retrieve_validator_info(node.account).unwrap();
+    let pre_exe_rotated_info = node.libra.retrieve_validator_info(owner_account).unwrap();
     assert_eq!(
         genesis_info.consensus_public_key(),
         pre_exe_rotated_info.consensus_public_key()
@@ -531,7 +555,7 @@ fn verify_init_and_basic_rotation<T: LibraInterface>(mut node: Node<T>) {
 
     // Execute key rotation on-chain
     node.execute_and_commit(node.libra.take_all_transactions());
-    let rotated_info = node.libra.retrieve_validator_info(node.account).unwrap();
+    let rotated_info = node.libra.retrieve_validator_info(owner_account).unwrap();
     assert_ne!(
         genesis_info.consensus_public_key(),
         rotated_info.consensus_public_key()
@@ -568,7 +592,7 @@ fn test_execute() {
 }
 
 fn verify_execute<T: LibraInterface>(mut node: Node<T>) {
-    let (_, key_manager_config) = create_test_configs();
+    let (_, key_manager_config) = get_test_configs();
 
     // Verify correct initial state (i.e., nothing to be done by key manager)
     assert_eq!(0, node.time.now());
@@ -620,44 +644,4 @@ fn verify_execute<T: LibraInterface>(mut node: Node<T>) {
         node.key_manager.evaluate_status().unwrap()
     );
     assert_ne!(0, node.libra.last_reconfiguration().unwrap());
-}
-
-#[test]
-// This test ensures that execute() will return an error and halt the key manager if something goes
-// wrong.
-fn test_execute_error() {
-    // Test the mock libra interface implementation
-    let node = setup_node_using_test_mocks();
-    verify_execute_error(node);
-
-    // Test the json libra interface implementation
-    let (node, _runtime) = setup_node_using_json_rpc();
-    verify_execute_error(node);
-}
-
-fn verify_execute_error<T: LibraInterface>(mut node: Node<T>) {
-    // Verify some correct initial state
-    assert_eq!(0, node.time.now());
-    assert_eq!(0, node.libra.last_reconfiguration().unwrap());
-
-    // Verify nothing to be done by key manager
-    node.update_libra_timestamp();
-    assert_eq!(
-        Action::NoAction,
-        node.key_manager.evaluate_status().unwrap()
-    );
-
-    // Perform each execution iteration a few times to see that everything is working
-    for _ in 0..5 {
-        node.update_libra_timestamp();
-        node.key_manager.execute_once().unwrap();
-    }
-
-    // Delete all keys in secure storage to emulate a failure (e.g., so that the key manager should
-    // fail when trying to access something in secure storage on the next execution iteration.)
-    node.key_manager.storage.reset_and_clear().unwrap();
-
-    // Check that execute() now returns an error and doesn't spin forever.
-    node.update_libra_timestamp();
-    assert!(node.key_manager.execute().is_err());
 }

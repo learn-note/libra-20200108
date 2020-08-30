@@ -20,12 +20,11 @@ mod libra_version;
 mod registered_currencies;
 mod validator_set;
 mod vm_config;
+mod vm_publishing_option;
 
 pub use self::{
-    libra_version::LibraVersion,
-    registered_currencies::RegisteredCurrencies,
-    validator_set::ValidatorSet,
-    vm_config::{VMConfig, VMPublishingOption},
+    libra_version::LibraVersion, registered_currencies::RegisteredCurrencies,
+    validator_set::ValidatorSet, vm_config::VMConfig, vm_publishing_option::VMPublishingOption,
 };
 
 /// To register an on-chain config in Rust:
@@ -35,8 +34,10 @@ pub use self::{
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConfigID(&'static str, &'static str);
 
+const CONFIG_ADDRESS_STR: &str = "0xA550C18";
+
 pub fn config_address() -> AccountAddress {
-    AccountAddress::from_hex_literal("0xF1A95").expect("failed to get address")
+    AccountAddress::from_hex_literal(CONFIG_ADDRESS_STR).expect("failed to get address")
 }
 
 impl ConfigID {
@@ -51,6 +52,7 @@ impl ConfigID {
 /// State sync will panic if the value of any config in this registry is uninitialized
 pub const ON_CHAIN_CONFIG_REGISTRY: &[ConfigID] = &[
     VMConfig::CONFIG_ID,
+    VMPublishingOption::CONFIG_ID,
     LibraVersion::CONFIG_ID,
     ValidatorSet::CONFIG_ID,
     RegisteredCurrencies::CONFIG_ID,
@@ -92,8 +94,8 @@ pub trait ConfigStorage {
 /// Trait to be implemented by a Rust struct representation of an on-chain config
 /// that is stored in storage as a serialized byte array
 pub trait OnChainConfig: Send + Sync + DeserializeOwned {
-    // association_address
-    const ADDRESS: &'static str = "0xF1A95";
+    // libra_root_address
+    const ADDRESS: &'static str = CONFIG_ADDRESS_STR;
     const IDENTIFIER: &'static str;
     const CONFIG_ID: ConfigID = ConfigID(Self::ADDRESS, Self::IDENTIFIER);
 
@@ -117,7 +119,7 @@ pub trait OnChainConfig: Send + Sync + DeserializeOwned {
         Self::deserialize_default_impl(bytes)
     }
 
-    fn fetch_config<T>(storage: T) -> Option<Self>
+    fn fetch_config<T>(storage: &T) -> Option<Self>
     where
         T: ConfigStorage,
     {
@@ -137,11 +139,11 @@ pub fn access_path_for_config(address: AccountAddress, config_name: Identifier) 
         AccessPath::resource_access_vec(&StructTag {
             address: CORE_CODE_ADDRESS,
             module: Identifier::new("LibraConfig").unwrap(),
-            name: Identifier::new("T").unwrap(),
+            name: Identifier::new("LibraConfig").unwrap(),
             type_params: vec![TypeTag::Struct(StructTag {
                 address: CORE_CODE_ADDRESS,
-                module: config_name,
-                name: Identifier::new("T").unwrap(),
+                module: config_name.clone(),
+                name: config_name,
                 type_params: vec![],
             })],
         }),
@@ -189,10 +191,7 @@ impl Default for ConfigurationResource {
         Self {
             epoch: 0,
             last_reconfiguration_time: 0,
-            events: EventHandle::new_from_address(
-                &crate::account_config::association_address(),
-                16,
-            ),
+            events: EventHandle::new_from_address(&crate::account_config::libra_root_address(), 16),
         }
     }
 }

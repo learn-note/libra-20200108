@@ -3,11 +3,13 @@
 
 //! sender: alice
 script {
-use 0x0::LBR;
-use 0x0::LibraAccount;
+use 0x1::LBR::LBR;
+use 0x1::LibraAccount;
 // send a transaction with metadata and make sure we see it in the PaymentReceivedEvent
-fun main() {
-    LibraAccount::pay_from_sender_with_metadata<LBR::T>({{bob}}, 1000, x"deadbeef", x"");
+fun main(account: &signer) {
+    let with_cap = LibraAccount::extract_withdraw_capability(account);
+    LibraAccount::pay_from<LBR>(&with_cap, {{bob}}, 1000, x"deadbeef", x"");
+    LibraAccount::restore_withdraw_capability(with_cap);
 }
 }
 
@@ -20,16 +22,19 @@ fun main() {
 //! new-transaction
 //! sender: alice
 script {
-use 0x0::LibraAccount;
-use 0x0::LBR;
+use 0x1::LibraAccount;
+use 0x1::LBR::LBR;
 // same thing, but using "deposit_with_metadata" API
-fun main() {
-    LibraAccount::deposit_with_metadata<LBR::T>(
+fun main(account: &signer) {
+    let with_cap = LibraAccount::extract_withdraw_capability(account);
+    LibraAccount::pay_from<LBR>(
+        &with_cap,
         {{bob}},
-        LibraAccount::withdraw_from_sender<LBR::T>(100),
+        100,
         x"deadbeef",
         x""
-    )
+    );
+    LibraAccount::restore_withdraw_capability(with_cap);
 }
 }
 

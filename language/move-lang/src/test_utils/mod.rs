@@ -20,14 +20,15 @@ pub const IR_EXTENSION: &str = "mvir";
 
 pub const DEBUG_MODULE_FILE_NAME: &str = "debug.move";
 
-pub const COMPLETED_DIRECTORIES: &[&str; 4] = &[
+pub const COMPLETED_DIRECTORIES: &[&str; 5] = &[
     "borrow_tests",
     "commands",
     "generics/instantiation_loops",
     "signer",
+    "operators",
 ];
 
-/// We need to replicate the specification of the (non-staged) stdlib files here since we can't
+/// We need to replicate the specification of the (non-compiled) stdlib files here since we can't
 /// import the stdlib crate: it will create a circular dependency since the stdlib needs the
 /// compiler to compile the stdlib and scripts.
 pub fn stdlib_files(stdlib_dir: impl AsRef<Path>) -> Vec<String> {

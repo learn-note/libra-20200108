@@ -1,5 +1,5 @@
-//! type-args: 0x0::LibraAccount::T
+//! type-args: 0x1::LibraAccount::LibraAccount
 main<T: copyable>() {
     return;
 }
-// check: CONTRAINT_KIND_MISMATCH
+// check: CONSTRAINT_KIND_MISMATCH

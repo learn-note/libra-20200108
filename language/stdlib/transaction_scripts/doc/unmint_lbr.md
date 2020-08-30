@@ -5,17 +5,20 @@
 
 ### Table of Contents
 
--  [Function `main`](#SCRIPT_main)
+-  [Function `unmint_lbr`](#SCRIPT_unmint_lbr)
 
 
 
-<a name="SCRIPT_main"></a>
+<a name="SCRIPT_unmint_lbr"></a>
 
-## Function `main`
+## Function `unmint_lbr`
+
+Unmints
+<code>amount_lbr</code> LBR from the sending account into the constituent coins and deposits
+the resulting coins into the sending account.
 
 
-
-<pre><code><b>public</b> <b>fun</b> <a href="#SCRIPT_main">main</a>(account: &signer, amount_lbr: u64)
+<pre><code><b>public</b> <b>fun</b> <a href="#SCRIPT_unmint_lbr">unmint_lbr</a>(account: &signer, amount_lbr: u64)
 </code></pre>
 
 
@@ -24,12 +27,10 @@
 <summary>Implementation</summary>
 
 
-<pre><code><b>fun</b> <a href="#SCRIPT_main">main</a>(account: &signer, amount_lbr: u64) {
-    <b>let</b> sender = <a href="../../modules/doc/Signer.md#0x0_Signer_address_of">Signer::address_of</a>(account);
-    <b>let</b> lbr = <a href="../../modules/doc/LibraAccount.md#0x0_LibraAccount_withdraw_from_sender">LibraAccount::withdraw_from_sender</a>&lt;<a href="../../modules/doc/LBR.md#0x0_LBR_T">LBR::T</a>&gt;(amount_lbr);
-    <b>let</b> (coin1, coin2) = <a href="../../modules/doc/LBR.md#0x0_LBR_unpack">LBR::unpack</a>(lbr);
-    <a href="../../modules/doc/LibraAccount.md#0x0_LibraAccount_deposit">LibraAccount::deposit</a>(sender, coin1);
-    <a href="../../modules/doc/LibraAccount.md#0x0_LibraAccount_deposit">LibraAccount::deposit</a>(sender, coin2);
+<pre><code><b>fun</b> <a href="#SCRIPT_unmint_lbr">unmint_lbr</a>(account: &signer, amount_lbr: u64) {
+    <b>let</b> withdraw_cap = <a href="../../modules/doc/LibraAccount.md#0x1_LibraAccount_extract_withdraw_capability">LibraAccount::extract_withdraw_capability</a>(account);
+    <a href="../../modules/doc/LibraAccount.md#0x1_LibraAccount_unstaple_lbr">LibraAccount::unstaple_lbr</a>(&withdraw_cap, amount_lbr);
+    <a href="../../modules/doc/LibraAccount.md#0x1_LibraAccount_restore_withdraw_capability">LibraAccount::restore_withdraw_capability</a>(withdraw_cap);
 }
 </code></pre>
 

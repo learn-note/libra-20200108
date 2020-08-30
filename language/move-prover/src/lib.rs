@@ -9,10 +9,13 @@ use crate::{
     cli::{Options, INLINE_PRELUDE},
     prelude_template_helpers::StratificationHelper,
 };
+use abigen::Abigen;
 use anyhow::anyhow;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream, WriteColor};
-use docgen::docgen::Docgen;
+use docgen::Docgen;
+use errmapgen::ErrmapGen;
 use handlebars::Handlebars;
+use itertools::Itertools;
 #[allow(unused_imports)]
 use log::{debug, info, warn};
 use move_lang::find_move_filenames;
@@ -26,6 +29,10 @@ use stackless_bytecode_generator::{
     function_target_pipeline::{FunctionTargetPipeline, FunctionTargetsHolder},
     livevar_analysis::LiveVarAnalysisProcessor,
     packref_analysis::PackrefAnalysisProcessor,
+    reaching_def_analysis::ReachingDefProcessor,
+    stackless_bytecode::{Bytecode, Operation},
+    test_instrumenter::TestInstrumenter,
+    usage_analysis::{self, UsageProcessor},
     writeback_analysis::WritebackAnalysisProcessor,
 };
 use std::{
@@ -64,7 +71,7 @@ pub fn run_move_prover<W: WriteColor>(
         env.report_errors(error_writer);
         return Err(anyhow!("exiting with checking errors"));
     }
-    if env.has_warnings() {
+    if options.prover.report_warnings && env.has_warnings() {
         env.report_warnings(error_writer);
     }
 
@@ -72,11 +79,28 @@ pub fn run_move_prover<W: WriteColor>(
     if options.run_docgen {
         return run_docgen(&env, &options, now);
     }
+    // Same for ABI generator.
+    if options.run_abigen {
+        return run_abigen(&env, &options, now);
+    }
+    // Same for the error map generator
+    if options.run_errmapgen {
+        return run_errmapgen(&env, &options, now);
+    }
     let targets = create_and_process_bytecode(&options, &env);
     if env.has_errors() {
         env.report_errors(error_writer);
         return Err(anyhow!("exiting with transformation errors"));
     }
+    if options.run_packed_types_gen {
+        return run_packed_types_gen(&env, &targets, now);
+    }
+    check_modifies(&env, &targets);
+    if env.has_errors() {
+        env.report_errors(error_writer);
+        return Err(anyhow!("exiting with modifies checking errors"));
+    }
+
     let writer = CodeWriter::new(env.internal_loc());
     add_prelude(&options, &writer)?;
     let mut translator = BoogieTranslator::new(&env, &options, &targets, &writer);
@@ -85,6 +109,7 @@ pub fn run_move_prover<W: WriteColor>(
         env.report_errors(error_writer);
         return Err(anyhow!("exiting with boogie generation errors"));
     }
+    let output_existed = std::path::Path::new(&options.output_path).exists();
     debug!("writing boogie to `{}`", &options.output_path);
     writer.process_result(|result| fs::write(&options.output_path, result))?;
     let translator_elapsed = now.elapsed();
@@ -115,12 +140,15 @@ pub fn run_move_prover<W: WriteColor>(
                 options.backend.bench_repeat
             );
         }
-
         if env.has_errors() {
             env.report_errors(error_writer);
             return Err(anyhow!("exiting with boogie verification errors"));
         }
     }
+    if !output_existed && !options.backend.keep_artifacts {
+        std::fs::remove_file(&options.output_path).unwrap_or_default();
+    }
+
     Ok(())
 }
 
@@ -139,6 +167,64 @@ fn run_docgen(env: &GlobalEnv, options: &Options, now: Instant) -> anyhow::Resul
         fs::create_dir_all(path.parent().unwrap())?;
         fs::write(path.as_path(), content)?;
     }
+    let generating_elapsed = now.elapsed();
+    info!(
+        "{:.3}s checking, {:.3}s generating",
+        checking_elapsed.as_secs_f64(),
+        (generating_elapsed - checking_elapsed).as_secs_f64()
+    );
+    Ok(())
+}
+
+fn run_abigen(env: &GlobalEnv, options: &Options, now: Instant) -> anyhow::Result<()> {
+    let mut generator = Abigen::new(env, &options.abigen);
+    let checking_elapsed = now.elapsed();
+    info!("generating ABI files");
+    generator.gen();
+    for (file, content) in generator.into_result() {
+        let path = PathBuf::from(&file);
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(path.as_path(), content)?;
+    }
+    let generating_elapsed = now.elapsed();
+    info!(
+        "{:.3}s checking, {:.3}s generating",
+        checking_elapsed.as_secs_f64(),
+        (generating_elapsed - checking_elapsed).as_secs_f64()
+    );
+    Ok(())
+}
+
+fn run_errmapgen(env: &GlobalEnv, options: &Options, now: Instant) -> anyhow::Result<()> {
+    let mut generator = ErrmapGen::new(env, &options.errmapgen);
+    let checking_elapsed = now.elapsed();
+    info!("generating error map");
+    generator.gen();
+    generator.save_result();
+    let generating_elapsed = now.elapsed();
+    info!(
+        "{:.3}s checking, {:.3}s generating",
+        checking_elapsed.as_secs_f64(),
+        (generating_elapsed - checking_elapsed).as_secs_f64()
+    );
+    Ok(())
+}
+
+fn run_packed_types_gen(
+    env: &GlobalEnv,
+    targets: &FunctionTargetsHolder,
+    now: Instant,
+) -> anyhow::Result<()> {
+    let checking_elapsed = now.elapsed();
+    info!("generating packed_types");
+    let packed_types = usage_analysis::get_packed_types(&env, &targets);
+    info!("found {:?} packed types", packed_types.len());
+    let mut access_path_type_map = BTreeMap::new();
+    for ty in packed_types {
+        access_path_type_map.insert(ty.access_vector(), ty);
+    }
+    // TODO: save to disk, resource-viewer and an LCS schema extractor should look at this
+
     let generating_elapsed = now.elapsed();
     info!(
         "{:.3}s checking, {:.3}s generating",
@@ -170,6 +256,39 @@ fn add_prelude(options: &Options, writer: &CodeWriter) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check modifies annotations
+fn check_modifies(env: &GlobalEnv, targets: &FunctionTargetsHolder) {
+    use Bytecode::*;
+    use Operation::*;
+
+    for module_env in env.get_modules() {
+        for func_env in module_env.get_functions() {
+            let caller_func_target = targets.get_target(&func_env);
+            for code in caller_func_target.get_bytecode() {
+                if let Call(_, _, oper, _) = code {
+                    if let Function(mid, fid, _) = oper {
+                        let callee = mid.qualified(*fid);
+                        let callee_func_env = env.get_function(callee);
+                        let callee_func_target = targets.get_target(&callee_func_env);
+                        let callee_modified_memory =
+                            usage_analysis::get_modified_memory(&callee_func_target);
+                        caller_func_target.get_modify_targets().keys().for_each(|target| {
+                                if callee_modified_memory.contains(target) && callee_func_target.get_modify_targets_for_type(target).is_none() {
+                                    let loc = caller_func_target.get_bytecode_loc(code.get_attr_id());
+                                    env.error(&loc, &format!(
+                                                        "caller `{}` specifies modify targets for `{}::{}` but callee does not",
+                                                        env.symbol_pool().string(caller_func_target.get_name()),
+                                                        env.get_module(target.module_id).get_name().display(env.symbol_pool()),
+                                                        env.symbol_pool().string(target.id.symbol())));
+                                }
+                            });
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Create bytecode and process it.
 fn create_and_process_bytecode(options: &Options, env: &GlobalEnv) -> FunctionTargetsHolder {
     let mut targets = FunctionTargetsHolder::default();
@@ -189,21 +308,24 @@ fn create_and_process_bytecode(options: &Options, env: &GlobalEnv) -> FunctionTa
 }
 
 /// Function to create the transformation pipeline.
-fn create_bytecode_processing_pipeline(_options: &Options) -> FunctionTargetPipeline {
+fn create_bytecode_processing_pipeline(options: &Options) -> FunctionTargetPipeline {
     let mut res = FunctionTargetPipeline::default();
 
     // Add processors in order they are executed.
+    res.add_processor(ReachingDefProcessor::new());
     res.add_processor(EliminateImmRefsProcessor::new());
     res.add_processor(LiveVarAnalysisProcessor::new());
     res.add_processor(BorrowAnalysisProcessor::new());
     res.add_processor(WritebackAnalysisProcessor::new());
     res.add_processor(PackrefAnalysisProcessor::new());
     res.add_processor(EliminateMutRefsProcessor::new());
+    res.add_processor(TestInstrumenter::new(options.prover.verify_scope));
+    res.add_processor(UsageProcessor::new());
 
     res
 }
 
-/// Calculates transitive dependencies of the given move sources.
+/// Calculates transitive dependencies of the given Move sources.
 fn calculate_deps(sources: &[String], input_deps: &[String]) -> anyhow::Result<Vec<String>> {
     let file_map = calculate_file_map(input_deps)?;
     let mut deps = vec![];
@@ -211,7 +333,25 @@ fn calculate_deps(sources: &[String], input_deps: &[String]) -> anyhow::Result<V
     for src in sources.iter() {
         calculate_deps_recursively(Path::new(src), &file_map, &mut visited, &mut deps)?;
     }
+    // Remove input sources from deps. They can end here because our dep analysis is an
+    // over-approximation and for example cannot distinguish between references inside
+    // and outside comments.
+    let canonical_sources = sources
+        .iter()
+        .map(|s| canonicalize(s))
+        .collect::<BTreeSet<_>>();
+    let deps = deps
+        .into_iter()
+        .filter(|d| !canonical_sources.contains(&canonicalize(d)))
+        .collect_vec();
     Ok(deps)
+}
+
+fn canonicalize(s: &str) -> String {
+    match fs::canonicalize(s) {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => s.to_string(),
+    }
 }
 
 /// Recursively calculate dependencies.
@@ -222,10 +362,11 @@ fn calculate_deps_recursively(
     deps: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     static REX: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?m)0x[0-9abcdefABCDEF]+::\s*(\w+)").unwrap());
+        Lazy::new(|| Regex::new(r"(?m)use\s*0x[0-9abcdefABCDEF]+::\s*(\w+)").unwrap());
     if !visited.insert(path.to_string_lossy().to_string()) {
         return Ok(());
     }
+    debug!("including `{}`", path.display());
     for dep in extract_matches(path, &*REX)? {
         if let Some(dep_path) = file_map.get(&dep) {
             let dep_str = dep_path.to_string_lossy().to_string();

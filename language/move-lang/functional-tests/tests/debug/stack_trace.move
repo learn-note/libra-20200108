@@ -3,7 +3,7 @@
 
 //! sender: alice
 module M {
-    use 0x0::Debug;
+    use 0x1::Debug;
 
     public fun sum(n: u64): u64 {
         if (n < 2) {
@@ -35,16 +35,16 @@ module N {
 //! sender: alice
 script {
 use {{bob}}::N;
-use 0x0::Vector;
-use 0x0::Debug;
-use 0x0::LibraAccount;
+use 0x1::Vector;
+use 0x1::Debug;
+use 0x1::LibraAccount::LibraAccount;
 
 fun main() {
     let v = Vector::empty();
     Vector::push_back(&mut v, true);
     Vector::push_back(&mut v, false);
     let r = Vector::borrow(&mut v, 1);
-    let x = N::foo<bool, LibraAccount::T>();
+    let x = N::foo<bool, LibraAccount>();
     Debug::print(&x);
     _ = r;
 }

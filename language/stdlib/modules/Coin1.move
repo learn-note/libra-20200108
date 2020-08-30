@@ -1,24 +1,31 @@
-address 0x0 {
+address 0x1 {
 
 module Coin1 {
-    use 0x0::Libra;
-    use 0x0::Association;
-    use 0x0::FixedPoint32;
+    use 0x1::AccountLimits;
+    use 0x1::Libra;
+    use 0x1::LibraTimestamp;
+    use 0x1::FixedPoint32;
 
-    struct T { }
+    struct Coin1 { }
 
-    public fun initialize(account: &signer): (Libra::MintCapability<T>, Libra::BurnCapability<T>) {
-        Association::assert_is_association(account);
-        // Register the Coin1 currency.
-        Libra::register_currency<T>(
-            account,
+    spec module {
+        invariant [global] LibraTimestamp::is_operating() ==> Libra::is_currency<Coin1>();
+    }
+
+    public fun initialize(
+        lr_account: &signer,
+        tc_account: &signer,
+    ) {
+        LibraTimestamp::assert_genesis();
+        Libra::register_SCS_currency<Coin1>(
+            lr_account,
+            tc_account,
             FixedPoint32::create_from_rational(1, 2), // exchange rate to LBR
-            false,   // is_synthetic
             1000000, // scaling_factor = 10^6
             100,     // fractional_part = 10^2
-            b"Coin1",
-        )
+            b"Coin1"
+        );
+        AccountLimits::publish_unrestricted_limits<Coin1>(lr_account);
     }
 }
-
 }

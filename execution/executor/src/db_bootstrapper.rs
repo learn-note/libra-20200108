@@ -8,10 +8,10 @@ use anyhow::{ensure, format_err, Result};
 use executor_types::BlockExecutor;
 use libra_crypto::{hash::PRE_GENESIS_BLOCK_ID, HashValue};
 use libra_logger::prelude::*;
-use libra_state_view::StateView;
+use libra_state_view::{StateView, StateViewId};
 use libra_types::{
     access_path::AccessPath,
-    account_config::association_address,
+    account_config::libra_root_address,
     block_info::{BlockInfo, GENESIS_EPOCH, GENESIS_ROUND, GENESIS_TIMESTAMP_USECS},
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     libra_timestamp::LibraTimestampResource,
@@ -24,19 +24,41 @@ use move_core_types::move_resource::MoveResource;
 use std::collections::btree_map::BTreeMap;
 use storage_interface::{state_view::VerifiedStateView, DbReaderWriter, TreeState};
 
-pub fn bootstrap_db_if_empty<V: VMExecutor>(
+pub fn generate_waypoint<V: VMExecutor>(
     db: &DbReaderWriter,
     genesis_txn: &Transaction,
-) -> Result<Option<Waypoint>> {
+) -> Result<Waypoint> {
     let tree_state = db.reader.get_latest_tree_state()?;
-    if !tree_state.is_empty() {
-        return Ok(None);
+
+    let committer = calculate_genesis::<V>(db, tree_state, genesis_txn)?;
+    Ok(committer.waypoint)
+}
+
+/// If current version + 1 != waypoint.version(), return Ok(false) indicating skipping the txn.
+/// otherwise apply the txn and commit it if the result matches the waypoint.
+/// Returns Ok(true) if committed otherwise Err.
+pub fn maybe_bootstrap<V: VMExecutor>(
+    db: &DbReaderWriter,
+    genesis_txn: &Transaction,
+    waypoint: Waypoint,
+) -> Result<bool> {
+    let tree_state = db.reader.get_latest_tree_state()?;
+    // if the waypoint is not targeted with the genesis txn, it may be either already bootstrapped, or
+    // aiming for state sync to catch up.
+    if tree_state.num_transactions != waypoint.version() {
+        info!("Skip genesis txn");
+        return Ok(false);
     }
 
     let committer = calculate_genesis::<V>(db, tree_state, genesis_txn)?;
-    let waypoint = committer.waypoint;
+    ensure!(
+        waypoint == committer.waypoint(),
+        "Waypoint verification failed. Expected {:?}, got {:?}.",
+        waypoint,
+        committer.waypoint(),
+    );
     committer.commit()?;
-    Ok(Some(waypoint))
+    Ok(true)
 }
 
 pub struct GenesisCommitter<V: VMExecutor> {
@@ -89,7 +111,8 @@ pub fn calculate_genesis<V: VMExecutor>(
         GENESIS_EPOCH
     } else {
         let executor_trees = executor.get_executed_trees(*PRE_GENESIS_BLOCK_ID)?;
-        let state_view = executor.get_executed_state_view(&executor_trees);
+        let state_view =
+            executor.get_executed_state_view(StateViewId::Miscellaneous, &executor_trees);
         get_state_epoch(&state_view)?
     };
 
@@ -103,7 +126,7 @@ pub fn calculate_genesis<V: VMExecutor>(
         .as_ref()
         .ok_or_else(|| format_err!("Genesis transaction must emit a epoch change."))?;
     let executed_trees = executor.get_executed_trees(block_id)?;
-    let state_view = executor.get_executed_state_view(&executed_trees);
+    let state_view = executor.get_executed_state_view(StateViewId::Miscellaneous, &executed_trees);
     let timestamp_usecs = if genesis_version == 0 {
         // TODO(aldenhu): fix existing tests before using real timestamp and check on-chain epoch.
         GENESIS_TIMESTAMP_USECS
@@ -142,7 +165,7 @@ pub fn calculate_genesis<V: VMExecutor>(
 fn get_state_timestamp(state_view: &VerifiedStateView) -> Result<u64> {
     let rsrc_bytes = &state_view
         .get(&AccessPath::new(
-            association_address(),
+            libra_root_address(),
             LibraTimestampResource::resource_path(),
         ))?
         .ok_or_else(|| format_err!("LibraTimestampResource missing."))?;

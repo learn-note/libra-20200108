@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::Result;
 use libra_types::account_address::AccountAddress;
-use move_core_types::{identifier::Identifier, language_storage::ModuleId};
+use move_core_types::{identifier::Identifier, language_storage::ModuleId, value::MoveValue};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,7 +20,7 @@ use std::{
 //**************************************************************************************************
 
 #[derive(Debug, Clone)]
-/// A set of move modules and a Move transaction script
+/// A set of Move modules and a Move transaction script
 pub struct Program {
     /// The modules to publish
     pub modules: Vec<ModuleDefinition>,
@@ -46,13 +46,16 @@ pub enum ScriptOrModule {
 //**************************************************************************************************
 
 #[derive(Debug, Clone)]
-/// The move transaction script to be executed
+/// The Move transaction script to be executed
 pub struct Script {
     /// The dependencies of `main`, i.e. of the transaction script
     pub imports: Vec<ImportDefinition>,
     /// Explicit declaration of dependencies. If not provided, will be inferred based on given
     /// dependencies to the IR compiler
     pub explicit_dependency_declarations: Vec<ModuleDependency>,
+    /// the constants that the module defines. Only a utility, the identifiers are not carried into
+    /// the Move bytecode
+    pub constants: Vec<Constant>,
     /// The transaction script's `main` procedure
     pub main: Function,
 }
@@ -87,6 +90,9 @@ pub struct ModuleDefinition {
     pub explicit_dependency_declarations: Vec<ModuleDependency>,
     /// the structs (including resources) that the module defines
     pub structs: Vec<StructDefinition>,
+    /// the constants that the script defines. Only a utility, the identifiers are not carried into
+    /// the Move bytecode
+    pub constants: Vec<Constant>,
     /// the procedure that the module defines
     pub functions: Vec<(FunctionName, Function)>,
     /// the synthetic, specification variables the module defines.
@@ -260,6 +266,25 @@ pub enum StructDefinitionFields {
 }
 
 //**************************************************************************************************
+// Structs
+//**************************************************************************************************
+
+/// Newtype for the name of a constant
+#[derive(Debug, Serialize, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Clone)]
+pub struct ConstantName(String);
+
+/// A constant declaration in a module or script
+#[derive(Clone, Debug, PartialEq)]
+pub struct Constant {
+    /// The constant's name. Not carried through to the Move bytecode
+    pub name: ConstantName,
+    /// The type of the constant's value
+    pub signature: Type,
+    /// The constant's value
+    pub value: MoveValue,
+}
+
+//**************************************************************************************************
 // Functions
 //**************************************************************************************************
 
@@ -351,13 +376,9 @@ pub enum Builtin {
     /// Get a reference to the resource(`StructName` resolved by current module) associated
     /// with the given address
     BorrowGlobal(bool, StructName, Vec<Type>),
-    /// Returns the address of the current transaction's sender
-    GetTxnSender,
 
     /// Remove a resource of the given type from the account with the given address
     MoveFrom(StructName, Vec<Type>),
-    /// Publish an instantiated struct object into sender's account.
-    MoveToSender(StructName, Vec<Type>),
     /// Publish an instantiated struct object into signer's (signer is the first arg) account.
     MoveTo(StructName, Vec<Type>),
 
@@ -627,6 +648,7 @@ pub enum Bytecode_ {
     LdAddr(AccountAddress),
     LdTrue,
     LdFalse,
+    LdConst(ConstantName),
     CopyLoc(Var),
     MoveLoc(Var),
     StLoc(Var),
@@ -660,10 +682,8 @@ pub enum Bytecode_ {
     Le,
     Ge,
     Abort,
-    GetTxnSenderAddress,
     Exists(StructName, Vec<Type>),
     MoveFrom(StructName, Vec<Type>),
-    MoveToSender(StructName, Vec<Type>),
     MoveTo(StructName, Vec<Type>),
     Shl,
     Shr,
@@ -697,11 +717,13 @@ impl Script {
     pub fn new(
         imports: Vec<ImportDefinition>,
         explicit_dependency_declarations: Vec<ModuleDependency>,
+        constants: Vec<Constant>,
         main: Function,
     ) -> Self {
         Script {
             imports,
             explicit_dependency_declarations,
+            constants,
             main,
         }
     }
@@ -787,6 +809,7 @@ impl ModuleDefinition {
         imports: Vec<ImportDefinition>,
         explicit_dependency_declarations: Vec<ModuleDependency>,
         structs: Vec<StructDefinition>,
+        constants: Vec<Constant>,
         functions: Vec<(FunctionName, Function)>,
         synthetics: Vec<SyntheticDefinition>,
     ) -> Result<Self> {
@@ -795,6 +818,7 @@ impl ModuleDefinition {
             imports,
             explicit_dependency_declarations,
             structs,
+            constants,
             functions,
             synthetics,
         })
@@ -933,6 +957,23 @@ impl StructDefinition_ {
             fields: StructDefinitionFields::Native,
             invariants: vec![],
         })
+    }
+}
+
+impl ConstantName {
+    /// Create a new `ConstantName` from a string
+    pub fn new(name: String) -> Self {
+        ConstantName(name)
+    }
+
+    /// Converts self into a string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Accessor for the name of the function
+    pub fn as_inner(&self) -> &str {
+        &self.0
     }
 }
 
@@ -1255,9 +1296,23 @@ impl fmt::Display for ScriptOrModule {
 impl fmt::Display for Script {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Script(")?;
+
         write!(f, "Imports(")?;
         write!(f, "{}", intersperse(&self.imports, ", "))?;
         writeln!(f, ")")?;
+
+        writeln!(f, "Dependency(")?;
+        for dependency in &self.explicit_dependency_declarations {
+            writeln!(f, "{},", dependency)?;
+        }
+        writeln!(f, ")")?;
+
+        writeln!(f, "Constants(")?;
+        for constant in &self.constants {
+            writeln!(f, "{};", constant)?;
+        }
+        writeln!(f, ")")?;
+
         write!(f, "Main(")?;
         write!(f, "{}", self.main)?;
         write!(f, ")")?;
@@ -1306,6 +1361,12 @@ impl fmt::Display for ModuleDefinition {
         writeln!(f, "Structs(")?;
         for struct_def in &self.structs {
             writeln!(f, "{}, ", struct_def)?;
+        }
+        writeln!(f, ")")?;
+
+        writeln!(f, "Constants(")?;
+        for constant in &self.constants {
+            writeln!(f, "{};", constant)?;
         }
         writeln!(f, ")")?;
 
@@ -1376,6 +1437,16 @@ impl fmt::Display for StructDefinition_ {
     }
 }
 
+impl fmt::Display for Constant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "const {}: {} = {:?}",
+            &self.name.0, self.signature, self.value
+        )
+    }
+}
+
 impl fmt::Display for Function_ {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} ({})", self.signature, self.body)
@@ -1395,6 +1466,12 @@ impl fmt::Display for StructName {
 }
 
 impl fmt::Display for FunctionName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for ConstantName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -1522,11 +1599,7 @@ impl fmt::Display for Builtin {
                     format_type_actuals(tys)
                 )
             }
-            Builtin::GetTxnSender => write!(f, "get_txn_sender"),
             Builtin::MoveFrom(t, tys) => write!(f, "move_from<{}{}>", t, format_type_actuals(tys)),
-            Builtin::MoveToSender(t, tys) => {
-                write!(f, "move_to_sender<{}{}>", t, format_type_actuals(tys))
-            }
             Builtin::MoveTo(t, tys) => write!(f, "move_to<{}{}>", t, format_type_actuals(tys)),
             Builtin::Freeze => write!(f, "freeze"),
             Builtin::ToU8 => write!(f, "to_u8"),
@@ -1779,6 +1852,7 @@ impl fmt::Display for Bytecode_ {
             Bytecode_::LdAddr(a) => write!(f, "LdAddr {}", a),
             Bytecode_::LdTrue => write!(f, "LdTrue"),
             Bytecode_::LdFalse => write!(f, "LdFalse"),
+            Bytecode_::LdConst(n) => write!(f, "LdConst({})", &n.0),
             Bytecode_::CopyLoc(v) => write!(f, "CopyLoc {}", v),
             Bytecode_::MoveLoc(v) => write!(f, "MoveLoc {}", v),
             Bytecode_::StLoc(v) => write!(f, "StLoc {}", v),
@@ -1828,12 +1902,8 @@ impl fmt::Display for Bytecode_ {
             Bytecode_::Le => write!(f, "Le"),
             Bytecode_::Ge => write!(f, "Ge"),
             Bytecode_::Abort => write!(f, "Abort"),
-            Bytecode_::GetTxnSenderAddress => write!(f, "GetTxnSenderAddress"),
             Bytecode_::Exists(n, tys) => write!(f, "Exists {}{}", n, format_type_actuals(tys)),
             Bytecode_::MoveFrom(n, tys) => write!(f, "MoveFrom {}{}", n, format_type_actuals(tys)),
-            Bytecode_::MoveToSender(n, tys) => {
-                write!(f, "MoveToSender {}{}", n, format_type_actuals(tys))
-            }
             Bytecode_::MoveTo(n, tys) => write!(f, "MoveTo {}{}", n, format_type_actuals(tys)),
             Bytecode_::Shl => write!(f, "Shl"),
             Bytecode_::Shr => write!(f, "Shr"),

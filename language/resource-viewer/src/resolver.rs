@@ -1,19 +1,22 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::module_cache::ModuleCache;
+use crate::{
+    fat_type::{FatStructType, FatType},
+    module_cache::ModuleCache,
+};
 use anyhow::{anyhow, Result};
+use compiled_stdlib::{stdlib_modules, StdLibOptions};
 use libra_state_view::StateView;
 use libra_types::{access_path::AccessPath, account_address::AccountAddress};
 use move_core_types::{
     identifier::{IdentStr, Identifier},
     language_storage::{ModuleId, StructTag, TypeTag},
 };
-use move_vm_types::loaded_data::types::{FatStructType, FatType};
 use std::rc::Rc;
-use stdlib::{stdlib_modules, StdLibOptions};
 use vm::{
     access::ModuleAccess,
+    errors::PartialVMError,
     file_format::{
         SignatureToken, StructDefinitionIndex, StructFieldInformation, StructHandleIndex,
     },
@@ -29,9 +32,9 @@ impl<'a> Resolver<'a> {
     pub fn new(state: &'a dyn StateView, use_stdlib: bool) -> Self {
         let cache = ModuleCache::new();
         if use_stdlib {
-            let modules = stdlib_modules(StdLibOptions::Staged);
+            let modules = stdlib_modules(StdLibOptions::Compiled);
             for module in modules {
-                cache.insert(module.self_id(), module.clone().into_inner());
+                cache.insert(module.self_id(), module.clone());
             }
         }
         Resolver { state, cache }
@@ -72,7 +75,15 @@ impl<'a> Resolver<'a> {
     pub fn resolve_struct(&self, struct_tag: &StructTag) -> Result<FatStructType> {
         let module = self.get_module(&struct_tag.address, &struct_tag.module)?;
         let struct_def = find_struct_def_in_module(module.clone(), struct_tag.name.as_ident_str())?;
-        self.resolve_struct_definition(module, struct_def)
+        let ty_args = struct_tag
+            .type_params
+            .iter()
+            .map(|ty| self.resolve_type(ty))
+            .collect::<Result<Vec<_>>>()?;
+        let ty_body = self.resolve_struct_definition(module, struct_def)?;
+        ty_body.subst(&ty_args).map_err(|e: PartialVMError| {
+            anyhow!("StructTag {:?} cannot be resolved: {:?}", struct_tag, e)
+        })
     }
 
     pub fn get_field_names(&self, ty: &FatStructType) -> Result<Vec<Identifier>> {

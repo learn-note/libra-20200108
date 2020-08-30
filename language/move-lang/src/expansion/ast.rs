@@ -3,8 +3,9 @@
 
 use crate::{
     parser::ast::{
-        BinOp, Field, FunctionName, FunctionVisibility, Kind, ModuleIdent, ResourceLoc,
-        SpecApplyPattern, SpecBlockTarget, SpecConditionKind, StructName, UnaryOp, Var,
+        BinOp, ConstantName, Field, FunctionName, FunctionVisibility, Kind, ModuleIdent,
+        ResourceLoc, SpecApplyPattern, SpecBlockTarget, SpecConditionKind, StructName, UnaryOp,
+        Var,
     },
     shared::{ast_debug::*, unique_map::UniqueMap, *},
 };
@@ -31,6 +32,7 @@ pub struct Program {
 #[derive(Debug)]
 pub struct Script {
     pub loc: Loc,
+    pub constants: UniqueMap<ConstantName, Constant>,
     pub function_name: FunctionName,
     pub function: Function,
     pub specs: Vec<SpecBlock>,
@@ -46,6 +48,7 @@ pub struct ModuleDefinition {
     pub is_source_module: bool,
     pub structs: UniqueMap<StructName, StructDefinition>,
     pub functions: UniqueMap<FunctionName, Function>,
+    pub constants: UniqueMap<ConstantName, Constant>,
     pub specs: Vec<SpecBlock>,
 }
 
@@ -102,6 +105,17 @@ pub struct Function {
 }
 
 //**************************************************************************************************
+// Constants
+//**************************************************************************************************
+
+#[derive(PartialEq, Debug)]
+pub struct Constant {
+    pub loc: Loc,
+    pub signature: Type,
+    pub value: Exp,
+}
+
+//**************************************************************************************************
 // Specification Blocks
 //**************************************************************************************************
 
@@ -117,9 +131,12 @@ pub type SpecBlock = Spanned<SpecBlock_>;
 pub enum SpecBlockMember_ {
     Condition {
         kind: SpecConditionKind,
+        properties: Vec<PragmaProperty>,
         exp: Exp,
+        additional_exps: Vec<Exp>,
     },
     Function {
+        uninterpreted: bool,
         name: FunctionName,
         signature: FunctionSignature,
         body: FunctionBody,
@@ -129,6 +146,10 @@ pub enum SpecBlockMember_ {
         name: Name,
         type_parameters: Vec<(Name, Kind)>,
         type_: Type,
+    },
+    Let {
+        name: Name,
+        def: Exp,
     },
     Include {
         exp: Exp,
@@ -195,7 +216,7 @@ pub enum ExpDotted_ {
 }
 pub type ExpDotted = Spanned<ExpDotted_>;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Value_ {
     // 0x<hex representation up to 64 digits with padding 0s>
     Address(Address),
@@ -221,7 +242,6 @@ pub enum Exp_ {
     Copy(Var),
 
     Name(ModuleAccess, Option<Vec<Type>>),
-    GlobalCall(Name, Option<Vec<Type>>, Spanned<Vec<Exp>>),
     Call(ModuleAccess, Option<Vec<Type>>, Spanned<Vec<Exp>>),
     Pack(ModuleAccess, Option<Vec<Type>>, Fields<Exp>),
 
@@ -354,10 +374,15 @@ impl AstDebug for Script {
     fn ast_debug(&self, w: &mut AstWriter) {
         let Script {
             loc: _loc,
+            constants,
             function_name,
             function,
             specs,
         } = self;
+        for cdef in constants {
+            cdef.ast_debug(w);
+            w.new_line();
+        }
         (function_name.clone(), function).ast_debug(w);
         for spec in specs {
             spec.ast_debug(w);
@@ -373,6 +398,7 @@ impl AstDebug for ModuleDefinition {
             is_source_module,
             structs,
             functions,
+            constants,
             specs,
         } = self;
         w.writeln(if *is_source_module {
@@ -382,6 +408,10 @@ impl AstDebug for ModuleDefinition {
         });
         for sdef in structs {
             sdef.ast_debug(w);
+            w.new_line();
+        }
+        for cdef in constants {
+            cdef.ast_debug(w);
             w.new_line();
         }
         for fdef in functions {
@@ -440,20 +470,31 @@ impl AstDebug for SpecBlock_ {
 impl AstDebug for SpecBlockMember_ {
     fn ast_debug(&self, w: &mut AstWriter) {
         match self {
-            SpecBlockMember_::Condition { kind, exp } => {
+            SpecBlockMember_::Condition {
+                kind,
+                properties: _,
+                exp,
+                additional_exps,
+            } => {
                 kind.ast_debug(w);
                 exp.ast_debug(w);
+                w.list(additional_exps, ",", |w, e| {
+                    e.ast_debug(w);
+                    true
+                });
             }
             SpecBlockMember_::Function {
+                uninterpreted,
                 signature,
                 name,
                 body,
             } => {
-                if let FunctionBody_::Native = &body.value {
+                if *uninterpreted {
+                    w.write("uninterpreted ")
+                } else if let FunctionBody_::Native = &body.value {
                     w.write("native ");
                 }
-                w.write("define ");
-                w.write(&format!("{}", name));
+                w.write(&format!("define {}", name));
                 signature.ast_debug(w);
                 match &body.value {
                     FunctionBody_::Defined(body) => w.block(|w| body.ast_debug(w)),
@@ -475,6 +516,10 @@ impl AstDebug for SpecBlockMember_ {
                 type_parameters.ast_debug(w);
                 w.write(": ");
                 type_.ast_debug(w);
+            }
+            SpecBlockMember_::Let { name, def } => {
+                w.write(&format!("let {} = ", name));
+                def.ast_debug(w);
             }
             SpecBlockMember_::Include { exp } => {
                 w.write("include ");
@@ -538,7 +583,7 @@ impl AstDebug for (FunctionName, &Function) {
         if let FunctionBody_::Native = &body.value {
             w.write("native ");
         }
-        w.write(&format!("{}", name));
+        w.write(&format!("fun {}", name));
         signature.ast_debug(w);
         if !acquires.is_empty() {
             w.write(" acquires ");
@@ -567,6 +612,24 @@ impl AstDebug for FunctionSignature {
         });
         w.write("): ");
         return_type.ast_debug(w)
+    }
+}
+
+impl AstDebug for (ConstantName, &Constant) {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        let (
+            name,
+            Constant {
+                loc: _loc,
+                signature,
+                value,
+            },
+        ) = self;
+        w.write(&format!("const {}:", name));
+        signature.ast_debug(w);
+        w.write(" = ");
+        value.ast_debug(w);
+        w.write(";");
     }
 }
 
@@ -681,17 +744,6 @@ impl AstDebug for Exp_ {
                     ss.ast_debug(w);
                     w.write(">");
                 }
-            }
-            E::GlobalCall(n, tys_opt, sp!(_, rhs)) => {
-                w.write(&format!("::{}", n));
-                if let Some(ss) = tys_opt {
-                    w.write("<");
-                    ss.ast_debug(w);
-                    w.write(">");
-                }
-                w.write("(");
-                w.comma(rhs, |w, e| e.ast_debug(w));
-                w.write(")");
             }
             E::Call(ma, tys_opt, sp!(_, rhs)) => {
                 ma.ast_debug(w);

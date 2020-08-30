@@ -2,18 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    block_storage::{PendingVotes, VoteReceptionResult},
     counters,
+    pending_votes::{PendingVotes, VoteReceptionResult},
     util::time_service::{SendTask, TimeService},
 };
 use consensus_types::{common::Round, sync_info::SyncInfo, vote::Vote};
 use libra_logger::prelude::*;
 use libra_types::validator_verifier::ValidatorVerifier;
-use std::{
-    fmt,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{fmt, sync::Arc, time::Duration};
 
 /// A reason for starting a new round: introduced for monitoring / debug purposes.
 #[derive(Eq, Debug, PartialEq)]
@@ -84,7 +80,6 @@ pub struct ExponentialTimeInterval {
     max_exponent: usize,
 }
 
-#[allow(dead_code)]
 impl ExponentialTimeInterval {
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn fixed(duration: Duration) -> Self {
@@ -143,7 +138,8 @@ pub struct RoundState {
     current_round: Round,
     // The deadline for the next local timeout event. It is reset every time a new round start, or
     // a previous deadline expires.
-    current_round_deadline: Instant,
+    // Represents as Duration since UNIX_EPOCH.
+    current_round_deadline: Duration,
     // Service for timer
     time_service: Arc<dyn TimeService>,
     // To send local timeout events to the subscriber (e.g., SMR)
@@ -192,7 +188,7 @@ impl RoundState {
             time_interval,
             highest_committed_round: 0,
             current_round: 0,
-            current_round_deadline: Instant::now(),
+            current_round_deadline: time_service.get_current_timestamp(),
             time_service,
             timeout_sender,
             pending_votes: PendingVotes::new(),
@@ -206,7 +202,7 @@ impl RoundState {
     }
 
     /// Returns deadline for current round
-    pub fn current_round_deadline(&self) -> Instant {
+    pub fn current_round_deadline(&self) -> Duration {
         self.current_round_deadline
     }
 
@@ -307,10 +303,10 @@ impl RoundState {
         let timeout = self
             .time_interval
             .get_round_duration(round_index_after_committed_round);
-        let now = Instant::now();
+        let now = self.time_service.get_current_timestamp();
         debug!(
             "{:?} passed since the previous deadline.",
-            now.checked_duration_since(self.current_round_deadline)
+            now.checked_sub(self.current_round_deadline)
                 .map_or("0 ms".to_string(), |v| format!("{:?}", v))
         );
         debug!("Set round deadline to {:?} from now", timeout);

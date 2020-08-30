@@ -4,24 +4,28 @@
 
 //! sender: bob
 script {
-use 0x0::LibraSystem;
-use 0x0::ValidatorConfig;
-fun main() {
-    // test bob is a validator
-    0x0::Transaction::assert(ValidatorConfig::is_valid({{bob}}) == true, 98);
-    0x0::Transaction::assert(LibraSystem::is_validator({{bob}}) == true, 98);
-}
+    use 0x1::LibraSystem;
+    use 0x1::ValidatorConfig;
+    fun main() {
+        // test bob is a validator
+        assert(ValidatorConfig::is_valid({{bob}}) == true, 98);
+        assert(LibraSystem::is_validator({{bob}}) == true, 98);
+    }
 }
 
 // check: EXECUTED
 
 //! new-transaction
-//! sender: association
+//! sender: libraroot
 script {
-use 0x0::LBR;
-use 0x0::LibraAccount;
-fun main() {
-    LibraAccount::create_validator_account<LBR::T>(0xAA, x"00000000000000000000000000000000");
+use 0x1::LibraAccount;
+fun main(creator: &signer) {
+//    LibraAccount::create_validator_account(
+//        creator, &r, 0xAA, x"00000000000000000000000000000000"
+    LibraAccount::create_validator_account(
+        creator, 0xAA, x"00000000000000000000000000000000", b"owner_name"
+    );
+
 }
 }
 
@@ -31,21 +35,9 @@ fun main() {
 // //! new-transaction
 // //! sender: 0xAA
 // script {
-// use 0x0::ValidatorConfig;
-// use 0x0::ValidatorOperatorConfig;
 // fun main() {
-//     ValidatorConfig::set_config(0xAA, x"10", x"20", x"30", x"40", x"50", x"60");
-//     let config = ValidatorConfig::get_config(0xAA);
-//     let consensus_pk = ValidatorConfig::get_consensus_pubkey(&config);
-//     let expected_pk = x"10";
-//     0x0::Transaction::assert(consensus_pk == &expected_pk, 98);
 //
 //     // add itself as a validator
-//     let validator_size = LibraSystem::validator_set_size();
-//     0x0::Transaction::assert(validator_size == 1, 99);
-//     LibraSystem::add_validator(0xAA);
-//    validator_size = LibraSystem::validator_set_size();
-//     0x0::Transaction::assert(validator_size == 2, 99);
 // }
 // }
 //

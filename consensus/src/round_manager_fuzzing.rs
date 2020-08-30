@@ -8,12 +8,13 @@ use crate::{
         rotating_proposer_election::RotatingProposer,
         round_state::{ExponentialTimeInterval, NewRoundEvent, NewRoundReason, RoundState},
     },
+    metrics_safety_rules::MetricsSafetyRules,
     network::NetworkSender,
     network_interface::ConsensusNetworkSender,
     persistent_liveness_storage::{PersistentLivenessStorage, RecoveryData},
     round_manager::RoundManager,
     test_utils::{EmptyStateComputer, MockStorage, MockTransactionManager},
-    util::mock_time_service::SimulatedTimeService,
+    util::{mock_time_service::SimulatedTimeService, time_service::TimeService},
 };
 use channel::{self, libra_channel, message_queues::QueueStyle};
 use consensus_types::proposal_msg::ProposalMsg;
@@ -27,10 +28,13 @@ use libra_types::{
     validator_signer::ValidatorSigner,
     validator_verifier::ValidatorVerifier,
 };
-use network::peer_manager::{ConnectionRequestSender, PeerManagerRequestSender};
+use network::{
+    peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
+    protocols::network::NewNetworkSender,
+};
 use once_cell::sync::Lazy;
 use safety_rules::{test_utils, SafetyRules, TSafetyRules};
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::runtime::Runtime;
 
 // This generates a proposal for round 1
@@ -65,6 +69,7 @@ fn build_empty_store(
         initial_data,
         Arc::new(EmptyStateComputer),
         10, // max pruned blocks in mem
+        Arc::new(SimulatedTimeService::new()),
     ))
 }
 
@@ -101,7 +106,7 @@ fn create_node_for_fuzzing() -> RoundManager {
 
     // TODO: remove
     let proof = make_initial_epoch_change_proof(&signer);
-    let mut safety_rules = SafetyRules::new(signer.author(), test_utils::test_storage(&signer));
+    let mut safety_rules = SafetyRules::new(test_utils::test_storage(&signer), false);
     safety_rules.initialize(&proof).unwrap();
 
     // TODO: mock channels
@@ -131,13 +136,14 @@ fn create_node_for_fuzzing() -> RoundManager {
 
     // TODO: remove
     let time_service = Arc::new(SimulatedTimeService::new());
+    time_service.sleep(Duration::from_millis(1));
 
     // TODO: remove
     let proposal_generator = ProposalGenerator::new(
         signer.author(),
         block_store.clone(),
-        Box::new(MockTransactionManager::new(None)),
-        time_service.clone(),
+        Arc::new(MockTransactionManager::new(None)),
+        time_service,
         1,
     );
 
@@ -154,11 +160,11 @@ fn create_node_for_fuzzing() -> RoundManager {
         round_state,
         proposer_election,
         proposal_generator,
-        Box::new(safety_rules),
+        MetricsSafetyRules::new(Box::new(safety_rules), storage.clone()),
         network,
-        Box::new(MockTransactionManager::new(None)),
+        Arc::new(MockTransactionManager::new(None)),
         storage,
-        time_service,
+        false,
     )
 }
 
@@ -179,7 +185,8 @@ pub fn fuzz_proposal(data: &[u8]) {
 
     let proposal = match proposal.verify_well_formed() {
         Ok(_) => proposal,
-        Err(_) => {
+        Err(e) => {
+            println!("{:?}", e);
             if cfg!(test) {
                 panic!();
             }

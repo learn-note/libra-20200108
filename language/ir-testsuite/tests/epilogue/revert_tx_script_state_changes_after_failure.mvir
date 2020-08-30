@@ -2,12 +2,15 @@
 //! account: bob, 1000000
 
 //! sender: alice
-import 0x0.LibraAccount;
-import 0x0.LBR;
-import 0x0.Vector;
+import 0x1.LibraAccount;
+import 0x1.LBR;
+import 0x1.Vector;
 
-main() {
-    LibraAccount.pay_from_sender<LBR.T>({{bob}}, 514);
+main(account: &signer) {
+    let with_cap: LibraAccount.WithdrawCapability;
+    with_cap = LibraAccount.extract_withdraw_capability(copy(account));
+    LibraAccount.pay_from<LBR.LBR>(&with_cap, {{bob}}, 514, h"", h"");
+    LibraAccount.restore_withdraw_capability(move(with_cap));
     assert(false, 42);
     return;
 }
@@ -17,11 +20,11 @@ main() {
 
 
 //! new-transaction
-import 0x0.LibraAccount;
-import 0x0.LBR;
+import 0x1.LibraAccount;
+import 0x1.LBR;
 
 main() {
-    assert(LibraAccount.balance<LBR.T>({{bob}}) == 1000000, 43);
+    assert(LibraAccount.balance<LBR.LBR>({{bob}}) == 1000000, 43);
     return;
 }
 

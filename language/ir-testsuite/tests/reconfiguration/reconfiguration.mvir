@@ -7,11 +7,11 @@
 //! block-time: 2
 
 //! new-transaction
-// Reconfiguration can only be invoked by association.
-import 0x0.LibraConfig;
+// Reconfiguration can only be invoked by libraroot.
+import 0x1.LibraConfig;
 
-main() {
-    LibraConfig.reconfigure();
+main(account: &signer) {
+    LibraConfig.reconfigure(copy(account));
     return;
 }
 
@@ -19,11 +19,11 @@ main() {
 // check: 1
 
 //! new-transaction
-//! sender: config
-import 0x0.LibraConfig;
+//! sender: libraroot
+import 0x1.LibraConfig;
 
-main() {
-    LibraConfig.reconfigure();
+main(account: &signer) {
+    LibraConfig.reconfigure(copy(account));
     return;
 }
 
@@ -31,12 +31,13 @@ main() {
 // check: EXECUTED
 
 //! new-transaction
-//! sender: config
+//! sender: libraroot
 // Cannot trigger two reconfiguration within the same block.
-import 0x0.LibraConfig;
+import 0x1.LibraConfig;
+// import 0x1.Roles;
 
-main() {
-    LibraConfig.reconfigure();
+main(account: &signer) {
+    LibraConfig.reconfigure(copy(account));
     return;
 }
 
@@ -48,11 +49,11 @@ main() {
 //! block-time: 3
 
 //! new-transaction
-//! sender: config
-import 0x0.LibraConfig;
+//! sender: libraroot
+import 0x1.LibraConfig;
 
-main() {
-    LibraConfig.reconfigure();
+main(account: &signer) {
+    LibraConfig.reconfigure(copy(account));
     return;
 }
 

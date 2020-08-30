@@ -1,10 +1,12 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::encrypted::{EncNetworkAddress, Key, KeyVersion};
 use libra_crypto::{
     traits::{CryptoMaterialError, ValidCryptoMaterialStringExt},
     x25519,
 };
+use move_core_types::account_address::AccountAddress;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest::{collection::vec, prelude::*};
 #[cfg(any(test, feature = "fuzzing"))]
@@ -14,37 +16,16 @@ use std::{
     convert::{Into, TryFrom},
     fmt,
     iter::IntoIterator,
-    net::{self, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{self, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     num,
     str::FromStr,
     string::ToString,
 };
 use thiserror::Error;
 
-const MAX_DNS_NAME_SIZE: usize = 255;
+pub mod encrypted;
 
-/// A `RawNetworkAddress` is the serialized, unverified, on-chain representation
-/// of a [`NetworkAddress`]. Specifically, a `RawNetworkAddress` is usually an
-/// [`lcs`]-serialized `NetworkAddress`.
-///
-/// This representation is useful because:
-///
-/// 1. Move does't understand (and doesn't really need to understand) what a
-///    `NetworkAddress` is, so we can just store an opaque `vector<u8>` on-chain,
-///    which we represent as `RawNetworkAddress` in Rust.
-/// 2. We want to deserialize a `Vec<NetworkAddress>` but ignore ones that don't
-///    properly deserialize. For example, a validator might advertise several
-///    `NetworkAddress`. If that validator is running a newer version of the node
-///    software, and old versions can't understand one of the `NetworkAddress`,
-///    they would be able to ignore the one that doesn't deserialize for them.
-///    We can easily do this by storing a `vector<vector<u8>>` on-chain, which
-///    we deserialize as `Vec<RawNetworkAddress>` in Rust. Then we deserialize
-///    each `RawNetworkAddress` into a `NetworkAddress` individually.
-///
-/// Note: deserializing a `RawNetworkAddress` does no validation, other than
-/// deserializing the underlying `Vec<u8>`.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub struct RawNetworkAddress(#[serde(with = "serde_bytes")] Vec<u8>);
+const MAX_DNS_NAME_SIZE: usize = 255;
 
 /// Libra `NetworkAddress` is a compact, efficient, self-describing and
 /// future-proof network address represented as a stack of protocols. Essentially
@@ -80,7 +61,12 @@ pub struct RawNetworkAddress(#[serde(with = "serde_bytes")] Vec<u8>);
 /// Similarly, the `Transport` takes `NetworkAddress` to listen on, which tells
 /// it what protocols to expect on the socket.
 ///
-/// An example of a serialized `NetworkAddress` and `RawNetworkAddress`:
+/// The network address is encoded with the length of the encoded NetworkAddresses and then the
+/// the protocol slices to allow for transparent upgradeability. For example, if the current
+/// software cannot decode a NetworkAddress within a Vec<NetworkAddress> it can still decode the
+/// underlying Vec<u8> and retrieve the remaining Vec<NetworkAddress>.
+///
+/// An example of a serialized `NetworkAddress`:
 ///
 /// ```rust
 /// // human-readable format:
@@ -89,35 +75,25 @@ pub struct RawNetworkAddress(#[serde(with = "serde_bytes")] Vec<u8>);
 /// //
 /// // serialized NetworkAddress:
 /// //
-/// //      [ 02 00 0a 00 00 10 05 80 00 ]
-/// //        \  \  \           \  \
-/// //         \  \  \           \  '-- u16 tcp port
-/// //          \  \  \           '-- uvarint protocol id for /tcp
-/// //           \  \  '-- u32 ipv4 address
-/// //            \  '-- uvarint protocol id for /ip4
-/// //             '-- uvarint number of protocols
-/// //
-/// // serialized RawNetworkAddress:
-/// //
-/// //   [ 09 02 00 0a 00 00 10 05 80 00 ]
-/// //     \  \
-/// //      \  '-- serialized NetworkAddress
-/// //       '-- uvarint length prefix
+/// //      [ 09 02 00 0a 00 00 10 05 80 00 ]
+/// //          \  \  \  \           \  \
+/// //           \  \  \  \           \  '-- u16 tcp port
+/// //            \  \  \  \           '-- uvarint protocol id for /tcp
+/// //             \  \  \  '-- u32 ipv4 address
+/// //              \  \  '-- uvarint protocol id for /ip4
+/// //               \  '-- uvarint number of protocols
+/// //                '-- length of encoded network address
 ///
-/// use libra_network_address::{NetworkAddress, RawNetworkAddress};
+/// use libra_network_address::NetworkAddress;
 /// use lcs;
 /// use std::{str::FromStr, convert::TryFrom};
 ///
 /// let addr = NetworkAddress::from_str("/ip4/10.0.0.16/tcp/80").unwrap();
-/// let raw_addr = RawNetworkAddress::try_from(&addr).unwrap();
-/// let actual_ser_raw_addr = lcs::to_bytes(&raw_addr).unwrap();
-/// let actual_raw_addr: Vec<u8> = raw_addr.into();
+/// let actual_ser_addr = lcs::to_bytes(&addr).unwrap();
 ///
-/// let expected_raw_addr: Vec<u8> = [2, 0, 10, 0, 0, 16, 5, 80, 0].to_vec();
-/// let expected_ser_raw_addr: Vec<u8> = [9, 2, 0, 10, 0, 0, 16, 5, 80, 0].to_vec();
+/// let expected_ser_addr: Vec<u8> = [9, 2, 0, 10, 0, 0, 16, 5, 80, 0].to_vec();
 ///
-/// assert_eq!(expected_raw_addr, actual_raw_addr);
-/// assert_eq!(expected_ser_raw_addr, actual_ser_raw_addr);
+/// assert_eq!(expected_ser_addr, actual_ser_addr);
 /// ```
 #[derive(Clone, Eq, PartialEq)]
 pub struct NetworkAddress(Vec<Protocol>);
@@ -139,9 +115,6 @@ pub enum Protocol {
     // probably need to move network wire into its own crate to avoid circular
     // dependency b/w network and types.
     Handshake(u8),
-    // TODO(philiphayes): gate behind cfg(test), should not even parse in prod.
-    // testing only, unauthenticated peer id exchange
-    PeerIdExchange,
 }
 
 /// A minimally parsed DNS name. We don't really do any checking other than
@@ -197,62 +170,17 @@ pub enum ParseError {
 
     #[error("dns name is too long: len: {0} bytes, max len: 255 bytes")]
     DnsNameTooLong(usize),
+
+    #[error("error decrypting network address")]
+    DecryptError,
+
+    #[error("lcs error: {0}")]
+    LCSError(#[from] lcs::Error),
 }
 
 #[derive(Error, Debug)]
 #[error("network address cannot be empty")]
 pub struct EmptyError;
-
-///////////////////////
-// RawNetworkAddress //
-///////////////////////
-
-impl RawNetworkAddress {
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl Into<Vec<u8>> for RawNetworkAddress {
-    fn into(self) -> Vec<u8> {
-        self.0
-    }
-}
-
-impl AsRef<[u8]> for RawNetworkAddress {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-impl TryFrom<&NetworkAddress> for RawNetworkAddress {
-    type Error = lcs::Error;
-
-    fn try_from(value: &NetworkAddress) -> Result<Self, lcs::Error> {
-        let bytes = lcs::to_bytes(value)?;
-        Ok(RawNetworkAddress::new(bytes))
-    }
-}
-
-#[cfg(any(test, feature = "fuzzing"))]
-impl Arbitrary for RawNetworkAddress {
-    type Parameters = ();
-    type Strategy = BoxedStrategy<Self>;
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        any::<NetworkAddress>()
-            .prop_map(|addr| RawNetworkAddress::try_from(&addr).unwrap())
-            .boxed()
-    }
-}
 
 ////////////////////
 // NetworkAddress //
@@ -261,15 +189,6 @@ impl Arbitrary for RawNetworkAddress {
 impl NetworkAddress {
     fn new(protocols: Vec<Protocol>) -> Self {
         Self(protocols)
-    }
-
-    // TODO(philiphayes): could return NonZeroUsize?
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     pub fn as_slice(&self) -> &[Protocol] {
@@ -284,6 +203,24 @@ impl NetworkAddress {
     pub fn extend_from_slice(mut self, protos: &[Protocol]) -> Self {
         self.0.extend_from_slice(protos);
         self
+    }
+
+    pub fn encrypt(
+        self,
+        shared_val_netaddr_key: &Key,
+        key_version: KeyVersion,
+        account: &AccountAddress,
+        seq_num: u64,
+        addr_idx: u32,
+    ) -> Result<EncNetworkAddress, ParseError> {
+        EncNetworkAddress::encrypt(
+            self,
+            shared_val_netaddr_key,
+            key_version,
+            account,
+            seq_num,
+            addr_idx,
+        )
     }
 
     /// Given a base `NetworkAddress`, append production protocols and
@@ -315,26 +252,6 @@ impl NetworkAddress {
             .push(Protocol::Handshake(handshake_version))
     }
 
-    /// Given a base `NetworkAddress`, append production protocols and
-    /// return the modified `NetworkAddress`.
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// use libra_network_address::NetworkAddress;
-    /// use std::str::FromStr;
-    ///
-    /// let addr = NetworkAddress::from_str("/memory/123").unwrap();
-    /// let addr = addr.append_test_protos(0);
-    /// assert_eq!(addr.to_string(), "/memory/123/ln-peerid-ex/ln-handshake/0");
-    /// ```
-    // TODO(philiphayes): gate with cfg(test)
-    // TODO(philiphayes): use handshake version enum
-    pub fn append_test_protos(self, handshake_version: u8) -> Self {
-        self.push(Protocol::PeerIdExchange)
-            .push(Protocol::Handshake(handshake_version))
-    }
-
     /// Check that a `NetworkAddress` looks like a typical LibraNet address with
     /// associated protocols.
     ///
@@ -349,8 +266,7 @@ impl NetworkAddress {
     ///
     /// followed by transport upgrade handshake protocols:
     ///
-    /// `"/ln-noise-ik/<pubkey>/ln-handshake/<version>"` or
-    /// cfg!(test) `"/ln-peerid-ex/ln-handshake/<version>"`
+    /// `"/ln-noise-ik/<pubkey>/ln-handshake/<version>"`
     ///
     /// ### Example
     ///
@@ -374,6 +290,22 @@ impl NetworkAddress {
             Protocol::NoiseIK(pubkey) => Some(*pubkey),
             _ => None,
         })
+    }
+
+    /// A function to rotate public keys for `NoiseIK` protocols
+    pub fn rotate_noise_public_key(
+        &mut self,
+        to_replace: &x25519::PublicKey,
+        new_public_key: &x25519::PublicKey,
+    ) {
+        for protocol in self.0.iter_mut() {
+            // Replace the public key in any Noise protocols that match the key
+            if let Protocol::NoiseIK(public_key) = protocol {
+                if public_key == to_replace {
+                    *protocol = Protocol::NoiseIK(*new_public_key);
+                }
+            }
+        }
     }
 
     #[cfg(any(test, feature = "fuzzing"))]
@@ -416,6 +348,24 @@ impl FromStr for NetworkAddress {
     }
 }
 
+impl ToSocketAddrs for NetworkAddress {
+    type Iter = std::vec::IntoIter<SocketAddr>;
+
+    fn to_socket_addrs(&self) -> Result<Self::Iter, std::io::Error> {
+        if let Some(((ipaddr, port), _)) = parse_ip_tcp(self.as_slice()) {
+            Ok(vec![SocketAddr::new(ipaddr, port)].into_iter())
+        } else if let Some(((ip_filter, dns_name, port), _)) = parse_dns_tcp(self.as_slice()) {
+            format!("{}:{}", dns_name, port).to_socket_addrs().map(|v| {
+                v.filter(|addr| ip_filter.matches(addr.ip()))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+        } else {
+            Ok(vec![].into_iter())
+        }
+    }
+}
+
 impl TryFrom<Vec<Protocol>> for NetworkAddress {
     type Error = EmptyError;
 
@@ -431,15 +381,6 @@ impl TryFrom<Vec<Protocol>> for NetworkAddress {
 impl From<Protocol> for NetworkAddress {
     fn from(proto: Protocol) -> NetworkAddress {
         NetworkAddress::new(vec![proto])
-    }
-}
-
-impl TryFrom<&RawNetworkAddress> for NetworkAddress {
-    type Error = lcs::Error;
-
-    fn try_from(value: &RawNetworkAddress) -> Result<Self, lcs::Error> {
-        let addr: NetworkAddress = lcs::from_bytes(value.as_ref())?;
-        Ok(addr)
     }
 }
 
@@ -471,15 +412,16 @@ impl Serialize for NetworkAddress {
     where
         S: Serializer,
     {
-        #[derive(Serialize)]
-        #[serde(rename = "NetworkAddress")]
-        struct SerializeWrapper<'a>(&'a [Protocol]);
-
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.to_string())
         } else {
-            let val = SerializeWrapper(&self.0.as_ref());
-            val.serialize(serializer)
+            #[derive(Serialize)]
+            #[serde(rename = "NetworkAddress")]
+            struct Wrapper<'a>(#[serde(with = "serde_bytes")] &'a [u8]);
+
+            lcs::to_bytes(&self.as_slice())
+                .map_err(serde::ser::Error::custom)
+                .and_then(|v| Wrapper(&v).serialize(serializer))
         }
     }
 }
@@ -489,17 +431,17 @@ impl<'de> Deserialize<'de> for NetworkAddress {
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(rename = "NetworkAddress")]
-        struct DeserializeWrapper(Vec<Protocol>);
-
         if deserializer.is_human_readable() {
             let s = <String>::deserialize(deserializer)?;
             NetworkAddress::from_str(s.as_str()).map_err(de::Error::custom)
         } else {
-            let wrapper = DeserializeWrapper::deserialize(deserializer)?;
-            let addr = NetworkAddress::try_from(wrapper.0).map_err(de::Error::custom)?;
-            Ok(addr)
+            #[derive(Deserialize)]
+            #[serde(rename = "NetworkAddress")]
+            struct Wrapper(#[serde(with = "serde_bytes")] Vec<u8>);
+
+            Wrapper::deserialize(deserializer)
+                .and_then(|v| lcs::from_bytes(&v.0).map_err(de::Error::custom))
+                .and_then(|v: Vec<Protocol>| NetworkAddress::try_from(v).map_err(de::Error::custom))
         }
     }
 }
@@ -531,11 +473,8 @@ pub fn arb_libranet_addr() -> impl Strategy<Value = NetworkAddress> {
         any::<(DnsName, u16)>()
             .prop_map(|(name, port)| vec![Protocol::Dns6(name), Protocol::Tcp(port)]),
     ];
-    let arb_libranet_protos = prop_oneof![
-        any::<(x25519::PublicKey, u8)>()
-            .prop_map(|(pubkey, hs)| vec![Protocol::NoiseIK(pubkey), Protocol::Handshake(hs)]),
-        any::<u8>().prop_map(|hs| vec![Protocol::PeerIdExchange, Protocol::Handshake(hs)]),
-    ];
+    let arb_libranet_protos = any::<(x25519::PublicKey, u8)>()
+        .prop_map(|(pubkey, hs)| vec![Protocol::NoiseIK(pubkey), Protocol::Handshake(hs)]);
 
     (arb_transport_protos, arb_libranet_protos).prop_map(
         |(mut transport_protos, mut libranet_protos)| {
@@ -568,7 +507,6 @@ impl fmt::Display for Protocol {
                     .expect("ValidCryptoMaterialStringExt::to_encoded_string is infallible")
             ),
             Handshake(version) => write!(f, "/ln-handshake/{}", version),
-            PeerIdExchange => write!(f, "/ln-peerid-ex"),
         }
     }
 }
@@ -599,7 +537,6 @@ impl Protocol {
                 args.next().ok_or(ParseError::UnexpectedEnd)?,
             )?),
             "ln-handshake" => Protocol::Handshake(parse_one(args)?),
-            "ln-peerid-ex" => Protocol::PeerIdExchange,
             unknown => return Err(ParseError::UnknownProtocolType(unknown.to_string())),
         };
         Ok(protocol)
@@ -738,10 +675,27 @@ pub fn parse_ip_tcp(protos: &[Protocol]) -> Option<((IpAddr, u16), &[Protocol])>
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum IpFilter {
+    Any,
+    OnlyIp4,
+    OnlyIp6,
+}
+
+impl IpFilter {
+    pub fn matches(&self, ipaddr: IpAddr) -> bool {
+        match self {
+            IpFilter::Any => true,
+            IpFilter::OnlyIp4 => ipaddr.is_ipv4(),
+            IpFilter::OnlyIp6 => ipaddr.is_ipv6(),
+        }
+    }
+}
+
 /// parse the `&[Protocol]` into the `"/dns/<domain>/tcp/<port>"`,
 /// `"/dns4/<domain>/tcp/<port>"`, or `"/dns6/<domain>/tcp/<port>"` prefix and
 /// unparsed `&[Protocol]` suffix.
-pub fn parse_dns_tcp(protos: &[Protocol]) -> Option<((&DnsName, u16), &[Protocol])> {
+pub fn parse_dns_tcp(protos: &[Protocol]) -> Option<((IpFilter, &DnsName, u16), &[Protocol])> {
     use Protocol::*;
 
     if protos.len() < 2 {
@@ -750,9 +704,9 @@ pub fn parse_dns_tcp(protos: &[Protocol]) -> Option<((&DnsName, u16), &[Protocol
 
     let (prefix, suffix) = protos.split_at(2);
     match prefix {
-        [Dns(name), Tcp(port)] => Some(((name, *port), suffix)),
-        [Dns4(name), Tcp(port)] => Some(((name, *port), suffix)),
-        [Dns6(name), Tcp(port)] => Some(((name, *port), suffix)),
+        [Dns(name), Tcp(port)] => Some(((IpFilter::Any, name, *port), suffix)),
+        [Dns4(name), Tcp(port)] => Some(((IpFilter::OnlyIp4, name, *port), suffix)),
+        [Dns6(name), Tcp(port)] => Some(((IpFilter::OnlyIp6, name, *port), suffix)),
         _ => None,
     }
 }
@@ -762,15 +716,6 @@ pub fn parse_dns_tcp(protos: &[Protocol]) -> Option<((&DnsName, u16), &[Protocol
 pub fn parse_noise_ik(protos: &[Protocol]) -> Option<(&x25519::PublicKey, &[Protocol])> {
     match protos.split_first() {
         Some((Protocol::NoiseIK(pubkey), suffix)) => Some((pubkey, suffix)),
-        _ => None,
-    }
-}
-
-/// parse the `&[Protocol]` into the `"/ln-peerid-ex"` prefix and unparsed
-/// `&[Protocol]` suffix.
-pub fn parse_peerid_ex(protos: &[Protocol]) -> Option<&[Protocol]> {
-    match protos.split_first() {
-        Some((Protocol::PeerIdExchange, suffix)) => Some(suffix),
         _ => None,
     }
 }
@@ -794,8 +739,8 @@ fn parse_libranet_protos(protos: &[Protocol]) -> Option<&[Protocol]> {
     // <or> parse_dns_tcp
     // <or> cfg!(test) parse_memory
 
-    let transport_suffix = None
-        .or_else(|| parse_ip_tcp(protos).map(|x| x.1))
+    let transport_suffix = parse_ip_tcp(protos)
+        .map(|x| x.1)
         .or_else(|| parse_dns_tcp(protos).map(|x| x.1))
         .or_else(|| {
             if cfg!(test) {
@@ -808,17 +753,8 @@ fn parse_libranet_protos(protos: &[Protocol]) -> Option<&[Protocol]> {
     // parse authentication layer
     // ---
     // parse_noise_ik
-    // <or> cfg!(test) parse_peerid_ex
 
-    let auth_suffix = None
-        .or_else(|| parse_noise_ik(transport_suffix).map(|x| x.1))
-        .or_else(|| {
-            if cfg!(test) {
-                parse_peerid_ex(transport_suffix)
-            } else {
-                None
-            }
-        })?;
+    let auth_suffix = parse_noise_ik(transport_suffix).map(|x| x.1)?;
 
     // parse handshake layer
 
@@ -990,28 +926,28 @@ mod test {
         let expected_suffix: &[Protocol] = &[];
         assert_eq!(
             parse_dns_tcp(addr.as_slice()).unwrap(),
-            ((&dns_name, 123), expected_suffix)
+            ((IpFilter::Any, &dns_name, 123), expected_suffix)
         );
 
         let addr = NetworkAddress::from_str("/dns4/example.com/tcp/123").unwrap();
         let expected_suffix: &[Protocol] = &[];
         assert_eq!(
             parse_dns_tcp(addr.as_slice()).unwrap(),
-            ((&dns_name, 123), expected_suffix)
+            ((IpFilter::OnlyIp4, &dns_name, 123), expected_suffix)
         );
 
         let addr = NetworkAddress::from_str("/dns6/example.com/tcp/123").unwrap();
         let expected_suffix: &[Protocol] = &[];
         assert_eq!(
             parse_dns_tcp(addr.as_slice()).unwrap(),
-            ((&dns_name, 123), expected_suffix)
+            ((IpFilter::OnlyIp6, &dns_name, 123), expected_suffix)
         );
 
-        let addr = NetworkAddress::from_str("/dns/example.com/tcp/123/ln-peerid-ex").unwrap();
-        let expected_suffix: &[Protocol] = &[Protocol::PeerIdExchange];
+        let addr = NetworkAddress::from_str("/dns/example.com/tcp/123/memory/44").unwrap();
+        let expected_suffix: &[Protocol] = &[Protocol::Memory(44)];
         assert_eq!(
             parse_dns_tcp(addr.as_slice()).unwrap(),
-            ((&dns_name, 123), expected_suffix)
+            ((IpFilter::Any, &dns_name, 123), expected_suffix)
         );
 
         let addr = NetworkAddress::from_str("/tcp/999/memory/123").unwrap();
@@ -1039,20 +975,6 @@ mod test {
 
         let addr = NetworkAddress::from_str("/tcp/999/memory/123").unwrap();
         assert_eq!(None, parse_noise_ik(addr.as_slice()));
-    }
-
-    #[test]
-    fn test_parse_peerid_ex() {
-        let addr = NetworkAddress::from_str("/ln-peerid-ex").unwrap();
-        let expected_suffix: &[Protocol] = &[];
-        assert_eq!(parse_peerid_ex(addr.as_slice()).unwrap(), expected_suffix);
-
-        let addr = NetworkAddress::from_str("/ln-peerid-ex/tcp/999").unwrap();
-        let expected_suffix: &[Protocol] = &[Protocol::Tcp(999)];
-        assert_eq!(parse_peerid_ex(addr.as_slice()).unwrap(), expected_suffix);
-
-        let addr = NetworkAddress::from_str("/tcp/999/memory/123").unwrap();
-        assert_eq!(None, parse_peerid_ex(addr.as_slice()));
     }
 
     #[test]

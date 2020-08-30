@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::env;
 use thiserror::Error;
 
 /// Request timeout for github operations
@@ -151,8 +152,12 @@ impl Client {
     /// Create or update a file.
     pub fn put(&self, path: &str, content: &str) -> Result<(), Error> {
         let json = match self.get_sha(path) {
-            Ok(hash) => json!({ "content": content, "message": "libra-secure", "sha": hash }),
-            Err(Error::NotFound(_)) => json!({ "content": content, "message": "libra-secure" }),
+            Ok(hash) => {
+                json!({ "content": content, "message": format!("[libra-management] {}", path), "sha": hash })
+            }
+            Err(Error::NotFound(_)) => {
+                json!({ "content": content, "message": format!("[libra-management] {}", path) })
+            }
             Err(e) => return Err(e),
         };
 
@@ -173,7 +178,15 @@ impl Client {
             .set("Authorization", &format!("token {}", self.token))
             .set(ACCEPT_HEADER, ACCEPT_VALUE)
             .timeout_connect(TIMEOUT);
-        request
+        match env::var("https_proxy") {
+            Ok(proxy) => request
+                .set_proxy(
+                    ureq::Proxy::new(proxy)
+                        .expect("Unable to parse https_proxy environment variable"),
+                )
+                .build(),
+            Err(_e) => request,
+        }
     }
 
     /// Get can read files or directories, this makes it easier to use

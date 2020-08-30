@@ -1,5 +1,5 @@
-import 0x0.LibraAccount;
-import 0x0.LBR;
+import 0x1.LibraAccount;
+import 0x1.LBR;
 
 main() {
     let addr: address;
@@ -7,8 +7,8 @@ main() {
     let account_balance: u64;
 
     addr = 0x011111111111111110;
-    account_exists = LibraAccount.exists(copy(addr));
-    account_balance = LibraAccount.balance<LBR.T>(move(addr));
+    account_exists = LibraAccount.exists_at(copy(addr));
+    account_balance = LibraAccount.balance<LBR.LBR>(move(addr));
     return;
 }
 

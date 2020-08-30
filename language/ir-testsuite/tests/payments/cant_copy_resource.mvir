@@ -1,20 +1,15 @@
-import 0x0.LibraAccount;
-import 0x0.LBR;
-import 0x0.Libra;
+import 0x1.LibraAccount;
+import 0x1.LBR;
+import 0x1.Libra;
 
-main() {
-    let ten_coins: Libra.T<LBR.T>;
-    let i_created_money: Libra.T<LBR.T>;
-    let addr: address;
+main(account: &signer) {
+    let coin: Libra.Libra<LBR.LBR>;
 
-    addr = get_txn_sender();
-    ten_coins = LibraAccount.withdraw_from_sender<LBR.T>(10);
-    i_created_money = copy(ten_coins);
-
-    LibraAccount.deposit<LBR.T>(copy(addr), move(ten_coins));
-    LibraAccount.deposit<LBR.T>(copy(addr), move(i_created_money));
+    coin = Libra.zero<LBR.LBR>();
+    Libra.destroy_zero<LBR.LBR>(copy(coin));
+    Libra.destroy_zero<LBR.LBR>(move(coin));
 
     return;
 }
 
-// check: COPYLOC_RESOURCE_ERROR,
+// check: COPYLOC_RESOURCE_ERROR

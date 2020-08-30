@@ -1,16 +1,18 @@
 module M {
+    import 0x1.Signer;
+
     resource Foo {
         x: u64,
     }
 
-    public foo() {
-        move_to_sender<Foo>(Foo {x: 100u64});
+    public foo(account: &signer) {
+        move_to<Foo>(move(account), Foo {x: 100u64});
         return;
     }
 
-    public bar(): u64 acquires Foo {
+    public bar(account: &signer): u64 acquires Foo {
         let x: u64;
-        Foo { x } = move_from<Foo>(get_txn_sender());
+        Foo { x } = move_from<Foo>(Signer.address_of(move(account)));
         return move(x);
     }
 }
@@ -19,15 +21,15 @@ module M {
 //! new-transaction
 import {{default}}.M;
 
-main() {
-    M.foo();
+main(account: &signer) {
+    M.foo(move(account));
     return;
 }
 
 //! new-transaction
 import {{default}}.M;
 
-main() {
-    assert(M.bar() == 100u64, 42);
+main(account: &signer) {
+    assert(M.bar(move(account)) == 100u64, 42);
     return;
 }

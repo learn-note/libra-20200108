@@ -3,20 +3,19 @@
 
 use crate::{ConsensusState, Error, SafetyRules, TSafetyRules};
 use consensus_types::{
-    block::Block, block_data::BlockData, quorum_cert::QuorumCert, timeout::Timeout, vote::Vote,
-    vote_proposal::VoteProposal,
+    block::Block, block_data::BlockData, timeout::Timeout, vote::Vote,
+    vote_proposal::MaybeSignedVoteProposal,
 };
 use libra_crypto::ed25519::Ed25519Signature;
 use libra_types::epoch_change::EpochChangeProof;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum SafetyRulesInput {
     ConsensusState,
     Initialize(Box<EpochChangeProof>),
-    Update(Box<QuorumCert>),
-    ConstructAndSignVote(Box<VoteProposal>),
+    ConstructAndSignVote(Box<MaybeSignedVoteProposal>),
     SignProposal(Box<BlockData>),
     SignTimeout(Box<Timeout>),
 }
@@ -36,7 +35,6 @@ impl SerializerService {
         let output = match input {
             SafetyRulesInput::ConsensusState => lcs::to_bytes(&self.internal.consensus_state()),
             SafetyRulesInput::Initialize(li) => lcs::to_bytes(&self.internal.initialize(&li)),
-            SafetyRulesInput::Update(qc) => lcs::to_bytes(&self.internal.update(&qc)),
             SafetyRulesInput::ConstructAndSignVote(vote_proposal) => {
                 lcs::to_bytes(&self.internal.construct_and_sign_vote(&vote_proposal))
             }
@@ -82,12 +80,10 @@ impl TSafetyRules for SerializerClient {
         lcs::from_bytes(&response)?
     }
 
-    fn update(&mut self, qc: &QuorumCert) -> Result<(), Error> {
-        let response = self.request(SafetyRulesInput::Update(Box::new(qc.clone())))?;
-        lcs::from_bytes(&response)?
-    }
-
-    fn construct_and_sign_vote(&mut self, vote_proposal: &VoteProposal) -> Result<Vote, Error> {
+    fn construct_and_sign_vote(
+        &mut self,
+        vote_proposal: &MaybeSignedVoteProposal,
+    ) -> Result<Vote, Error> {
         let response = self.request(SafetyRulesInput::ConstructAndSignVote(Box::new(
             vote_proposal.clone(),
         )))?;

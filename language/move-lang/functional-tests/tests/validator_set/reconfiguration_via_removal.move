@@ -10,12 +10,12 @@
 //! block-time: 2
 
 //! new-transaction
-//! sender: vivian
+//! sender: libraroot
 script{
-use 0x0::LibraSystem;
-fun main() {
-    LibraSystem::remove_validator({{vivian}});
-}
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{vivian}});
+    }
 }
 
 // check: NewEpochEvent
@@ -29,12 +29,12 @@ fun main() {
 // check that Vivian is no longer a validator, Alice is not, but Viola is still a
 // validator
 script{
-use 0x0::LibraSystem;
-fun main() {
-    0x0::Transaction::assert(!LibraSystem::is_validator({{vivian}}), 70);
-    0x0::Transaction::assert(!LibraSystem::is_validator({{alice}}), 71);
-    0x0::Transaction::assert(LibraSystem::is_validator({{viola}}), 72);
-}
+    use 0x1::LibraSystem;
+    fun main() {
+        assert(!LibraSystem::is_validator({{vivian}}), 70);
+        assert(!LibraSystem::is_validator({{alice}}), 71);
+        assert(LibraSystem::is_validator({{viola}}), 72);
+    }
 }
 
 // check: EXECUTED

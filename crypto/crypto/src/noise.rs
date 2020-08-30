@@ -64,7 +64,7 @@ use std::{
 use crate::{hash::HashValue, hkdf::Hkdf, traits::Uniform as _, x25519};
 
 use aes_gcm::{
-    aead::{generic_array::GenericArray, Aead, NewAead, Payload},
+    aead::{generic_array::GenericArray, Aead, AeadInPlace, NewAead, Payload},
     Aes256Gcm,
 };
 use sha2::Digest;
@@ -166,6 +166,10 @@ pub enum NoiseError {
     /// the response buffer passed as argument is too small
     #[error("noise: the response buffer passed as argument is too small")]
     ResponseBufferTooSmall,
+
+    /// the nonce exceeds the maximum u64 value (in practice this should not happen)
+    #[error("noise: the nonce exceeds the maximum u64 value")]
+    NonceOverflow,
 }
 
 //
@@ -246,6 +250,11 @@ impl NoiseConfig {
         }
     }
 
+    /// Handy getter to access the configuration's public key
+    pub fn public_key(&self) -> x25519::PublicKey {
+        self.public_key
+    }
+
     //
     // Initiator
     // ---------
@@ -290,7 +299,7 @@ impl NoiseConfig {
         let k = mix_key(&mut ck, &dh_output)?;
 
         // -> s
-        let aead = Aes256Gcm::new(*GenericArray::from_slice(&k));
+        let aead = Aes256Gcm::new(GenericArray::from_slice(&k));
 
         let msg_and_ad = Payload {
             msg: self.public_key.as_slice(),
@@ -311,7 +320,7 @@ impl NoiseConfig {
         let k = mix_key(&mut ck, &dh_output)?;
 
         // -> payload
-        let aead = Aes256Gcm::new(*GenericArray::from_slice(&k));
+        let aead = Aes256Gcm::new(GenericArray::from_slice(&k));
 
         let msg_and_ad = Payload {
             msg: payload.unwrap_or_else(|| &[]),
@@ -372,20 +381,16 @@ impl NoiseConfig {
         let offset = cursor.position() as usize;
         let received_encrypted_payload = &cursor.into_inner()[offset..];
 
-        let aead = Aes256Gcm::new(*GenericArray::from_slice(&k));
+        let aead = Aes256Gcm::new(GenericArray::from_slice(&k));
 
         let nonce = GenericArray::from_slice(&[0u8; AES_NONCE_SIZE]);
         let ct_and_ad = Payload {
             msg: received_encrypted_payload,
             aad: &h,
         };
-        let received_payload = match aead.decrypt(nonce, ct_and_ad) {
-            Ok(res) => res,
-            Err(_) if cfg!(feature = "fuzzing") => Vec::new(),
-            Err(_) => {
-                return Err(NoiseError::Decrypt);
-            }
-        };
+        let received_payload = aead
+            .decrypt(nonce, ct_and_ad)
+            .map_err(|_| NoiseError::Decrypt)?;
 
         // split
         let (k1, k2) = hkdf(&ck, None)?;
@@ -451,20 +456,16 @@ impl NoiseConfig {
             .read_exact(&mut encrypted_remote_static)
             .map_err(|_| NoiseError::MsgTooShort)?;
 
-        let aead = Aes256Gcm::new(*GenericArray::from_slice(&k));
+        let aead = Aes256Gcm::new(GenericArray::from_slice(&k));
 
         let nonce = GenericArray::from_slice(&[0u8; AES_NONCE_SIZE]);
         let ct_and_ad = Payload {
             msg: &encrypted_remote_static,
             aad: &h,
         };
-        let rs = match aead.decrypt(nonce, ct_and_ad) {
-            Ok(res) => res,
-            Err(_) if cfg!(feature = "fuzzing") => encrypted_remote_static[..32].to_vec(),
-            Err(_) => {
-                return Err(NoiseError::Decrypt);
-            }
-        };
+        let rs = aead
+            .decrypt(nonce, ct_and_ad)
+            .map_err(|_| NoiseError::Decrypt)?;
         let rs = x25519::PublicKey::try_from(rs.as_slice())
             .map_err(|_| NoiseError::WrongPublicKeyReceived)?;
         mix_hash(&mut h, &encrypted_remote_static);
@@ -477,20 +478,16 @@ impl NoiseConfig {
         let offset = cursor.position() as usize;
         let received_encrypted_payload = &cursor.into_inner()[offset..];
 
-        let aead = Aes256Gcm::new(*GenericArray::from_slice(&k));
+        let aead = Aes256Gcm::new(GenericArray::from_slice(&k));
 
         let nonce = GenericArray::from_slice(&[0u8; AES_NONCE_SIZE]);
         let ct_and_ad = Payload {
             msg: received_encrypted_payload,
             aad: &h,
         };
-        let received_payload = match aead.decrypt(nonce, ct_and_ad) {
-            Ok(res) => res,
-            Err(_) if cfg!(feature = "fuzzing") => Vec::new(),
-            Err(_) => {
-                return Err(NoiseError::Decrypt);
-            }
-        };
+        let received_payload = aead
+            .decrypt(nonce, ct_and_ad)
+            .map_err(|_| NoiseError::Decrypt)?;
         mix_hash(&mut h, received_encrypted_payload);
 
         // return
@@ -544,7 +541,7 @@ impl NoiseConfig {
         let k = mix_key(&mut ck, &dh_output)?;
 
         // -> payload
-        let aead = Aes256Gcm::new(*GenericArray::from_slice(&k));
+        let aead = Aes256Gcm::new(GenericArray::from_slice(&k));
 
         let msg_and_ad = Payload {
             msg: payload.unwrap_or_else(|| &[]),
@@ -623,6 +620,16 @@ impl NoiseSession {
         }
     }
 
+    /// create a dummy session with 0 keys
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn new_for_testing() -> Self {
+        Self::new(
+            vec![0u8; 32],
+            vec![0u8; 32],
+            [0u8; x25519::PUBLIC_KEY_SIZE].into(),
+        )
+    }
+
     /// obtain remote static public key
     pub fn get_remote_static(&self) -> x25519::PublicKey {
         self.remote_public_key
@@ -643,7 +650,7 @@ impl NoiseSession {
         }
 
         // encrypt in place
-        let aead = Aes256Gcm::new(*GenericArray::from_slice(&self.write_key));
+        let aead = Aes256Gcm::new(GenericArray::from_slice(&self.write_key));
         let mut nonce = [0u8; 4].to_vec();
         nonce.extend_from_slice(&self.write_nonce.to_be_bytes());
         let nonce = GenericArray::from_slice(&nonce);
@@ -653,7 +660,10 @@ impl NoiseSession {
             .map_err(|_| NoiseError::Encrypt)?;
 
         // increment nonce
-        self.write_nonce += 1;
+        self.write_nonce = self
+            .write_nonce
+            .checked_add(1)
+            .ok_or(NoiseError::NonceOverflow)?;
 
         // return a subslice without the authentication tag
         Ok(authentication_tag.to_vec())
@@ -679,7 +689,7 @@ impl NoiseSession {
         }
 
         // decrypt in place
-        let aead = Aes256Gcm::new(*GenericArray::from_slice(&self.read_key));
+        let aead = Aes256Gcm::new(GenericArray::from_slice(&self.read_key));
 
         let mut nonce = [0u8; 4].to_vec();
         nonce.extend_from_slice(&self.read_nonce.to_be_bytes());
@@ -694,7 +704,10 @@ impl NoiseSession {
             })?;
 
         // increment nonce
-        self.read_nonce += 1;
+        self.read_nonce = self
+            .read_nonce
+            .checked_add(1)
+            .ok_or(NoiseError::NonceOverflow)?;
 
         // return a subslice of the buffer representing the decrypted plaintext
         Ok(buffer)

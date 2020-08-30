@@ -8,19 +8,18 @@ use crate::{
         PersistentLivenessStorage, RecoveryData, RootInfo, RootMetadata,
     },
     state_replication::StateComputer,
-    util::time_service::duration_since_epoch,
+    util::time_service::TimeService,
 };
 use anyhow::{bail, ensure, format_err, Context};
 use consensus_types::{
     block::Block, executed_block::ExecutedBlock, quorum_cert::QuorumCert, sync_info::SyncInfo,
     timeout_certificate::TimeoutCertificate,
 };
-use debug_interface::prelude::*;
-use executor_types::StateComputeResult;
+use executor_types::{Error, StateComputeResult};
 use libra_crypto::HashValue;
 use libra_logger::prelude::*;
-#[cfg(any(test, feature = "fuzzing"))]
-use libra_types::epoch_state::EpochState;
+use libra_time::duration_since_epoch;
+use libra_trace::prelude::*;
 use libra_types::{ledger_info::LedgerInfoWithSignatures, transaction::TransactionStatus};
 use std::{
     collections::vec_deque::VecDeque,
@@ -32,6 +31,10 @@ use termion::color::*;
 #[cfg(test)]
 #[path = "block_store_test.rs"]
 mod block_store_test;
+
+#[cfg(test)]
+#[path = "block_store_and_lec_recovery_test.rs"]
+mod block_store_and_lec_recovery_test;
 
 #[path = "sync_manager.rs"]
 pub mod sync_manager;
@@ -47,6 +50,7 @@ fn update_counters_for_committed_blocks(blocks_to_commit: &[Arc<ExecutedBlock>])
         counters::NUM_TXNS_PER_BLOCK.observe(txn_status.len() as f64);
         counters::COMMITTED_BLOCKS_COUNT.inc();
         counters::LAST_COMMITTED_ROUND.set(block.round() as i64);
+        counters::LAST_COMMITTED_VERSION.set(block.compute_result().num_leaves() as i64);
 
         for status in txn_status.iter() {
             match status {
@@ -60,8 +64,11 @@ fn update_counters_for_committed_blocks(blocks_to_commit: &[Arc<ExecutedBlock>])
                         .with_label_values(&["failed"])
                         .inc();
                 }
-                // TODO(zekunli): add counter
-                TransactionStatus::Retry => (),
+                TransactionStatus::Retry => {
+                    counters::COMMITTED_TXNS_COUNT
+                        .with_label_values(&["retry"])
+                        .inc();
+                }
             }
         }
     }
@@ -89,6 +96,8 @@ pub struct BlockStore {
     /// The persistent storage backing up the in-memory data structure, every write should go
     /// through this before in-memory tree.
     storage: Arc<dyn PersistentLivenessStorage>,
+    /// Used to ensure that any block stored will have a timestamp < the local time
+    time_service: Arc<dyn TimeService>,
 }
 
 impl BlockStore {
@@ -97,6 +106,7 @@ impl BlockStore {
         initial_data: RecoveryData,
         state_computer: Arc<dyn StateComputer>,
         max_pruned_blocks_in_mem: usize,
+        time_service: Arc<dyn TimeService>,
     ) -> Self {
         let highest_tc = initial_data.highest_timeout_certificate();
         let (root, root_metadata, blocks, quorum_certs) = initial_data.take();
@@ -109,6 +119,7 @@ impl BlockStore {
             state_computer,
             storage,
             max_pruned_blocks_in_mem,
+            time_service,
         )
     }
 
@@ -121,6 +132,7 @@ impl BlockStore {
         state_computer: Arc<dyn StateComputer>,
         storage: Arc<dyn PersistentLivenessStorage>,
         max_pruned_blocks_in_mem: usize,
+        time_service: Arc<dyn TimeService>,
     ) -> Self {
         let RootInfo(root_block, root_qc, root_li) = root;
         //verify root is correct
@@ -139,18 +151,23 @@ impl BlockStore {
             root_metadata.accu_hash,
         );
 
+        let result = StateComputeResult::new(
+            root_metadata.accu_hash,
+            root_metadata.frozen_root_hashes,
+            root_metadata.num_leaves, /* num_leaves */
+            vec![],                   /* parent_root_hashes */
+            0,                        /* parent_num_leaves */
+            None,                     /* epoch_state */
+            vec![],                   /* compute_status */
+            vec![],                   /* txn_infos */
+        );
+
         let executed_root_block = ExecutedBlock::new(
             root_block,
             // Create a dummy state_compute_result with necessary fields filled in.
-            StateComputeResult::new(
-                root_metadata.accu_hash,
-                root_metadata.frozen_root_hashes,
-                root_metadata.num_leaves, /* num_leaves */
-                None,                     /* epoch_state */
-                vec![],                   /* compute_status */
-                vec![],                   /* transaction_info_hashes */
-            ),
+            result,
         );
+
         let tree = BlockTree::new(
             executed_root_block,
             root_qc,
@@ -162,6 +179,7 @@ impl BlockStore {
             inner: Arc::new(RwLock::new(tree)),
             state_computer,
             storage,
+            time_service,
         };
         for block in blocks {
             block_store
@@ -177,6 +195,9 @@ impl BlockStore {
                     panic!("[BlockStore] failed to insert quorum during build{:?}", e)
                 });
         }
+        counters::LAST_COMMITTED_ROUND.set(block_store.root().round() as i64);
+        counters::LAST_COMMITTED_VERSION
+            .set(block_store.root().compute_result().num_leaves() as i64);
         block_store
     }
 
@@ -237,6 +258,7 @@ impl BlockStore {
             Arc::clone(&self.state_computer),
             Arc::clone(&self.storage),
             max_pruned_blocks_in_mem,
+            Arc::clone(&self.time_service),
         );
         let to_remove = self.inner.read().unwrap().get_all_block_id();
         if let Err(e) = self.storage.prune_tree(to_remove) {
@@ -273,42 +295,43 @@ impl BlockStore {
         if let Some(existing_block) = self.get_block(block.id()) {
             return Ok(existing_block);
         }
-        let executed_block = self.execute_block(block)?;
+        ensure!(
+            self.inner.read().unwrap().root().round() < block.round(),
+            "Block with old round"
+        );
+
+        let executed_block = match self.execute_block(block.clone()) {
+            Ok(res) => Ok(res),
+            Err(Error::BlockNotFound(parent_block_id)) => {
+                // recover the block tree in executor
+                let blocks_to_reexecute = self
+                    .path_from_root(parent_block_id)
+                    .unwrap_or_else(Vec::new);
+
+                for block in blocks_to_reexecute {
+                    self.execute_block(block.block().clone())?;
+                }
+                self.execute_block(block)
+            }
+            err => err,
+        }?;
+
+        // ensure local time past the block time
+        let block_time = Duration::from_micros(executed_block.timestamp_usecs());
+        self.time_service.wait_until(block_time);
         self.storage
             .save_tree(vec![executed_block.block().clone()], vec![])
             .context("Insert block failed when saving block")?;
         self.inner.write().unwrap().insert_block(executed_block)
     }
 
-    fn execute_block(&self, block: Block) -> anyhow::Result<ExecutedBlock> {
+    fn execute_block(&self, block: Block) -> anyhow::Result<ExecutedBlock, Error> {
         trace_code_block!("block_store::execute_block", {"block", block.id()});
-        ensure!(
-            self.inner.read().unwrap().root().round() < block.round(),
-            "Block with old round"
-        );
 
-        let parent_block = self
-            .get_block(block.parent_id())
-            .ok_or_else(|| format_err!("Block with missing parent {}", block.parent_id()))?;
+        // Although NIL blocks don't have a payload, we still send a T::default() to compute
+        // because we may inject a block prologue transaction.
+        let state_compute_result = self.state_computer.compute(&block, block.parent_id())?;
 
-        // Reconfiguration rule - if a block is a child of pending reconfiguration, it needs to be empty
-        // So we roll over the executed state until it's committed and we start new epoch.
-        let state_compute_result = if parent_block.compute_result().has_reconfiguration() {
-            StateComputeResult::new(
-                parent_block.compute_result().root_hash(),
-                parent_block.compute_result().frozen_subtree_roots().clone(),
-                parent_block.compute_result().num_leaves(),
-                parent_block.compute_result().epoch_state().clone(),
-                vec![], /* compute_status */
-                vec![], /* transaction_info_hashes */
-            )
-        } else {
-            // Although NIL blocks don't have payload, we still send a T::default() to compute
-            // because we may inject a block prologue transaction.
-            self.state_computer
-                .compute(&block, parent_block.id())
-                .with_context(|| format!("Execution failure for block {}", block))?
-        };
         Ok(ExecutedBlock::new(block, state_compute_result))
     }
 
@@ -456,27 +479,5 @@ impl BlockStore {
     pub fn insert_block_with_qc(&self, block: Block) -> anyhow::Result<Arc<ExecutedBlock>> {
         self.insert_single_quorum_cert(block.quorum_cert().clone())?;
         Ok(self.execute_and_insert_block(block)?)
-    }
-
-    /// Helper function to insert a reconfiguration block
-    pub fn insert_reconfiguration_block(&self, block: Block) -> anyhow::Result<Arc<ExecutedBlock>> {
-        self.insert_single_quorum_cert(block.quorum_cert().clone())?;
-        let executed_block = self.execute_block(block)?;
-        let compute_result = executed_block.compute_result();
-        Ok(self
-            .inner
-            .write()
-            .unwrap()
-            .insert_block(ExecutedBlock::new(
-                executed_block.block().clone(),
-                StateComputeResult::new(
-                    compute_result.root_hash(),
-                    compute_result.frozen_subtree_roots().clone(),
-                    compute_result.num_leaves(),
-                    Some(EpochState::empty()),
-                    compute_result.compute_status().clone(),
-                    compute_result.transaction_info_hashes().clone(),
-                ),
-            ))?)
     }
 }

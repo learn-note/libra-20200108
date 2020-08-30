@@ -1,17 +1,6 @@
-//! account: alice, 0
-//! account: bob, 0
-//! account: carol, 0
-
-//! new-transaction
-//! sender: association
-import 0x0.LBR;
-import 0x0.LibraAccount;
-import 0x0.Libra;
-main(blessed: &signer) {
-    LibraAccount.deposit<LBR.T>({{alice}}, LBR.mint(copy(blessed), 1000000));
-    LibraAccount.deposit<LBR.T>({{bob}}, LBR.mint(move(blessed), 1000000));
-    return;
-}
+//! account: alice, 1000000Coin1
+//! account: bob, 1000000Coin1
+//! account: carol, 0Coin1
 
 
 // Transfer all of the Alice's funds to Carol. this script will execute successfully, but
@@ -21,18 +10,22 @@ main(blessed: &signer) {
 //! new-transaction
 //! sender: alice
 //! gas-price: 1
+//! gas-currency: Coin1
 //! args: 1000000
-import 0x0.LibraAccount;
-import 0x0.LBR;
-import 0x0.Vector;
+import 0x1.LibraAccount;
+import 0x1.Coin1;
+import 0x1.Vector;
 
-main(amount: u64) {
-    LibraAccount.pay_from_sender<LBR.T>({{carol}}, move(amount));
+main(account: &signer, amount: u64) {
+    let with_cap: LibraAccount.WithdrawCapability;
+    with_cap = LibraAccount.extract_withdraw_capability(copy(account));
+    LibraAccount.pay_from<Coin1.Coin1>(&with_cap, {{carol}}, move(amount), h"", h"");
+    LibraAccount.restore_withdraw_capability(move(with_cap));
     return;
 }
 
 // check: ABORTED
-// check: 6
+// check: 43
 
 
 // Bob sends the same transaction script, with the amount set to 1000 instead of his full balance.
@@ -41,13 +34,17 @@ main(amount: u64) {
 //! new-transaction
 //! sender: bob
 //! gas-price: 1
+//! gas-currency: Coin1
 //! args: 1000
-import 0x0.LibraAccount;
-import 0x0.LBR;
-import 0x0.Vector;
+import 0x1.LibraAccount;
+import 0x1.Coin1;
+import 0x1.Vector;
 
-main(amount: u64) {
-    LibraAccount.pay_from_sender<LBR.T>({{carol}}, move(amount));
+main(account: &signer, amount: u64) {
+    let with_cap: LibraAccount.WithdrawCapability;
+    with_cap = LibraAccount.extract_withdraw_capability(copy(account));
+    LibraAccount.pay_from<Coin1.Coin1>(&with_cap, {{carol}}, move(amount), h"", h"");
+    LibraAccount.restore_withdraw_capability(move(with_cap));
     return;
 }
 
@@ -59,12 +56,12 @@ main(amount: u64) {
 // 2) Alice's balance is exactly 1000 greater than Bob's, indicating they consumed the same amount of gas.
 
 //! new-transaction
-import 0x0.LibraAccount;
-import 0x0.LBR;
+import 0x1.LibraAccount;
+import 0x1.Coin1;
 
 main() {
-    assert(LibraAccount.balance<LBR.T>({{carol}}) == 1000, 42);
-    assert(LibraAccount.balance<LBR.T>({{alice}}) == LibraAccount.balance<LBR.T>({{bob}}) + 1000, 43)
+    assert(LibraAccount.balance<Coin1.Coin1>({{carol}}) == 1000, 42);
+    assert(LibraAccount.balance<Coin1.Coin1>({{alice}}) == LibraAccount.balance<Coin1.Coin1>({{bob}}) + 1000, 43)
     return;
 }
 

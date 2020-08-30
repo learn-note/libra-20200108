@@ -6,7 +6,8 @@
 // allows a different address `master_key_address` to rotate the auth key. This is useful for
 // implementing (e.g.) a hot wallet with a cold recovery key.
 module SharedKeyRotation {
-    import 0x0.LibraAccount;
+    import 0x1.LibraAccount;
+    import 0x1.Signer;
 
     resource T {
         // cap.address can rotate the auth key for cap.address
@@ -17,26 +18,26 @@ module SharedKeyRotation {
 
     // Publish a SharedRotation resource for the account `cap.address` with master key
     // `master_key_address` under the sender's account
-    public publish(cap: LibraAccount.KeyRotationCapability, master_key_address: address) {
+    public publish(account: &signer, cap: LibraAccount.KeyRotationCapability, master_key_address: address) {
         let t: Self.T;
 
         t = T { cap: move(cap), master_key_address: move(master_key_address) };
-        move_to_sender<T>(move(t));
+        move_to<T>(move(account), move(t));
         return;
     }
 
-    // Rotate the auth key for the account at wallet_address/SharedKeyRotation.T/cap/address to
+    // Rotate the auth key for the account at wallet_address/SharedKeyRotation.SharedKeyRotation/cap/address to
     // new_key
-    public rotate(wallet_address: address, new_key: vector<u8>) acquires T {
+    public rotate(account: &signer, wallet_address: address, new_key: vector<u8>) acquires T {
         let wallet_ref: &mut Self.T;
         let sender: address;
 
         wallet_ref = borrow_global_mut<T>(move(wallet_address));
-        sender = get_txn_sender();
+        sender = Signer.address_of(move(account));
         if ((*&copy(wallet_ref).master_key_address == copy(sender)) ||
             (*LibraAccount.key_rotation_capability_address(&copy(wallet_ref).cap) == move(sender))
         ) {
-            LibraAccount.rotate_authentication_key_with_capability(
+            LibraAccount.rotate_authentication_key(
                 &move(wallet_ref).cap,
                 move(new_key)
             );
@@ -50,24 +51,26 @@ module SharedKeyRotation {
 //! new-transaction
 //! sender: alice
 import {{alice}}.SharedKeyRotation;
-import 0x0.LibraAccount;
+import 0x1.LibraAccount;
 // create a SharedKeyRotation for Alice's account with Bob's account key as the master key
-main() {
+main(account: &signer) {
     assert(LibraAccount.sequence_number({{alice}}) == 1, 77);
-    SharedKeyRotation.publish(LibraAccount.extract_sender_key_rotation_capability(), {{bob}});
+    SharedKeyRotation.publish(copy(account), LibraAccount.extract_key_rotation_capability(copy(account)), {{bob}});
     return;
 }
 
 // TODO: fix when porting to source lang. These are too painful without proper vector<u8> literals
 // //! new-transaction
 // //! sender: alice
-// import 0x0.AddressUtil;
+// import 0x1.AddressUtil;
 // import {{alice}}.SharedKeyRotation;
-// import 0x0.LibraAccount;
+// import 0x1.LibraAccount;
+// import 0x1.Signer;
 // // Alice can rotate her key. Here, she rotates it to its original value
-// main() {
+// main(account: &signer) {
 //     assert(LibraAccount.sequence_number({{alice}}) == 2, 78);
 //     SharedKeyRotation.rotate(
+//         Signer.address_of(move(account)),
 //         {{alice}},
 //         h"8a88082abf9fbb576bdb6969143ee6384066e363c48e041c8da1e08b9fc931f",
 //     );
@@ -77,11 +80,12 @@ main() {
 // //! new-transaction
 // //! sender: bob
 // import {{alice}}.SharedKeyRotation;
-// import 0x0.LibraAccount;
+// import 0x1.LibraAccount;
+// import 0x1.Signer;
 // // Bob can too. Here, he zeroes it out to stop Alice from sending any transactions
-// main() {
+// main(account: &signer) {
 //     assert(LibraAccount.sequence_number({{alice}}) == 3, 78);
-//     SharedKeyRotation.rotate({{alice}}, h"00");
+//     SharedKeyRotation.rotate(Signer.address_of(move(account)), {{alice}}, h"00");
 //     return;
 // }
 
@@ -96,19 +100,23 @@ main() {
 
 // //! new-transaction
 // //! sender: bob
-// import 0x0.AddressUtil;
+// import 0x1.AddressUtil;
 // import {{alice}}.SharedKeyRotation;
-// import 0x0.LibraAccount;
+// import 0x1.LibraAccount;
+// import 0x1.Signer;
 // // Bob now rotates the key back to its old value
-// main() {
+// main(account: &signer) {
 //     assert(LibraAccount.sequence_number({{alice}}) == 3, 78);
-//     SharedKeyRotation.rotate({{alice}}, h"8a88082abf9fbb576bdb6969143ee6384066e363c48e041c8da1e08b9fc931f"));
+//     SharedKeyRotation.rotate(
+//         Signer.address_of(move(account)),
+//         {{alice}},
+//         h"8a88082abf9fbb576bdb6969143ee6384066e363c48e041c8da1e08b9fc931f"));
 //     return;
 // }
 
 // //! new-transaction
 // //! sender: alice
-// import 0x0.LibraAccount;
+// import 0x1.LibraAccount;
 // // And then Alice should be able to send a tx once again
 // main() {
 //     assert(LibraAccount.sequence_number({{alice}}) == 3, 79);

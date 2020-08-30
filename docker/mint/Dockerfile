@@ -1,4 +1,4 @@
-FROM debian:buster AS toolchain
+FROM debian:buster-20200803@sha256:a44ab0cca6cd9411032d180bc396f19bc98f71972d2398d50460145cab81c5ab AS toolchain
 
 # To use http/https proxy while building, use:
 # docker build --build-arg https_proxy=http://fwdproxy:8080 --build-arg http_proxy=http://fwdproxy:8080
@@ -12,12 +12,14 @@ WORKDIR /libra
 COPY rust-toolchain /libra/rust-toolchain
 RUN rustup install $(cat rust-toolchain)
 
+COPY cargo-toolchain /libra/cargo-toolchain
+RUN rustup install $(cat cargo-toolchain)
+
 FROM toolchain AS builder
 
 COPY . /libra
 
-ENV RUSTFLAGS "-Ctarget-cpu=skylake -Ctarget-feature=+aes,+sse2,+sse4.1,+ssse3"
-RUN cargo build --release -p libra-node -p cli -p config-builder -p safety-rules && cd target/release && rm -r build deps incremental
+RUN ./docker/build-common.sh
 
 ### Production Image ###
 FROM debian:buster AS pre-test
@@ -47,6 +49,7 @@ RUN apt-get update && apt-get install -y procps
 #   GIVEN necessary environment arguments to run docker-run.sh
 ARG AC_PORT="8080"
 ARG AC_HOST="172.18.0.13"
+ARG CFG_CHAIN_ID="TESTING"
 ARG LOG_LEVEL="info"
 ARG CFG_NUM_VALIDATORS=5
 
@@ -76,7 +79,7 @@ FROM pre-test as prod
 # Mint proxy listening address
 EXPOSE 8000
 
-# Define CFG_SEED, AC_HOST and AC_PORT environment variables when running
+# Define CFG_SEED, AC_HOST, AC_PORT and CFG_CHAIN_ID environment variables when running
 CMD /opt/libra/bin/docker-run.sh
 
 ARG BUILD_DATE

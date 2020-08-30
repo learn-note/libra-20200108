@@ -28,7 +28,8 @@ pub mod ty;
 
 use crate::env::SCRIPT_MODULE_NAME;
 #[allow(unused_imports)]
-use log::{info, warn};
+use itertools::Itertools;
+use log::warn;
 use move_ir_types::location::Spanned;
 use move_lang::{
     expansion::ast::ModuleDefinition,
@@ -53,11 +54,12 @@ pub fn run_spec_lang_compiler(
     let mut all_sources = targets;
     all_sources.extend(deps.clone());
     let mut env = GlobalEnv::new();
-    // First pass: compile move code.
+    // First pass: compile Move code.
     let (files, units_or_errors) = move_compile_no_report(&all_sources, &[], address_opt)?;
     // Enter sources into env, remember file ids as
-    for (fname, fsrc) in files {
-        env.add_source(fname, &fsrc, deps.contains(&fname.to_string()));
+    for fname in files.keys().sorted() {
+        let fsrc = &files[fname];
+        env.add_source(fname, fsrc, deps.contains(&fname.to_string()));
     }
     match units_or_errors {
         Err(errors) => {
@@ -75,7 +77,7 @@ pub fn run_spec_lang_compiler(
                 let (_, eprog_or_errors) =
                     move_compile_to_expansion_no_report(&all_sources, &[], address_opt)?;
                 let (eprog, comment_map) = eprog_or_errors.expect("no compilation errors");
-                // Add any documentation comments found by the move compiler to the env.
+                // Add any documentation comments found by the Move compiler to the env.
                 for (fname, documentation) in comment_map {
                     let file_id = env.get_file_id(fname).expect("file name defined");
                     env.add_documentation(file_id, documentation);
@@ -143,6 +145,7 @@ fn run_spec_checker(
                     let move_lang::expansion::ast::Script {
                         loc,
                         function_name,
+                        constants,
                         function,
                         specs,
                     } = match eprog.scripts.remove(&key) {
@@ -182,6 +185,7 @@ fn run_spec_checker(
                         loc,
                         is_source_module: true,
                         structs: UniqueMap::new(),
+                        constants,
                         functions,
                         specs,
                     };

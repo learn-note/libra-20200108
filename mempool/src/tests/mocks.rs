@@ -12,11 +12,15 @@ use channel::{self, libra_channel, message_queues::QueueStyle};
 use futures::channel::{mpsc, oneshot};
 use libra_config::{
     config::{NetworkConfig, NodeConfig},
-    network_id::NetworkId,
+    network_id::{NetworkId, NodeNetworkId},
 };
-use libra_types::{mempool_status::MempoolStatusCode, transaction::SignedTransaction};
-use network::peer_manager::{
-    conn_notifs_channel, ConnectionRequestSender, PeerManagerRequestSender,
+use libra_types::{
+    mempool_status::MempoolStatusCode,
+    transaction::{GovernanceRole, SignedTransaction},
+};
+use network::{
+    peer_manager::{conn_notifs_channel, ConnectionRequestSender, PeerManagerRequestSender},
+    protocols::network::{NewNetworkEvents, NewNetworkSender},
 };
 use std::{
     num::NonZeroUsize,
@@ -53,7 +57,6 @@ impl MockSharedMempool {
 
         let mut config = NodeConfig::random();
         config.validator_network = Some(NetworkConfig::network_with_id(NetworkId::Validator));
-        let peer_id = config.validator_network.as_ref().unwrap().peer_id();
 
         let mempool = Arc::new(Mutex::new(CoreMempool::new(&config)));
         let (network_reqs_tx, _network_reqs_rx) =
@@ -79,7 +82,11 @@ impl MockSharedMempool {
         };
         let (_reconfig_event_publisher, reconfig_event_subscriber) =
             libra_channel::new(QueueStyle::LIFO, NonZeroUsize::new(1).unwrap(), None);
-        let network_handles = vec![(peer_id, network_sender, network_events)];
+        let network_handles = vec![(
+            NodeNetworkId::new(NetworkId::Validator, 0),
+            network_sender,
+            network_events,
+        )];
 
         start_shared_mempool(
             runtime.handle(),
@@ -119,7 +126,7 @@ impl MockSharedMempool {
                         txn.gas_unit_price(),
                         0,
                         TimelineState::NotReady,
-                        false,
+                        GovernanceRole::NonGovernanceRole,
                     )
                     .code
                     != MempoolStatusCode::Accepted
@@ -137,6 +144,10 @@ impl MockSharedMempool {
             .mempool
             .lock()
             .expect("[mock shared mempool] failed to acquire mempool lock");
-        pool.read_timeline(timeline_id, count).0
+        pool.read_timeline(timeline_id, count)
+            .0
+            .into_iter()
+            .map(|(_, txn)| txn)
+            .collect()
     }
 }

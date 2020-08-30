@@ -118,7 +118,7 @@ fn sequence_item(context: &mut Context, item: &mut T::SequenceItem) {
     }
 }
 
-fn exp(context: &mut Context, e: &mut T::Exp) {
+pub fn exp(context: &mut Context, e: &mut T::Exp) {
     use T::UnannotatedExp_ as E;
     match &e.exp.value {
         // dont expand the type for return, abort, break, or continue
@@ -212,6 +212,7 @@ fn exp(context: &mut Context, e: &mut T::Exp) {
 
         E::Unit { .. }
         | E::Value(_)
+        | E::Constant(_, _)
         | E::Move { .. }
         | E::Copy { .. }
         | E::BorrowLocal(_, _)
@@ -305,14 +306,14 @@ fn module_call(context: &mut Context, call: &mut T::ModuleCall) {
 fn builtin_function(context: &mut Context, b: &mut T::BuiltinFunction) {
     use T::BuiltinFunction_ as B;
     match &mut b.value {
-        B::MoveToSender(bt)
-        | B::MoveTo(bt)
+        B::MoveTo(bt)
         | B::MoveFrom(bt)
         | B::BorrowGlobal(_, bt)
         | B::Exists(bt)
         | B::Freeze(bt) => {
             type_(context, bt);
         }
+        B::Assert => (),
     }
 }
 

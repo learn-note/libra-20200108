@@ -19,13 +19,13 @@ use libra_logger::prelude::*;
 use libra_mempool::ConsensusRequest;
 use libra_types::on_chain_config::OnChainConfigPayload;
 use state_synchronizer::StateSyncClient;
-use std::{boxed::Box, sync::Arc};
+use std::sync::Arc;
 use storage_interface::DbReader;
 use tokio::runtime::{self, Runtime};
 
 /// Helper function to start consensus based on configuration and return the runtime
 pub fn start_consensus(
-    node_config: &mut NodeConfig,
+    node_config: &NodeConfig,
     network_sender: ConsensusNetworkSender,
     network_events: ConsensusNetworkEvents,
     state_sync_client: Arc<StateSyncClient>,
@@ -40,7 +40,7 @@ pub fn start_consensus(
         .build()
         .expect("Failed to create Tokio runtime!");
     let storage = Arc::new(StorageWriteProxy::new(node_config, libra_db));
-    let txn_manager = Box::new(MempoolProxy::new(consensus_to_mempool_sender));
+    let txn_manager = Arc::new(MempoolProxy::new(consensus_to_mempool_sender));
     let execution_correctness_manager = ExecutionCorrectnessManager::new(node_config);
     let state_computer = Arc::new(ExecutionProxy::new(
         execution_correctness_manager.client(),

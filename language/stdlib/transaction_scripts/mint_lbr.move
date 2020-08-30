@@ -1,18 +1,11 @@
 script {
-use 0x0::Coin1;
-use 0x0::Coin2;
-use 0x0::LBR;
-use 0x0::LibraAccount;
-use 0x0::Signer;
-fun main(account: &signer, amount_lbr: u64) {
-    let sender = Signer::address_of(account);
-    let coin1_balance = LibraAccount::balance<Coin1::T>(sender);
-    let coin2_balance = LibraAccount::balance<Coin2::T>(sender);
-    let coin1 = LibraAccount::withdraw_from_sender<Coin1::T>(coin1_balance);
-    let coin2 = LibraAccount::withdraw_from_sender<Coin2::T>(coin2_balance);
-    let (lbr, coin1, coin2) = LBR::create(amount_lbr, coin1, coin2);
-    LibraAccount::deposit(sender, lbr);
-    LibraAccount::deposit(sender, coin1);
-    LibraAccount::deposit(sender, coin2);
+use 0x1::LibraAccount;
+
+/// Mint `amount_lbr` LBR from the sending account's constituent coins and deposits the
+/// resulting LBR into the sending account.
+fun mint_lbr(account: &signer, amount_lbr: u64) {
+    let withdraw_cap = LibraAccount::extract_withdraw_capability(account);
+    LibraAccount::staple_lbr(&withdraw_cap, amount_lbr);
+    LibraAccount::restore_withdraw_capability(withdraw_cap)
 }
 }

@@ -3,7 +3,7 @@
 
 //! This module provides mock dbreader for tests.
 
-use crate::{DbReader, StartupInfo, TreeState};
+use crate::{DbReader, Order, StartupInfo, TreeState};
 use anyhow::Result;
 use libra_crypto::HashValue;
 use libra_types::{
@@ -25,7 +25,7 @@ use std::convert::TryFrom;
 pub struct MockDbReader;
 
 impl DbReader for MockDbReader {
-    fn get_epoch_change_ledger_infos(
+    fn get_epoch_ending_ledger_infos(
         &self,
         _start_epoch: u64,
         _end_epoch: u64,
@@ -48,9 +48,13 @@ impl DbReader for MockDbReader {
         &self,
         _event_key: &EventKey,
         _start: u64,
-        _ascending: bool,
+        _order: Order,
         _limit: u64,
     ) -> Result<Vec<(u64, ContractEvent)>> {
+        unimplemented!()
+    }
+
+    fn get_block_timestamp(&self, _version: u64) -> Result<u64> {
         unimplemented!()
     }
 
@@ -124,7 +128,10 @@ impl DbReader for MockDbReader {
         unimplemented!()
     }
 
-    fn get_ledger_info(&self, _known_version: u64) -> Result<LedgerInfoWithSignatures> {
+    fn get_epoch_ending_ledger_info(
+        &self,
+        _known_version: u64,
+    ) -> Result<LedgerInfoWithSignatures> {
         unimplemented!()
     }
 }
@@ -133,11 +140,10 @@ fn get_mock_account_state_blob() -> AccountStateBlob {
     let account_resource = AccountResource::new(
         0,
         vec![],
-        false,
-        false,
+        None,
+        None,
         EventHandle::random_handle(0),
         EventHandle::random_handle(0),
-        false,
     );
 
     let mut account_state = AccountState::default();

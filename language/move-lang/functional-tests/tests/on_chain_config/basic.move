@@ -1,106 +1,84 @@
-module ConfigHolder {
-    use 0x0::LibraConfig;
-    resource struct Holder<T> {
-        cap: LibraConfig::ModifyConfigCapability<T>
-    }
-
-    public fun hold<T>(account: &signer, cap: LibraConfig::ModifyConfigCapability<T>) {
-        move_to(account, Holder<T>{ cap })
-    }
-
-    public fun get<T>(): LibraConfig::ModifyConfigCapability<T>
-    acquires Holder {
-        let Holder<T>{ cap } = move_from<Holder<T>>({{config}});
-        cap
-    }
-}
-
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig::{Self};
     fun main(account: &signer) {
-        LibraConfig::initialize(account, account);
+        LibraConfig::initialize(account);
     }
 }
+// TODO(status_migration) remove duplicate check
+// check: ABORTED
 // check: ABORTED
 // check: 1
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig;
     fun main() {
         let _x = LibraConfig::get<u64>();
     }
 }
+// TODO(status_migration) remove duplicate check
 // check: ABORTED
-// check: 24
+// check: ABORTED
+// check: 261
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig;
     fun main(account: &signer) {
         LibraConfig::set(account, 0);
     }
 }
+// TODO(status_migration) remove duplicate check
 // check: ABORTED
-// check: 24
+// check: ABORTED
+// check: 516
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
-    use {{default}}::ConfigHolder;
+    use 0x1::LibraConfig::{Self};
     fun main(account: &signer) {
-        ConfigHolder::hold(
-            account,
-            LibraConfig::publish_new_config_with_capability(account, 0)
-        );
+        LibraConfig::publish_new_config(account, 0);
     }
 }
+// TODO(status_migration) remove duplicate check
+// check: ABORTED
 // check: ABORTED
 // check: 1
 
 //! new-transaction
-//! sender: config
-script {
-    use 0x0::LibraConfig;
-    use {{default}}::ConfigHolder;
-    fun main(account: &signer) {
-        ConfigHolder::hold(
-            account,
-            LibraConfig::publish_new_config_with_capability<u64>(account, 0)
-        );
+module Holder {
+    resource struct Holder<T> { x: T }
+    public fun hold<T>(account: &signer, x: T)  {
+        move_to(account, Holder<T> { x })
     }
 }
 // check: EXECUTED
 
 //! new-transaction
+//! sender: libraroot
 script {
-    use 0x0::LibraConfig;
-    use {{default}}::ConfigHolder;
+    use 0x1::LibraConfig::{Self};
+    use {{default}}::Holder;
+    use 0x1::LibraTimestamp;
     fun main(account: &signer) {
-        let cap = ConfigHolder::get<u64>();
-        LibraConfig::set_with_capability(&cap, 0);
-        ConfigHolder::hold(account, cap);
+        LibraTimestamp::reset_time_has_started_for_test();
+        Holder::hold(account, LibraConfig::publish_new_config_and_get_capability(account, 0));
+        LibraConfig::set(account, 1);
     }
 }
-// check: EXECUTED
+// check: "Keep(ABORTED { code: 516,"
 
 //! new-transaction
+//! sender: blessed
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig::{Self};
+    use {{default}}::Holder;
+    use 0x1::LibraTimestamp;
     fun main(account: &signer) {
-        LibraConfig::publish_new_config(account, 0)
+        LibraTimestamp::reset_time_has_started_for_test();
+        Holder::hold(account, LibraConfig::publish_new_config_and_get_capability(account, 0));
+        LibraConfig::set(account, 1);
     }
 }
-// check: ABORTED
-// check: 1
-
-//! new-transaction
-script {
-    use 0x0::LibraConfig;
-    fun main(account: &signer) {
-        LibraConfig::publish_new_config_with_delegate(account, 0, {{config}})
-    }
-}
-// check: ABORTED
-// check: 1
+// check: "Keep(ABORTED { code: 2,"

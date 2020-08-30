@@ -1,5 +1,5 @@
 script {
-use 0x0::FixedPoint32;
+use 0x1::FixedPoint32;
 
 fun main() {
     // Dividing by zero should cause an arithmetic error.
@@ -7,7 +7,7 @@ fun main() {
     let fail = FixedPoint32::divide_u64(1, copy f1);
     // The above should fail at runtime so that the following assertion
     // is never even tested.
-    0x0::Transaction::assert(fail == 999, 1);
+    assert(fail == 999, 1);
 }
 }
-// check: ARITHMETIC_ERROR
+// check: "Keep(ABORTED { code: 775"

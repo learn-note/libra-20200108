@@ -1,8 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::SynchronizerState;
-use anyhow::{ensure, format_err, Result};
+use crate::{counters, SynchronizerState};
+use anyhow::{format_err, Result};
 use executor_types::{ChunkExecutor, ExecutedTrees};
 use itertools::Itertools;
 use libra_types::{
@@ -42,8 +42,8 @@ pub trait ExecutorProxyTrait: Send {
     /// Get the epoch change ledger info for epoch so that we can move to next epoch.
     fn get_epoch_proof(&self, epoch: u64) -> Result<LedgerInfoWithSignatures>;
 
-    /// Tries to find a LedgerInfo for a given version.
-    fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures>;
+    /// Get ledger info at an epoch boundary version.
+    fn get_epoch_ending_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures>;
 
     /// Load all on-chain configs from storage
     /// Note: this method is being exposed as executor proxy trait temporarily because storage read is currently
@@ -93,7 +93,11 @@ impl ExecutorProxy {
             .collect();
         let configs = storage.batch_fetch_resources(access_paths)?;
         let epoch = storage
-            .get_latest_account_state(config_address())?
+            .get_account_state_with_proof_by_version(
+                config_address(),
+                storage.fetch_synced_version()?,
+            )?
+            .0
             .map(|blob| {
                 AccountState::try_from(&blob).and_then(|state| {
                     Ok(state
@@ -146,11 +150,14 @@ impl ExecutorProxyTrait for ExecutorProxy {
         intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
         _synced_trees: &mut ExecutedTrees,
     ) -> Result<()> {
+        // track chunk execution time
+        let timer = counters::EXECUTE_CHUNK_DURATION.start_timer();
         let reconfig_events = self.executor.execute_and_commit_chunk(
             txn_list_with_proof,
             verified_target_li,
             intermediate_end_of_epoch_li,
         )?;
+        timer.stop_and_record();
         self.publish_on_chain_config_updates(reconfig_events)
     }
 
@@ -165,24 +172,15 @@ impl ExecutorProxyTrait for ExecutorProxy {
     }
 
     fn get_epoch_proof(&self, epoch: u64) -> Result<LedgerInfoWithSignatures> {
-        let epoch_change_li = self
-            .storage
-            .get_epoch_change_ledger_infos(epoch, epoch + 1)?
+        self.storage
+            .get_epoch_ending_ledger_infos(epoch, epoch + 1)?
             .ledger_info_with_sigs
             .pop()
-            .ok_or_else(|| format_err!("Empty EpochChangeProof"))?;
-        Ok(epoch_change_li)
+            .ok_or_else(|| format_err!("Empty EpochChangeProof"))
     }
 
-    fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
-        let waypoint_li = self.storage.get_ledger_info(version)?;
-        ensure!(
-            waypoint_li.ledger_info().version() == version,
-            "Version of Waypoint LI {} is different from requested waypoint version {}",
-            waypoint_li.ledger_info().version(),
-            version
-        );
-        Ok(waypoint_li)
+    fn get_epoch_ending_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+        self.storage.get_epoch_ending_ledger_info(version)
     }
 
     fn load_on_chain_configs(&mut self) -> Result<()> {
@@ -195,7 +193,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
             return Ok(());
         }
         let event_keys = events
-            .into_iter()
+            .iter()
             .map(|event| *event.key())
             .collect::<HashSet<_>>();
 

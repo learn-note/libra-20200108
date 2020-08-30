@@ -8,6 +8,8 @@ use libra_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub const MAX_BLOCKS_PER_REQUEST: u64 = 10;
+
 /// RPC to get a chain of block of the given length starting from the given block id.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct BlockRetrievalRequest {
@@ -86,7 +88,7 @@ impl BlockRetrievalResponse {
         self.blocks
             .iter()
             .try_fold(block_id, |expected_id, block| {
-                block.validate_signatures(sig_verifier)?;
+                block.validate_signature(sig_verifier)?;
                 block.verify_well_formed()?;
                 ensure!(
                     block.id() == expected_id,

@@ -1,43 +1,13 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Protocol used to identify key information about a remote
-//!
-//! Currently, the information shared as part of this protocol includes the peer identity and a
-//! list of protocols supported by the peer.
+//! Protocol used to exchange supported protocol information with a remote.
+
 use crate::protocols::wire::handshake::v1::HandshakeMsg;
 use bytes::BytesMut;
 use futures::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use libra_types::PeerId;
 use netcore::framing::{read_u16frame, write_u16frame};
 use std::io;
-
-/// The PeerId exchange protocol.
-pub async fn exchange_peerid<T>(own_peer_id: &PeerId, socket: &mut T) -> io::Result<PeerId>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    // Send serialized PeerId to remote peer.
-    let msg = lcs::to_bytes(own_peer_id).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Failed to serialize identity msg: {}", e),
-        )
-    })?;
-    write_u16frame(socket, &msg).await?;
-    socket.flush().await?;
-
-    // Read PeerId from remote peer.
-    let mut response = BytesMut::new();
-    read_u16frame(socket, &mut response).await?;
-    let remote_peer_id = lcs::from_bytes(&response).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Failed to parse identity msg: {}", e),
-        )
-    })?;
-    Ok(remote_peer_id)
-}
 
 /// The Handshake exchange protocol.
 pub async fn exchange_handshake<T>(
@@ -73,15 +43,16 @@ where
 mod tests {
     use crate::{
         protocols::{
-            identity::{exchange_handshake, exchange_peerid},
+            identity::exchange_handshake,
             wire::handshake::v1::{HandshakeMsg, MessagingProtocolVersion},
         },
         ProtocolId,
     };
     use futures::{executor::block_on, future::join};
     use libra_config::network_id::NetworkId;
-    use libra_types::PeerId;
+    use libra_types::chain_id::ChainId;
     use memsocket::MemorySocket;
+    use std::collections::BTreeMap;
 
     fn build_test_connection() -> (MemorySocket, MemorySocket) {
         MemorySocket::new_pair()
@@ -90,11 +61,12 @@ mod tests {
     #[test]
     fn simple_handshake() {
         let network_id = NetworkId::Validator;
+        let chain_id = ChainId::test();
         let (mut outbound, mut inbound) = build_test_connection();
 
         // Create client and server handshake messages.
-        let mut server_handshake = HandshakeMsg::new(network_id.clone());
-        server_handshake.add(
+        let mut supported_protocols = BTreeMap::new();
+        supported_protocols.insert(
             MessagingProtocolVersion::V1,
             [
                 ProtocolId::ConsensusDirectSend,
@@ -103,13 +75,23 @@ mod tests {
             .iter()
             .into(),
         );
-        let mut client_handshake = HandshakeMsg::new(network_id);
-        client_handshake.add(
+        let server_handshake = HandshakeMsg {
+            chain_id,
+            network_id: network_id.clone(),
+            supported_protocols,
+        };
+        let mut supported_protocols = BTreeMap::new();
+        supported_protocols.insert(
             MessagingProtocolVersion::V1,
             [ProtocolId::ConsensusRpc, ProtocolId::ConsensusDirectSend]
                 .iter()
                 .into(),
         );
+        let client_handshake = HandshakeMsg {
+            chain_id,
+            network_id,
+            supported_protocols,
+        };
 
         let server_handshake_clone = server_handshake.clone();
         let client_handshake_clone = client_handshake.clone();
@@ -140,27 +122,66 @@ mod tests {
     }
 
     #[test]
-    fn simple_peerid_exchange() {
-        let (mut outbound, mut inbound) = build_test_connection();
+    fn handshake_chain_id_mismatch() {
+        let (mut outbound, mut inbound) = MemorySocket::new_pair();
 
-        // Create client and server ids.
-        let client_id = PeerId::random();
-        let server_id = PeerId::random();
+        // server state
+        let server_handshake = HandshakeMsg::new_for_testing();
 
-        let server = async {
-            let id = exchange_peerid(&server_id, &mut inbound)
+        // client state
+        let mut client_handshake = server_handshake.clone();
+        client_handshake.chain_id = ChainId::new(client_handshake.chain_id.id() + 1);
+
+        // perform the handshake negotiation
+        let server = async move {
+            let remote_handshake = exchange_handshake(&server_handshake, &mut inbound)
                 .await
-                .expect("Identity exchange fails");
-
-            assert_eq!(id, client_id);
+                .unwrap();
+            server_handshake
+                .perform_handshake(&remote_handshake)
+                .unwrap_err()
         };
 
-        let client = async {
-            let id = exchange_peerid(&client_id, &mut outbound)
+        let client = async move {
+            let remote_handshake = exchange_handshake(&client_handshake, &mut outbound)
                 .await
-                .expect("Identity exchange fails");
+                .unwrap();
+            client_handshake
+                .perform_handshake(&remote_handshake)
+                .unwrap_err()
+        };
 
-            assert_eq!(id, server_id);
+        block_on(join(server, client));
+    }
+
+    #[test]
+    fn handshake_network_id_mismatch() {
+        let (mut outbound, mut inbound) = MemorySocket::new_pair();
+
+        // server state
+        let server_handshake = HandshakeMsg::new_for_testing();
+
+        // client state
+        let mut client_handshake = server_handshake.clone();
+        client_handshake.network_id = NetworkId::Public;
+
+        // perform the handshake negotiation
+        let server = async move {
+            let remote_handshake = exchange_handshake(&server_handshake, &mut inbound)
+                .await
+                .unwrap();
+            server_handshake
+                .perform_handshake(&remote_handshake)
+                .unwrap_err()
+        };
+
+        let client = async move {
+            let remote_handshake = exchange_handshake(&client_handshake, &mut outbound)
+                .await
+                .unwrap();
+            client_handshake
+                .perform_handshake(&remote_handshake)
+                .unwrap_err()
         };
 
         block_on(join(server, client));

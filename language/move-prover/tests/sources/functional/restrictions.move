@@ -28,21 +28,6 @@ module M {
             S{f: 1}
         }
 
-        // Shl
-        define f6(): num {
-            8 << 2
-        }
-
-        // Shr
-        define f7(): num {
-            8 >> 2
-        }
-
-        // All/Any wo/ direct lambda.
-        define f8(x: vector<num>, p: |num|bool): bool {
-            all(x, p) && any(x, p)
-        }
-
         // Multiple variable bindings
         // Those aren't supported even in the checker, so commented out to see the other issues.
         // define f9(): (num, num) {

@@ -4,21 +4,16 @@
 use crate::{BuildSwarm, Error, ValidatorConfig};
 use anyhow::{ensure, Result};
 use libra_config::{
-    config::{
-        NetworkPeerInfo, NetworkPeersConfig, NodeConfig, PeerNetworkId, RoleType, UpstreamConfig,
-    },
+    config::{DiscoveryMethod, NodeConfig, RoleType, SeedPublicKeys},
     generator,
     network_id::NetworkId,
     utils,
 };
 use libra_crypto::ed25519::Ed25519PrivateKey;
 use libra_network_address::NetworkAddress;
-use libra_types::transaction::Transaction;
+use libra_types::{chain_id::ChainId, transaction::Transaction};
 use rand::{rngs::StdRng, SeedableRng};
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
+use std::{collections::HashSet, str::FromStr};
 
 pub struct FullNodeConfig {
     pub advertised_address: NetworkAddress,
@@ -28,7 +23,7 @@ pub struct FullNodeConfig {
     pub num_full_nodes: usize,
     pub genesis: Option<Transaction>,
     pub listen_address: NetworkAddress,
-    pub enable_remote_authentication: bool,
+    pub mutual_authentication: bool,
     template: NodeConfig,
     validator_config: ValidatorConfig,
 }
@@ -50,7 +45,7 @@ impl Default for FullNodeConfig {
             num_full_nodes: 1,
             genesis: None,
             listen_address: NetworkAddress::from_str(DEFAULT_LISTEN_ADDRESS).unwrap(),
-            enable_remote_authentication: true,
+            mutual_authentication: true,
             template,
             validator_config: ValidatorConfig::new(),
         }
@@ -60,6 +55,11 @@ impl Default for FullNodeConfig {
 impl FullNodeConfig {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn chain_id(&mut self, chain_id: ChainId) -> &mut Self {
+        self.validator_config.chain_id = chain_id;
+        self
     }
 
     pub fn num_validator_nodes(&mut self, nodes: usize) -> &mut Self {
@@ -86,16 +86,16 @@ impl FullNodeConfig {
             .full_node_networks
             .last()
             .ok_or(Error::MissingFullNodeNetwork)?;
-        let seed_peers = generator::build_seed_peers(&seed_config, self.bootstrap.clone());
+        let seed_addrs = generator::build_seed_addrs(&seed_config, self.bootstrap.clone());
 
         let mut config = configs.swap_remove(self.full_node_index);
         let network = &mut config
             .full_node_networks
             .last_mut()
             .ok_or(Error::MissingFullNodeNetwork)?;
-        network.advertised_address = self.advertised_address.clone();
+        network.discovery_method = DiscoveryMethod::gossip(self.advertised_address.clone());
         network.listen_address = self.listen_address.clone();
-        network.seed_peers = seed_peers;
+        network.seed_addrs = seed_addrs;
 
         Ok(config)
     }
@@ -108,12 +108,12 @@ impl FullNodeConfig {
             .full_node_networks
             .last()
             .ok_or(Error::MissingFullNodeNetwork)?;
-        let seed_peers = generator::build_seed_peers(&seed_config, self.bootstrap.clone());
+        let seed_addrs = generator::build_seed_addrs(&seed_config, self.bootstrap.clone());
 
         let mut network = new_net.full_node_networks.swap_remove(0);
-        network.advertised_address = self.advertised_address.clone();
+        network.discovery_method = DiscoveryMethod::gossip(self.advertised_address.clone());
         network.listen_address = self.listen_address.clone();
-        network.seed_peers = seed_peers;
+        network.seed_addrs = seed_addrs;
         config.full_node_networks.push(network);
         Ok(())
     }
@@ -122,8 +122,8 @@ impl FullNodeConfig {
         let mut full_node_config = self.build()?;
         let new_net = full_node_config.full_node_networks.swap_remove(0);
         for net in &config.full_node_networks {
-            let new_net_id = new_net.identity.peer_id_from_config().unwrap();
-            let net_id = net.identity.peer_id_from_config().unwrap();
+            let new_net_id = new_net.peer_id();
+            let net_id = net.peer_id();
             ensure!(new_net_id != net_id, "Network already exists");
         }
         config.full_node_networks.push(new_net);
@@ -146,16 +146,14 @@ impl FullNodeConfig {
         // Don't randomize ports. Until we better separate genesis generation,
         // we don't want to accidentally randomize initial discovery set addresses.
         let randomize_validator_ports = false;
-        let (validator_configs, faucet_key) = self
+        let (validator_configs, libra_root_key) = self
             .validator_config
             .build_common(randomize_validator_ports)?;
         let validator_config = validator_configs.first().ok_or(Error::NoConfigs)?;
 
         let mut rng = StdRng::from_seed(self.full_node_seed);
         let mut configs = Vec::new();
-        let mut network_peers = NetworkPeersConfig {
-            peers: HashMap::new(),
-        };
+        let mut seed_pubkeys = SeedPublicKeys::default();
 
         // @TODO The last one is the upstream peer, note at some point we'll have to support taking
         // in a genesis instead at which point we may not have an upstream peer config
@@ -179,18 +177,12 @@ impl FullNodeConfig {
                 .ok_or(Error::MissingFullNodeNetwork)?;
             network.network_id = NetworkId::vfn_network();
             network.listen_address = utils::get_available_port_in_multiaddr(true);
-            network.advertised_address = network.listen_address.clone();
-            network.enable_remote_authentication = self.enable_remote_authentication;
+            network.discovery_method = DiscoveryMethod::gossip(self.advertised_address.clone());
+            network.mutual_authentication = self.mutual_authentication;
 
-            network_peers.peers.insert(
-                network.identity.peer_id_from_config().unwrap(),
-                NetworkPeerInfo {
-                    identity_public_key: network
-                        .identity
-                        .public_key_from_config()
-                        .ok_or(Error::MissingNetworkKeyPairs)?,
-                },
-            );
+            let pubkey = network.identity_key().public_key();
+            let pubkey_set: HashSet<_> = [pubkey].iter().copied().collect();
+            seed_pubkeys.insert(network.peer_id(), pubkey_set);
 
             configs.push(config);
         }
@@ -200,37 +192,30 @@ impl FullNodeConfig {
             .full_node_networks
             .last()
             .ok_or(Error::MissingFullNodeNetwork)?;
-        let seed_peers =
-            generator::build_seed_peers(&validator_full_node_network, self.bootstrap.clone());
-        let upstream_peer_id = validator_full_node_network
-            .identity
-            .peer_id_from_config()
-            .unwrap();
-        for config in configs.iter_mut() {
+        let seed_addrs =
+            generator::build_seed_addrs(&validator_full_node_network, self.bootstrap.clone());
+        for (idx, config) in configs.iter_mut().enumerate() {
             let network = config
                 .full_node_networks
                 .last_mut()
                 .ok_or(Error::MissingFullNodeNetwork)?;
             network.network_id = NetworkId::Public;
-            network.network_peers = network_peers.clone();
-            network.seed_peers = seed_peers.clone();
-            let mut upstream = UpstreamConfig::default();
-            let peer_id = network.identity.peer_id_from_config().unwrap();
-            upstream.upstream_peers = vec![PeerNetworkId(peer_id, upstream_peer_id)]
-                .into_iter()
-                .collect::<HashSet<_>>();
-            config.upstream = upstream;
+            network.seed_pubkeys = seed_pubkeys.clone();
+            network.seed_addrs = seed_addrs.clone();
+            if idx < actual_nodes - 1 {
+                config.upstream.networks.push(network.network_id.clone());
+            }
         }
 
-        Ok((configs, faucet_key))
+        Ok((configs, libra_root_key))
     }
 }
 
 impl BuildSwarm for FullNodeConfig {
     fn build_swarm(&self) -> Result<(Vec<NodeConfig>, Ed25519PrivateKey)> {
-        let (mut configs, faucet_key) = self.build_internal(true)?;
+        let (mut configs, libra_root_key) = self.build_internal(true)?;
         configs.swap_remove(configs.len() - 1);
-        Ok((configs, faucet_key))
+        Ok((configs, libra_root_key))
     }
 }
 
@@ -245,17 +230,17 @@ mod test {
         let config = FullNodeConfig::new().build().unwrap();
         let network = &config.full_node_networks[0];
 
-        network.seed_peers.verify_libranet_addrs().unwrap();
-        let (seed_peer_id, seed_addrs) = network.seed_peers.seed_peers.iter().next().unwrap();
+        network.verify_seed_addrs().unwrap();
+        let (seed_peer_id, seed_addrs) = network.seed_addrs.iter().next().unwrap();
         assert_eq!(seed_addrs.len(), 1);
+        assert_ne!(&network.peer_id(), seed_peer_id);
         assert_ne!(
-            &network.identity.peer_id_from_config().unwrap(),
-            seed_peer_id
+            &network.discovery_method.advertised_address(),
+            &seed_addrs[0]
         );
-        assert_ne!(&network.advertised_address, &seed_addrs[0]);
 
         assert_eq!(
-            network.advertised_address,
+            network.discovery_method.advertised_address(),
             NetworkAddress::from_str(DEFAULT_ADVERTISED_ADDRESS).unwrap()
         );
         assert_eq!(
@@ -272,14 +257,10 @@ mod test {
         FullNodeConfig::new()
             .extend_validator(&mut validator_config)
             .unwrap();
-        let val_fn = &validator_config.full_node_networks[0];
 
         let fnc = FullNodeConfig::new().build().unwrap();
-        let fn_network_id = fnc.full_node_networks[0].peer_id();
-        assert!(fnc
-            .upstream
-            .upstream_peers
-            .contains(&PeerNetworkId(fn_network_id, val_fn.peer_id())));
+        let fn_network_id = &fnc.full_node_networks[0].network_id;
+        assert!(fnc.upstream.networks.contains(fn_network_id));
     }
 
     #[test]
@@ -296,8 +277,8 @@ mod test {
         );
         assert!(config_extended.full_node_networks != config_orig.full_node_networks);
         assert_eq!(
-            config_extended.full_node_networks[0].network_peers,
-            config_full.full_node_networks[0].network_peers
+            config_extended.full_node_networks[0].seed_pubkeys,
+            config_full.full_node_networks[0].seed_pubkeys,
         );
     }
 

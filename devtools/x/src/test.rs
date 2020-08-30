@@ -32,6 +32,9 @@ pub struct Args {
     #[structopt(long)]
     /// Do not run tests, only compile the test executables
     no_run: bool,
+    #[structopt(long, short)]
+    /// Number of parallel jobs, defaults to # of CPUs
+    jobs: Option<u16>,
     #[structopt(long, parse(from_os_str))]
     /// Directory to output HTML coverage report to (using grcov)
     html_cov_dir: Option<OsString>,
@@ -59,7 +62,7 @@ pub fn run(mut args: Args, xctx: XContext) -> Result<()> {
             // for more info see:  https://github.com/mozilla/grcov#example-how-to-generate-gcda-fiels-for-a-rust-project
             (
                 "RUSTFLAGS",
-                "-Zprofile -Ccodegen-units=1 -Coverflow-checks=off -Zno-landing-pads",
+                "-Zprofile -Ccodegen-units=1 -Coverflow-checks=off",
             ),
         ]
     } else {
@@ -75,84 +78,33 @@ pub fn run(mut args: Args, xctx: XContext) -> Result<()> {
     };
     if args.lib {
         direct_args.push(OsString::from("--lib"));
-    }
+    };
+
+    if let Some(jobs) = args.jobs {
+        direct_args.push(OsString::from("--jobs"));
+        direct_args.push(OsString::from(jobs.to_string()));
+    };
 
     let cmd = CargoCommand::Test {
+        cargo_config: xctx.config().cargo_config(),
         direct_args: direct_args.as_slice(),
         args: &args.args,
         env: &env_vars,
     };
 
-    // When testing, by deafult we want to turn on all features to ensure that the fuzzing features
-    // are flipped on
-    let base_args = CargoArgs {
-        all_features: true,
-        ..CargoArgs::default()
-    };
-
     if args.unit {
         cmd.run_with_exclusions(
-            config.package_exceptions().iter().map(|(p, _)| p),
-            &base_args,
-        )?;
-        cmd.run_on_packages_separate(
-            config
-                .package_exceptions()
-                .iter()
-                .filter(|(_, pkg)| !pkg.system)
-                .map(|(name, pkg)| {
-                    (
-                        name,
-                        CargoArgs {
-                            all_features: pkg.all_features,
-                            ..base_args
-                        },
-                    )
-                }),
+            config.system_tests().iter().map(|(p, _)| p),
+            &CargoArgs::default(),
         )?;
     } else if !args.package.is_empty() {
-        let run_together = args.package.iter().filter(|p| !config.is_exception(p));
-        let run_separate = args.package.iter().filter_map(|p| {
-            config.package_exceptions().get(p).map(|e| {
-                (
-                    p,
-                    CargoArgs {
-                        all_features: e.all_features,
-                        ..base_args
-                    },
-                )
-            })
-        });
-        cmd.run_on_packages_together(run_together, &base_args)?;
-        cmd.run_on_packages_separate(run_separate)?;
-    } else if utils::project_is_root()? {
+        cmd.run_on_packages(args.package.iter(), &CargoArgs::default())?;
+    } else if utils::project_is_root(&xctx)? {
         // TODO Maybe only run a subest of tests if we're not inside
         // a package but not at the project root (e.g. language)
-        cmd.run_with_exclusions(
-            config.package_exceptions().iter().map(|(p, _)| p),
-            &base_args,
-        )?;
-        cmd.run_on_packages_separate(config.package_exceptions().iter().map(|(name, pkg)| {
-            (
-                name,
-                CargoArgs {
-                    all_features: pkg.all_features,
-                    ..base_args
-                },
-            )
-        }))?;
+        cmd.run_on_all_packages(&CargoArgs::default())?;
     } else {
-        let package = utils::get_local_package()?;
-        let all_features = config
-            .package_exceptions()
-            .get(&package)
-            .map(|pkg| pkg.all_features)
-            .unwrap_or(true);
-
-        cmd.run_on_local_package(&CargoArgs {
-            all_features,
-            ..base_args
-        })?;
+        cmd.run_on_local_package(&CargoArgs::default())?;
     }
 
     if args.html_cov_dir.is_some() {

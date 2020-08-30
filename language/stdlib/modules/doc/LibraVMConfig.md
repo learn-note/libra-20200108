@@ -1,25 +1,25 @@
 
-<a name="0x0_LibraVMConfig"></a>
+<a name="0x1_LibraVMConfig"></a>
 
-# Module `0x0::LibraVMConfig`
+# Module `0x1::LibraVMConfig`
 
 ### Table of Contents
 
--  [Struct `T`](#0x0_LibraVMConfig_T)
--  [Struct `GasSchedule`](#0x0_LibraVMConfig_GasSchedule)
--  [Struct `GasConstants`](#0x0_LibraVMConfig_GasConstants)
--  [Function `initialize`](#0x0_LibraVMConfig_initialize)
--  [Function `set_publishing_option`](#0x0_LibraVMConfig_set_publishing_option)
+-  [Struct `LibraVMConfig`](#0x1_LibraVMConfig_LibraVMConfig)
+-  [Struct `GasSchedule`](#0x1_LibraVMConfig_GasSchedule)
+-  [Struct `GasConstants`](#0x1_LibraVMConfig_GasConstants)
+-  [Function `initialize`](#0x1_LibraVMConfig_initialize)
+-  [Specification](#0x1_LibraVMConfig_Specification)
 
 
 
-<a name="0x0_LibraVMConfig_T"></a>
+<a name="0x1_LibraVMConfig_LibraVMConfig"></a>
 
-## Struct `T`
+## Struct `LibraVMConfig`
 
 
 
-<pre><code><b>struct</b> <a href="#0x0_LibraVMConfig_T">T</a>
+<pre><code><b>struct</b> <a href="#0x1_LibraVMConfig">LibraVMConfig</a>
 </code></pre>
 
 
@@ -31,14 +31,7 @@
 <dl>
 <dt>
 
-<code>publishing_option: vector&lt;u8&gt;</code>
-</dt>
-<dd>
-
-</dd>
-<dt>
-
-<code>gas_schedule: <a href="#0x0_LibraVMConfig_GasSchedule">LibraVMConfig::GasSchedule</a></code>
+<code>gas_schedule: <a href="#0x1_LibraVMConfig_GasSchedule">LibraVMConfig::GasSchedule</a></code>
 </dt>
 <dd>
 
@@ -48,13 +41,13 @@
 
 </details>
 
-<a name="0x0_LibraVMConfig_GasSchedule"></a>
+<a name="0x1_LibraVMConfig_GasSchedule"></a>
 
 ## Struct `GasSchedule`
 
 
 
-<pre><code><b>struct</b> <a href="#0x0_LibraVMConfig_GasSchedule">GasSchedule</a>
+<pre><code><b>struct</b> <a href="#0x1_LibraVMConfig_GasSchedule">GasSchedule</a>
 </code></pre>
 
 
@@ -80,7 +73,7 @@
 </dd>
 <dt>
 
-<code>gas_constants: <a href="#0x0_LibraVMConfig_GasConstants">LibraVMConfig::GasConstants</a></code>
+<code>gas_constants: <a href="#0x1_LibraVMConfig_GasConstants">LibraVMConfig::GasConstants</a></code>
 </dt>
 <dd>
 
@@ -90,13 +83,13 @@
 
 </details>
 
-<a name="0x0_LibraVMConfig_GasConstants"></a>
+<a name="0x1_LibraVMConfig_GasConstants"></a>
 
 ## Struct `GasConstants`
 
 
 
-<pre><code><b>struct</b> <a href="#0x0_LibraVMConfig_GasConstants">GasConstants</a>
+<pre><code><b>struct</b> <a href="#0x1_LibraVMConfig_GasConstants">GasConstants</a>
 </code></pre>
 
 
@@ -125,32 +118,37 @@
 <code>min_transaction_gas_units: u64</code>
 </dt>
 <dd>
- We charge one unit of gas per-byte for the first 600 bytes
+ The flat minimum amount of gas required for any transaction.
+ Charged at the start of execution.
 </dd>
 <dt>
 
 <code>large_transaction_cutoff: u64</code>
 </dt>
 <dd>
- Any transaction over this size will be charged
-<code>INTRINSIC_GAS_PER_BYTE</code> per byte
+ Any transaction over this size will be charged an additional amount per byte.
 </dd>
 <dt>
 
-<code>instrinsic_gas_per_byte: u64</code>
+<code>intrinsic_gas_per_byte: u64</code>
 </dt>
 <dd>
- The units of gas that should be charged per byte for every transaction.
+ The units of gas that to be charged per byte over the
+<code>large_transaction_cutoff</code> in addition to
+ <code>min_transaction_gas_units</code> for transactions whose size exceeds
+<code>large_transaction_cutoff</code>.
 </dd>
 <dt>
 
 <code>maximum_number_of_gas_units: u64</code>
 </dt>
 <dd>
- 1 nanosecond should equal one unit of computational gas. We bound the maximum
- computational time of any given transaction at 10 milliseconds. We want this number and
+ ~5 microseconds should equal one unit of computational gas. We bound the maximum
+ computational time of any given transaction at roughly 20 seconds. We want this number and
  <code>MAX_PRICE_PER_GAS_UNIT</code> to always satisfy the inequality that
-         MAXIMUM_NUMBER_OF_GAS_UNITS * MAX_PRICE_PER_GAS_UNIT < min(u64::MAX, GasUnits<GasCarrier>::MAX)
+ MAXIMUM_NUMBER_OF_GAS_UNITS * MAX_PRICE_PER_GAS_UNIT < min(u64::MAX, GasUnits<GasCarrier>::MAX)
+ NB: The bound is set quite high since custom scripts aren't allowed except from predefined
+ and vetted senders.
 </dd>
 <dt>
 
@@ -173,18 +171,32 @@
 <dd>
 
 </dd>
+<dt>
+
+<code>gas_unit_scaling_factor: u64</code>
+</dt>
+<dd>
+
+</dd>
+<dt>
+
+<code>default_account_size: u64</code>
+</dt>
+<dd>
+
+</dd>
 </dl>
 
 
 </details>
 
-<a name="0x0_LibraVMConfig_initialize"></a>
+<a name="0x1_LibraVMConfig_initialize"></a>
 
 ## Function `initialize`
 
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="#0x0_LibraVMConfig_initialize">initialize</a>(config_account: &signer, publishing_option: vector&lt;u8&gt;, instruction_schedule: vector&lt;u8&gt;, native_schedule: vector&lt;u8&gt;)
+<pre><code><b>public</b> <b>fun</b> <a href="#0x1_LibraVMConfig_initialize">initialize</a>(lr_account: &signer, instruction_schedule: vector&lt;u8&gt;, native_schedule: vector&lt;u8&gt;)
 </code></pre>
 
 
@@ -193,30 +205,34 @@
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="#0x0_LibraVMConfig_initialize">initialize</a>(
-    config_account: &signer,
-    publishing_option: vector&lt;u8&gt;,
+<pre><code><b>public</b> <b>fun</b> <a href="#0x1_LibraVMConfig_initialize">initialize</a>(
+    lr_account: &signer,
     instruction_schedule: vector&lt;u8&gt;,
     native_schedule: vector&lt;u8&gt;,
 ) {
-    <b>let</b> gas_constants = <a href="#0x0_LibraVMConfig_GasConstants">GasConstants</a> {
-        global_memory_per_byte_cost: 8,
-        global_memory_per_byte_write_cost: 8,
+    <a href="LibraTimestamp.md#0x1_LibraTimestamp_assert_genesis">LibraTimestamp::assert_genesis</a>();
+
+    // The permission "UpdateVMConfig" is granted <b>to</b> LibraRoot [B21].
+    <a href="Roles.md#0x1_Roles_assert_libra_root">Roles::assert_libra_root</a>(lr_account);
+
+    <b>let</b> gas_constants = <a href="#0x1_LibraVMConfig_GasConstants">GasConstants</a> {
+        global_memory_per_byte_cost: 4,
+        global_memory_per_byte_write_cost: 9,
         min_transaction_gas_units: 600,
         large_transaction_cutoff: 600,
-        instrinsic_gas_per_byte: 8,
-        maximum_number_of_gas_units: 2000000,
+        intrinsic_gas_per_byte: 8,
+        maximum_number_of_gas_units: 4000000,
         min_price_per_gas_unit: 0,
         max_price_per_gas_unit: 10000,
         max_transaction_size_in_bytes: 4096,
+        gas_unit_scaling_factor: 1000,
+        default_account_size: 800,
     };
 
-
-    <a href="LibraConfig.md#0x0_LibraConfig_publish_new_config">LibraConfig::publish_new_config</a>&lt;<a href="#0x0_LibraVMConfig_T">Self::T</a>&gt;(
-        config_account,
-        <a href="#0x0_LibraVMConfig_T">T</a> {
-            publishing_option,
-            gas_schedule: <a href="#0x0_LibraVMConfig_GasSchedule">GasSchedule</a> {
+    <a href="LibraConfig.md#0x1_LibraConfig_publish_new_config">LibraConfig::publish_new_config</a>(
+        lr_account,
+        <a href="#0x1_LibraVMConfig">LibraVMConfig</a> {
+            gas_schedule: <a href="#0x1_LibraVMConfig_GasSchedule">GasSchedule</a> {
                 instruction_schedule,
                 native_schedule,
                 gas_constants,
@@ -230,28 +246,11 @@
 
 </details>
 
-<a name="0x0_LibraVMConfig_set_publishing_option"></a>
+<a name="0x1_LibraVMConfig_Specification"></a>
 
-## Function `set_publishing_option`
+## Specification
 
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="#0x0_LibraVMConfig_set_publishing_option">set_publishing_option</a>(account: &signer, publishing_option: vector&lt;u8&gt;)
+<pre><code><b>invariant</b> [<b>global</b>] <a href="LibraTimestamp.md#0x1_LibraTimestamp_is_operating">LibraTimestamp::is_operating</a>() ==&gt; <a href="LibraConfig.md#0x1_LibraConfig_spec_is_published">LibraConfig::spec_is_published</a>&lt;<a href="#0x1_LibraVMConfig">LibraVMConfig</a>&gt;();
 </code></pre>
-
-
-
-<details>
-<summary>Implementation</summary>
-
-
-<pre><code><b>public</b> <b>fun</b> <a href="#0x0_LibraVMConfig_set_publishing_option">set_publishing_option</a>(account: &signer, publishing_option: vector&lt;u8&gt;) {
-    <b>let</b> current_config = <a href="LibraConfig.md#0x0_LibraConfig_get">LibraConfig::get</a>&lt;<a href="#0x0_LibraVMConfig_T">Self::T</a>&gt;();
-    current_config.publishing_option = publishing_option;
-    <a href="LibraConfig.md#0x0_LibraConfig_set">LibraConfig::set</a>&lt;<a href="#0x0_LibraVMConfig_T">Self::T</a>&gt;(account, current_config);
-}
-</code></pre>
-
-
-
-</details>

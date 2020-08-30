@@ -1,51 +1,38 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use admission_control_service::admission_control_service::AdmissionControlService;
 use backup_service::start_backup_service;
 use consensus::{consensus_provider::start_consensus, gen_consensus_reconfig_subscription};
 use debug_interface::node_debug_service::NodeDebugService;
-use executor::{db_bootstrapper::bootstrap_db_if_empty, Executor};
+use executor::{db_bootstrapper::maybe_bootstrap, Executor};
 use executor_types::ChunkExecutor;
-use futures::{channel::mpsc::channel, executor::block_on, stream::StreamExt};
+use futures::{channel::mpsc::channel, executor::block_on};
 use libra_config::{
-    config::{DiscoveryMethod, NetworkConfig, NodeConfig, RoleType},
+    config::{NetworkConfig, NodeConfig, RoleType},
+    network_id::NodeNetworkId,
     utils::get_genesis_txn,
 };
 use libra_json_rpc::bootstrap_from_config as bootstrap_rpc;
 use libra_logger::prelude::*;
 use libra_mempool::gen_mempool_reconfig_subscription;
 use libra_metrics::metric_server;
-use libra_secure_storage::config;
-use libra_types::{waypoint::Waypoint, PeerId};
+use libra_types::{
+    account_config::libra_root_address, account_state::AccountState, chain_id::ChainId,
+    move_resource::MoveStorage,
+};
 use libra_vm::LibraVM;
 use libradb::LibraDB;
-use network::validator_network::network_builder::{AuthenticationMode, NetworkBuilder};
-use network_simple_onchain_discovery::{
-    gen_simple_discovery_reconfig_subscription, ConfigurationChangeListener,
-};
-use onchain_discovery::{client::OnchainDiscovery, service::OnchainDiscoveryService};
+use network_builder::builder::NetworkBuilder;
 use state_synchronizer::StateSynchronizer;
-use std::{
-    boxed::Box,
-    collections::HashMap,
-    net::ToSocketAddrs,
-    sync::Arc,
-    thread,
-    time::{Duration, Instant},
-};
-use storage_interface::{DbReader, DbReaderWriter};
+use std::{boxed::Box, convert::TryFrom, net::ToSocketAddrs, sync::Arc, thread, time::Instant};
+use storage_interface::DbReaderWriter;
 use storage_service::start_storage_service_with_db;
-use tokio::{
-    runtime::{Builder, Handle, Runtime},
-    time::interval,
-};
+use tokio::runtime::{Builder, Runtime};
 
 const AC_SMP_CHANNEL_BUFFER_SIZE: usize = 1_024;
 const INTRA_NODE_CHANNEL_BUFFER_SIZE: usize = 1;
 
 pub struct LibraHandle {
-    _ac: Runtime,
     _rpc: Runtime,
     _mempool: Runtime,
     _state_synchronizer: StateSynchronizer,
@@ -53,6 +40,27 @@ pub struct LibraHandle {
     _consensus_runtime: Option<Runtime>,
     _debug: NodeDebugService,
     _backup: Runtime,
+}
+
+// Fetch chain ID from on-chain resource
+fn fetch_chain_id(db: &DbReaderWriter) -> ChainId {
+    let blob = db
+        .reader
+        .get_account_state_with_proof_by_version(
+            libra_root_address(),
+            (&*db.reader)
+                .fetch_synced_version()
+                .expect("[libra-node] failed fetching synced version."),
+        )
+        .expect("[libra-node] failed to get Libra root address account state")
+        .0
+        .expect("[libra-node] missing Libra root address account state");
+    AccountState::try_from(&blob)
+        .expect("[libra-node] failed to convert blob to account state")
+        .get_chain_id_resource()
+        .expect("[libra-node] failed to get chain ID resource")
+        .expect("[libra-node] missing chain ID resource")
+        .chain_id()
 }
 
 fn setup_chunk_executor(db: DbReaderWriter) -> Box<dyn ChunkExecutor> {
@@ -69,138 +77,21 @@ fn setup_debug_interface(config: &NodeConfig) -> NodeDebugService {
     .next()
     .unwrap();
 
+    libra_trace::set_libra_trace(&config.debug_interface.libra_trace.sampling)
+        .expect("Failed to set libra trace sampling rate.");
+
     NodeDebugService::new(addr)
 }
 
-pub fn setup_onchain_discovery(
-    network: &mut NetworkBuilder,
-    peer_id: PeerId,
-    role: RoleType,
-    libra_db: Arc<dyn DbReader>,
-    waypoint: Waypoint,
-    executor: &Handle,
-) {
-    let (network_tx, peer_mgr_notifs_rx, conn_notifs_rx) =
-        onchain_discovery::network_interface::add_to_network(network);
-    let outbound_rpc_timeout = Duration::from_secs(30);
-    let max_concurrent_inbound_queries = 8;
-
-    let onchain_discovery_service = OnchainDiscoveryService::new(
-        executor.clone(),
-        peer_mgr_notifs_rx,
-        Arc::clone(&libra_db),
-        max_concurrent_inbound_queries,
-    );
-    executor.spawn(onchain_discovery_service.start());
-
-    let onchain_discovery = executor.enter(move || {
-        let peer_query_ticker = interval(Duration::from_secs(30)).fuse();
-        let storage_query_ticker = interval(Duration::from_secs(30)).fuse();
-
-        OnchainDiscovery::new(
-            peer_id,
-            role,
-            waypoint,
-            network_tx,
-            conn_notifs_rx,
-            libra_db,
-            peer_query_ticker,
-            storage_query_ticker,
-            outbound_rpc_timeout,
-        )
+pub fn setup_environment(node_config: &NodeConfig) -> LibraHandle {
+    let metrics_port = node_config.debug_interface.metrics_server_port;
+    let metric_host = node_config.debug_interface.address.clone();
+    thread::spawn(move || metric_server::start_server(metric_host, metrics_port, false));
+    let public_metrics_port = node_config.debug_interface.public_metrics_server_port;
+    let public_metric_host = node_config.debug_interface.address.clone();
+    thread::spawn(move || {
+        metric_server::start_server(public_metric_host, public_metrics_port, true)
     });
-    executor.spawn(onchain_discovery.start());
-}
-
-// TODO(abhayb): Move to network crate (similar to consensus).
-pub fn setup_network(
-    config: &mut NetworkConfig,
-    role: RoleType,
-    libra_db: Arc<dyn DbReader>,
-    waypoint: Waypoint,
-) -> (Runtime, NetworkBuilder) {
-    let runtime = Builder::new()
-        .thread_name("network-")
-        .threaded_scheduler()
-        .enable_all()
-        .build()
-        .expect("Failed to start runtime. Won't be able to start networking.");
-
-    let identity_key = config::identity_key(config);
-    let peer_id = config::peer_id(config);
-
-    let mut network_builder = NetworkBuilder::new(
-        runtime.handle().clone(),
-        config.network_id.clone(),
-        peer_id,
-        role,
-        config.listen_address.clone(),
-    );
-    network_builder.add_connection_monitoring();
-
-    if config.enable_remote_authentication {
-        // Sanity check seed peer addresses.
-        config
-            .seed_peers
-            .verify_libranet_addrs()
-            .expect("Seed peer addresses must be well-formed");
-
-        let network_peers = config.network_peers.peers.clone();
-        let seed_peers = config.seed_peers.seed_peers.clone();
-
-        let trusted_peers = if role == RoleType::Validator {
-            // for validators, trusted_peers is empty will be populated from consensus
-            HashMap::new()
-        } else {
-            network_peers
-        };
-
-        info!(
-            "network setup: role: {}, seed_peers: {:?}, trusted_peers: {:?}",
-            role, seed_peers, trusted_peers,
-        );
-
-        network_builder
-            .advertised_address(config.advertised_address.clone())
-            .authentication_mode(AuthenticationMode::Mutual(identity_key))
-            .trusted_peers(trusted_peers)
-            .seed_peers(seed_peers)
-            .connectivity_check_interval_ms(config.connectivity_check_interval_ms)
-            // TODO:  Why is the connectivity manager related to remote_authentication?
-            .add_connectivity_manager();
-    } else {
-        // Even if a network end-point operates without remote authentication, it might want to prove
-        // its identity to another peer it connects to. For this, we use TCP + Noise but without
-        // enforcing a trusted peers set.
-        network_builder
-            .authentication_mode(AuthenticationMode::ServerOnly(identity_key))
-            .advertised_address(config.advertised_address.clone());
-    }
-
-    match config.discovery_method {
-        DiscoveryMethod::Gossip => {
-            network_builder
-                .discovery_interval_ms(config.discovery_interval_ms)
-                .add_gossip_discovery();
-        }
-        DiscoveryMethod::Onchain => {
-            setup_onchain_discovery(
-                &mut network_builder,
-                peer_id,
-                role,
-                libra_db,
-                waypoint,
-                runtime.handle(),
-            );
-        }
-        DiscoveryMethod::None => {}
-    }
-
-    (runtime, network_builder)
-}
-
-pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
-    crash_handler::setup_panic_handler();
 
     // Some of our code uses the rayon global thread pool. Name the rayon threads so it doesn't
     // cause confusion, otherwise the threads would have their parent's name.
@@ -221,12 +112,16 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     let _simple_storage_service =
         start_storage_service_with_db(&node_config, Arc::clone(&libra_db));
     let backup_service = start_backup_service(
-        node_config.storage.backup_service_port,
+        node_config.storage.backup_service_address,
         Arc::clone(&libra_db),
     );
 
-    bootstrap_db_if_empty::<LibraVM>(&db_rw, get_genesis_txn(&node_config).unwrap())
-        .expect("Db-bootstrapper should not fail.");
+    let waypoint = node_config.base.waypoint.waypoint();
+    // if there's genesis txn and waypoint, commit it if the result matches.
+    if let Some(genesis) = get_genesis_txn(&node_config) {
+        maybe_bootstrap::<LibraVM>(&db_rw, genesis, waypoint)
+            .expect("Db-bootstrapper should not fail.");
+    }
 
     debug!(
         "Storage service started in {} ms",
@@ -239,10 +134,11 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         "ChunkExecutor setup in {} ms",
         instant.elapsed().as_millis()
     );
+    let chain_id = fetch_chain_id(&db_rw);
     let mut network_runtimes = vec![];
     let mut state_sync_network_handles = vec![];
     let mut mempool_network_handles = vec![];
-    let mut validator_network_provider = None;
+    let mut consensus_network_handles = None;
     let mut reconfig_subscriptions = vec![];
 
     let (mempool_reconfig_subscription, mempool_reconfig_events) =
@@ -253,63 +149,90 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         gen_consensus_reconfig_subscription();
     reconfig_subscriptions.push(consensus_reconfig_subscription);
 
-    let waypoint = config::waypoint(&node_config.base.waypoint);
-
-    if let Some(network) = node_config.validator_network.as_mut() {
-        let (runtime, mut network_builder) = setup_network(
-            network,
-            RoleType::Validator,
-            Arc::clone(&db_rw.reader),
-            waypoint,
-        );
-        let peer_id = network_builder.peer_id();
-
-        // Set up to listen for network configuration changes from StateSync.
-        if let Some(conn_mgr_reqs_tx) = network_builder.conn_mgr_reqs_tx() {
-            let (simple_discovery_reconfig_subscription, simple_discovery_reconfig_rx) =
-                gen_simple_discovery_reconfig_subscription();
-            reconfig_subscriptions.push(simple_discovery_reconfig_subscription);
-            let network_config_listener =
-                ConfigurationChangeListener::new(conn_mgr_reqs_tx, RoleType::Validator);
-            runtime
-                .handle()
-                .spawn(network_config_listener.start(simple_discovery_reconfig_rx));
-        };
-
-        let (state_sync_sender, state_sync_events) =
-            state_synchronizer::network::add_to_network(&mut network_builder);
-        state_sync_network_handles.push((peer_id, state_sync_sender, state_sync_events));
-
-        let (mempool_sender, mempool_events) = libra_mempool::network::add_to_network(
-            &mut network_builder,
-            node_config.mempool.max_broadcasts_per_peer,
-        );
-        mempool_network_handles.push((peer_id, mempool_sender, mempool_events));
-        validator_network_provider = Some((peer_id, runtime, network_builder));
+    // Gather all network configs into a single vector.
+    // TODO:  consider explicitly encoding the role in the NetworkConfig
+    let mut network_configs: Vec<(RoleType, &NetworkConfig)> = node_config
+        .full_node_networks
+        .iter()
+        .map(|network_config| (RoleType::FullNode, network_config))
+        .collect();
+    if let Some(network_config) = node_config.validator_network.as_ref() {
+        network_configs.push((RoleType::Validator, network_config));
     }
 
-    for mut full_node_network in node_config.full_node_networks.iter_mut() {
-        let (runtime, mut network_builder) = setup_network(
-            &mut full_node_network,
-            RoleType::FullNode,
-            Arc::clone(&db_rw.reader),
-            waypoint,
-        );
-        let peer_id = network_builder.peer_id();
+    let mut network_builders = Vec::new();
 
+    // Instantiate every network and collect the requisite endpoints for state_sync, mempool, and consensus.
+    for (idx, (role, network_config)) in network_configs.into_iter().enumerate() {
+        // Perform common instantiation steps
+        let mut network_builder = NetworkBuilder::create(chain_id, role, network_config);
+        let network_id = network_config.network_id.clone();
+
+        // Create the endpoints to connect the Network to StateSynchronizer.
+        let (state_sync_sender, state_sync_events) = network_builder
+            .add_protocol_handler(state_synchronizer::network::network_endpoint_config());
+        state_sync_network_handles.push((
+            NodeNetworkId::new(network_id.clone(), idx),
+            state_sync_sender,
+            state_sync_events,
+        ));
+
+        // Create the endpoints to connect the Network to mempool.
+        let (mempool_sender, mempool_events) =
+            network_builder.add_protocol_handler(libra_mempool::network::network_endpoint_config(
+                // TODO:  Make this configuration option more clear.
+                node_config.mempool.max_broadcasts_per_peer,
+            ));
+        mempool_network_handles.push((
+            NodeNetworkId::new(network_id, idx),
+            mempool_sender,
+            mempool_events,
+        ));
+
+        match role {
+            // Perform steps relevant specifically to Validator networks.
+            RoleType::Validator => {
+                // A valid config is allowed to have at most one ValidatorNetwork
+                // TODO:  `expect_none` would be perfect here, once it is stable.
+                if consensus_network_handles.is_some() {
+                    panic!("There can be at most one validator network!");
+                }
+
+                consensus_network_handles =
+                    Some(network_builder.add_protocol_handler(
+                        consensus::network_interface::network_endpoint_config(),
+                    ));
+            }
+            // Currently no FullNode network specific steps.
+            RoleType::FullNode => (),
+        }
+
+        reconfig_subscriptions.append(network_builder.reconfig_subscriptions());
+
+        network_builders.push(network_builder);
+    }
+
+    // Build the configured networks.
+    for network_builder in &mut network_builders {
+        debug!("Creating runtime for {}", network_builder.network_context());
+        let runtime = Builder::new()
+            .thread_name("network-")
+            .threaded_scheduler()
+            .enable_all()
+            .build()
+            .expect("Failed to start runtime. Won't be able to start networking.");
+        network_builder.build(runtime.handle().clone());
         network_runtimes.push(runtime);
-        let (state_sync_sender, state_sync_events) =
-            state_synchronizer::network::add_to_network(&mut network_builder);
-        state_sync_network_handles.push((peer_id, state_sync_sender, state_sync_events));
-        let (mempool_sender, mempool_events) = libra_mempool::network::add_to_network(
-            &mut network_builder,
-            node_config.mempool.max_broadcasts_per_peer,
+        debug!(
+            "Network built for network context: {}",
+            network_builder.network_context()
         );
-        mempool_network_handles.push((peer_id, mempool_sender, mempool_events));
+    }
 
-        // Start the network provider.
-        let _listen_addr = network_builder.build();
-        debug!("Network started for peer_id: {}", peer_id);
+    // Start the configured networks.
+    // TODO:  Collect all component starts at the end of this function
+    for network_builder in &mut network_builders {
+        network_builder.start();
     }
 
     // TODO set up on-chain discovery network based on UpstreamConfig.fallback_network
@@ -329,12 +252,7 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     );
     let (mp_client_sender, mp_client_events) = channel(AC_SMP_CHANNEL_BUFFER_SIZE);
 
-    let admission_control_runtime = AdmissionControlService::bootstrap(
-        &node_config,
-        Arc::clone(&db_rw.reader),
-        mp_client_sender.clone(),
-    );
-    let rpc_runtime = bootstrap_rpc(&node_config, libra_db.clone(), mp_client_sender);
+    let rpc_runtime = bootstrap_rpc(&node_config, chain_id, libra_db.clone(), mp_client_sender);
 
     let mut consensus_runtime = None;
     let (consensus_to_mempool_sender, consensus_requests) = channel(INTRA_NODE_CHANNEL_BUFFER_SIZE);
@@ -351,22 +269,10 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     );
     debug!("Mempool started in {} ms", instant.elapsed().as_millis());
 
-    if let Some((peer_id, runtime, mut network_builder)) = validator_network_provider {
-        // Note: We need to start network provider before consensus, because the consensus
-        // initialization is blocked on state synchronizer to sync to the initial root ledger
-        // info, which in turn cannot make progress before network initialization
-        // because the NewPeer events which state synchronizer uses to know its
-        // peers are delivered by network provider. If we were to start network
-        // provider after consensus, we create a cyclic dependency from
-        // network provider -> consensus -> state synchronizer -> network provider. This deadlock
-        // was observed in GitHub Issue #749. A long term fix might be make
-        // consensus initialization async instead of blocking on state synchronizer.
-        let (consensus_network_sender, consensus_network_events) =
-            consensus::network_interface::add_to_network(&mut network_builder);
-        let _listen_addr = network_builder.build();
-        network_runtimes.push(runtime);
-        debug!("Network started for peer_id: {}", peer_id);
-
+    // StateSync should be instantiated and started before Consensus to avoid a cyclic dependency:
+    // network provider -> consensus -> state synchronizer -> network provider.  This has resulted
+    // in a deadlock as observed in GitHub issue #749.
+    if let Some((consensus_network_sender, consensus_network_events)) = consensus_network_handles {
         // Make sure that state synchronizer is caught up at least to its waypoint
         // (in case it's present). There is no sense to start consensus prior to that.
         // TODO: Note that we need the networking layer to be able to discover & connect to the
@@ -392,18 +298,8 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
 
     let debug_if = setup_debug_interface(&node_config);
 
-    let metrics_port = node_config.debug_interface.metrics_server_port;
-    let metric_host = node_config.debug_interface.address.clone();
-    thread::spawn(move || metric_server::start_server(metric_host, metrics_port, false));
-    let public_metrics_port = node_config.debug_interface.public_metrics_server_port;
-    let public_metric_host = node_config.debug_interface.address.clone();
-    thread::spawn(move || {
-        metric_server::start_server(public_metric_host, public_metrics_port, true)
-    });
-
     LibraHandle {
         _network_runtimes: network_runtimes,
-        _ac: admission_control_runtime,
         _rpc: rpc_runtime,
         _mempool: mempool,
         _state_synchronizer: state_synchronizer,

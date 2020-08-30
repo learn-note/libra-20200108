@@ -1,43 +1,111 @@
+//! account: dd1, 0, 0, address
+//! account: dd2, 0, 0, address
+
+//! sender: blessed
+script {
+use 0x1::LibraAccount;
+use 0x1::Coin1::Coin1;
+use 0x1::Coin2::Coin2;
+use 0x1::Libra;
+
+// register dd(1|2) as a preburner
+fun main(account: &signer) {
+    let prev_mcap1 = Libra::market_cap<Coin1>();
+    let prev_mcap2 = Libra::market_cap<Coin2>();
+    LibraAccount::create_designated_dealer<Coin1>(
+        account,
+        {{dd1}},
+        {{dd1::auth_key}},
+        x"",
+        false,
+    );
+    LibraAccount::create_designated_dealer<Coin2>(
+        account,
+        {{dd2}},
+        {{dd2::auth_key}},
+        x"",
+        false,
+    );
+    LibraAccount::tiered_mint<Coin1>(
+        account,
+        {{dd1}},
+        10,
+        0,
+    );
+    LibraAccount::tiered_mint<Coin2>(
+        account,
+        {{dd2}},
+        100,
+        0,
+    );
+    assert(Libra::market_cap<Coin1>() - prev_mcap1 == 10, 7);
+    assert(Libra::market_cap<Coin2>() - prev_mcap2 == 100, 8);
+}
+}
+// check: EXECUTED
+
+//! new-transaction
+//! sender: dd1
+script {
+use 0x1::Coin1::Coin1;
+use 0x1::LibraAccount;
+
+// do some preburning
+fun main(account: &signer) {
+    let with_cap = LibraAccount::extract_withdraw_capability(account);
+    LibraAccount::preburn<Coin1>(account, &with_cap, 10);
+    LibraAccount::restore_withdraw_capability(with_cap);
+}
+}
+// check: EXECUTED
+
+//! new-transaction
+//! sender: dd2
+script {
+use 0x1::Coin2::Coin2;
+use 0x1::LibraAccount;
+
+// do some preburning
+fun main(account: &signer) {
+    let with_cap = LibraAccount::extract_withdraw_capability(account);
+    LibraAccount::preburn<Coin2>(account, &with_cap, 100);
+    LibraAccount::restore_withdraw_capability(with_cap);
+}
+}
+// check: EXECUTED
+
+
+// do some burning
 //! new-transaction
 //! sender: blessed
 script {
-use 0x0::Libra;
-use 0x0::Coin1;
-use 0x0::Coin2;
-use 0x0::Signer;
-use 0x0::Transaction;
+use 0x1::Libra;
+use 0x1::Coin1::Coin1;
+use 0x1::Coin2::Coin2;
 
-// Make sure we can mint and burn
 fun main(account: &signer) {
-    let sender = Signer::address_of(account);
-    let pre_coin1 = Libra::new_preburn<Coin1::T>();
-    let pre_coin2 = Libra::new_preburn<Coin2::T>();
-    Libra::publish_preburn(account, pre_coin1);
-    Libra::publish_preburn(account, pre_coin2);
-    let coin1_coins = Libra::mint<Coin1::T>(account, 10);
-    let coin2_coins = Libra::mint<Coin2::T>(account, 10);
-    Transaction::assert(Libra::market_cap<Coin1::T>() == 10, 7);
-    Transaction::assert(Libra::market_cap<Coin2::T>() == 10, 8);
-    Libra::preburn_to(account, coin1_coins);
-    Libra::preburn_to(account, coin2_coins);
-    Libra::burn<Coin1::T>(account, sender);
-    Libra::burn<Coin2::T>(account, sender);
-    Transaction::assert(Libra::market_cap<Coin1::T>() == 0, 9);
-    Transaction::assert(Libra::market_cap<Coin2::T>() == 0, 10);
+    let prev_mcap1 = Libra::market_cap<Coin1>();
+    let prev_mcap2 = Libra::market_cap<Coin2>();
+    Libra::burn<Coin1>(account, {{dd1}});
+    Libra::burn<Coin2>(account, {{dd2}});
+    assert(prev_mcap1 - Libra::market_cap<Coin1>() == 10, 9);
+    assert(prev_mcap2 - Libra::market_cap<Coin2>() == 100, 10);
+}
+}
+// check: EXECUTED
 
-    let coin1_coins = Libra::mint<Coin1::T>(account, 10);
-    let coin2_coins = Libra::mint<Coin2::T>(account, 10);
+// check that stop minting works
+//! new-transaction
+//! sender: blessed
+script {
+use 0x1::Libra;
+use 0x1::Coin1::Coin1;
 
-    Libra::update_minting_ability<Coin1::T>(account, false);
-    Libra::preburn_to(account, coin1_coins);
-    Libra::preburn_to(account, coin2_coins);
-    Libra::burn<Coin1::T>(account, sender);
-    Libra::burn<Coin2::T>(account, sender);
-    Transaction::assert(Libra::market_cap<Coin1::T>() == 0, 11);
-    Transaction::assert(Libra::market_cap<Coin2::T>() == 0, 12);
-    Libra::preburn_to(account, Libra::mint<Coin2::T>(account, 10));
-    Libra::preburn_to(account, Libra::mint<Coin1::T>(account, 10))
+fun main(account: &signer) {
+    Libra::update_minting_ability<Coin1>(account, false);
+    let coin = Libra::mint<Coin1>(account, 10); // will abort here
+    Libra::destroy_zero(coin);
 }
 }
 // check: ABORTED
-// check: 4
+// check: 3

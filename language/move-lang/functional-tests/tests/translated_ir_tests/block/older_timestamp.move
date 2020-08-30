@@ -6,12 +6,12 @@
 
 //! new-transaction
 script{
-use 0x0::LibraBlock;
-use 0x0::LibraTimestamp;
+use 0x1::LibraBlock;
+use 0x1::LibraTimestamp;
 
 fun main() {
-    0x0::Transaction::assert(LibraBlock::get_current_block_height() == 1, 76);
-    0x0::Transaction::assert(LibraTimestamp::now_microseconds() == 100000000, 77);
+    assert(LibraBlock::get_current_block_height() == 1, 76);
+    assert(LibraTimestamp::now_microseconds() == 100000000, 77);
 }
 }
 
@@ -19,5 +19,4 @@ fun main() {
 //! proposer: vivian
 //! block-time: 11000000
 
-// check: ABORTED
-// check: 5001
+// check: UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION

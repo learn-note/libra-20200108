@@ -1,4 +1,4 @@
-import 0x0.Vector;
+import 0x1.Vector;
 
 main() {
   let vec: vector<u64>;
@@ -10,5 +10,4 @@ main() {
   return;
 }
 
-// check: NATIVE_FUNCTION_ERROR
-// check: 1
+// check: ABORTED 1

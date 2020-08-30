@@ -9,10 +9,11 @@ use crate::{
         rotating_proposer_election::RotatingProposer,
         round_state::{ExponentialTimeInterval, RoundState},
     },
+    metrics_safety_rules::MetricsSafetyRules,
     network::{IncomingBlockRetrievalRequest, NetworkSender},
     network_interface::{ConsensusMsg, ConsensusNetworkEvents, ConsensusNetworkSender},
     network_tests::{NetworkPlayground, TwinId},
-    persistent_liveness_storage::{PersistentLivenessStorage, RecoveryData},
+    persistent_liveness_storage::RecoveryData,
     round_manager::RoundManager,
     test_utils::{
         consensus_runtime, timed_block_on, MockStateComputer, MockStorage, MockTransactionManager,
@@ -40,19 +41,20 @@ use futures::{
     stream::select,
     Stream, StreamExt, TryStreamExt,
 };
-use libra_crypto::{hash::CryptoHash, HashValue};
+use libra_crypto::{ed25519::Ed25519PrivateKey, HashValue, Uniform};
+use libra_secure_storage::Storage;
 use libra_types::{
     epoch_state::EpochState,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     validator_signer::ValidatorSigner,
-    validator_verifier::{random_validator_verifier, ValidatorVerifier},
+    validator_verifier::random_validator_verifier,
     waypoint::Waypoint,
 };
 use network::{
     peer_manager::{conn_notifs_channel, ConnectionRequestSender, PeerManagerRequestSender},
-    protocols::network::Event,
+    protocols::network::{Event, NewNetworkEvents, NewNetworkSender},
 };
-use safety_rules::{ConsensusState, PersistentSafetyStorage, SafetyRulesManager};
+use safety_rules::{PersistentSafetyStorage, SafetyRulesManager};
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 
@@ -63,11 +65,10 @@ pub struct NodeSetup {
     storage: Arc<MockStorage>,
     signer: ValidatorSigner,
     proposer_author: Author,
-    validators: ValidatorVerifier,
     safety_rules_manager: SafetyRulesManager,
     all_events: Box<dyn Stream<Item = anyhow::Result<Event<ConsensusMsg>>> + Send + Unpin>,
     commit_cb_receiver: mpsc::UnboundedReceiver<LedgerInfoWithSignatures>,
-    state_sync_receiver: mpsc::UnboundedReceiver<Payload>,
+    _state_sync_receiver: mpsc::UnboundedReceiver<Payload>,
     id: usize,
 }
 
@@ -95,18 +96,17 @@ impl NodeSetup {
             Waypoint::new_epoch_boundary(&LedgerInfo::mock_genesis(Some(validator_set))).unwrap();
 
         let mut nodes = vec![];
-        //let mut id = 0;
-        //for signer in signers.iter().take(num_nodes) {
         for (id, signer) in signers.iter().take(num_nodes).enumerate() {
             let (initial_data, storage) = MockStorage::start_for_testing((&validators).into());
 
-            let author = signer.author();
             let safety_storage = PersistentSafetyStorage::initialize(
-                Box::new(libra_secure_storage::InMemoryStorage::new()),
+                Storage::from(libra_secure_storage::InMemoryStorage::new()),
+                signer.author(),
                 signer.private_key().clone(),
+                Ed25519PrivateKey::generate_for_testing(),
                 waypoint,
             );
-            let safety_rules_manager = SafetyRulesManager::new_local(author, safety_storage);
+            let safety_rules_manager = SafetyRulesManager::new_local(safety_storage, false);
 
             nodes.push(Self::new(
                 playground,
@@ -118,7 +118,6 @@ impl NodeSetup {
                 safety_rules_manager,
                 id,
             ));
-            //id += 1;
         }
         nodes
     }
@@ -128,11 +127,6 @@ impl NodeSetup {
         executor: Handle,
         signer: ValidatorSigner,
         proposer_author: Author,
-        /*
-        storage: Arc<MockStorage<TestPayload>>,
-        initial_data: RecoveryData<TestPayload>,
-        safety_rules_manager: SafetyRulesManager<TestPayload>,
-        */
         storage: Arc<MockStorage>,
         initial_data: RecoveryData,
         safety_rules_manager: SafetyRulesManager,
@@ -164,41 +158,41 @@ impl NodeSetup {
         playground.add_node(twin_id, consensus_tx, network_reqs_rx, conn_mgr_reqs_rx);
 
         let (self_sender, self_receiver) = channel::new_test(1000);
-        let network = NetworkSender::new(author, network_sender, self_sender, validators.clone());
+        let network = NetworkSender::new(author, network_sender, self_sender, validators);
 
         let all_events = Box::new(select(network_events, self_receiver));
 
         let last_vote_sent = initial_data.last_vote();
         let (commit_cb_sender, commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
-        let (state_sync_client, state_sync_receiver) = mpsc::unbounded();
+        let (state_sync_client, _state_sync_receiver) = mpsc::unbounded();
         let state_computer = Arc::new(MockStateComputer::new(
             state_sync_client,
             commit_cb_sender,
             Arc::clone(&storage),
         ));
+        let time_service = Arc::new(ClockTimeService::new(executor));
 
         let block_store = Arc::new(BlockStore::new(
             storage.clone(),
             initial_data,
             state_computer,
             10, // max pruned blocks in mem
+            time_service.clone(),
         ));
-
-        let time_service = Arc::new(ClockTimeService::new(executor));
 
         let proposal_generator = ProposalGenerator::new(
             author,
             block_store.clone(),
-            Box::new(MockTransactionManager::new(None)),
+            Arc::new(MockTransactionManager::new(None)),
             time_service.clone(),
             1,
         );
 
-        let round_state = Self::create_round_state(time_service.clone());
+        let round_state = Self::create_round_state(time_service);
         let proposer_election = Self::create_proposer_election(proposer_author);
-        let mut safety_rules = safety_rules_manager.client();
-        let proof = storage.retrieve_epoch_change_proof(0).unwrap();
-        safety_rules.initialize(&proof).unwrap();
+        let mut safety_rules =
+            MetricsSafetyRules::new(safety_rules_manager.client(), storage.clone());
+        safety_rules.perform_initialize().unwrap();
 
         let mut round_manager = RoundManager::new(
             epoch_state,
@@ -208,9 +202,9 @@ impl NodeSetup {
             proposal_generator,
             safety_rules,
             network,
-            Box::new(MockTransactionManager::new(None)),
+            Arc::new(MockTransactionManager::new(None)),
             storage.clone(),
-            time_service,
+            false,
         );
         block_on(round_manager.start(last_vote_sent));
         Self {
@@ -219,11 +213,10 @@ impl NodeSetup {
             storage,
             signer,
             proposer_author,
-            validators,
             safety_rules_manager,
             all_events,
             commit_cb_receiver,
-            state_sync_receiver,
+            _state_sync_receiver,
             id,
         }
     }
@@ -274,6 +267,13 @@ impl NodeSetup {
             _ => panic!("Unexpected Network Event"),
         }
     }
+
+    pub async fn next_message(&mut self) -> ConsensusMsg {
+        match self.all_events.next().await.unwrap().unwrap() {
+            Event::Message((_, msg)) => msg,
+            _ => panic!("Unexpected Network Event"),
+        }
+    }
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn new_round_on_quorum_cert() {
             .unwrap();
         let vote_msg = node.next_vote().await;
         // Adding vote to form a QC
-        node.round_manager.process_vote(vote_msg).await.unwrap();
+        node.round_manager.process_vote_msg(vote_msg).await.unwrap();
 
         // round 2 should start
         let proposal_msg = node.next_proposal().await;
@@ -327,16 +327,15 @@ fn vote_on_successful_proposal() {
 
         let proposal = Block::new_proposal(vec![], 1, 1, genesis_qc.clone(), &node.signer);
         let proposal_id = proposal.id();
-        node.round_manager
-            .process_proposed_block(proposal)
-            .await
-            .unwrap();
+        node.round_manager.process_proposal(proposal).await.unwrap();
         let vote_msg = node.next_vote().await;
         assert_eq!(vote_msg.vote().author(), node.signer.author());
         assert_eq!(vote_msg.vote().vote_data().proposed().id(), proposal_id);
         let consensus_state = node.round_manager.consensus_state();
-        let waypoint = consensus_state.waypoint();
-        assert_eq!(consensus_state, ConsensusState::new(1, 1, 0, waypoint));
+        assert_eq!(consensus_state.epoch(), 1);
+        assert_eq!(consensus_state.last_voted_round(), 1);
+        assert_eq!(consensus_state.preferred_round(), 0);
+        assert_eq!(consensus_state.in_validator_set(), true);
     });
 }
 
@@ -360,11 +359,11 @@ fn no_vote_on_old_proposal() {
         node.next_proposal().await;
 
         node.round_manager
-            .process_proposed_block(new_block)
+            .process_proposal(new_block)
             .await
             .unwrap();
         node.round_manager
-            .process_proposed_block(old_block)
+            .process_proposal(old_block)
             .await
             .unwrap_err();
         let vote_msg = node.next_vote().await;
@@ -396,20 +395,17 @@ fn no_vote_on_mismatch_round() {
         );
         assert!(node
             .round_manager
-            .pre_process_proposal(bad_proposal)
+            .process_proposal_msg(bad_proposal)
             .await
             .is_err());
         let good_proposal = ProposalMsg::new(
             correct_block.clone(),
             SyncInfo::new(genesis_qc.clone(), genesis_qc.clone(), None),
         );
-        assert_eq!(
-            node.round_manager
-                .pre_process_proposal(good_proposal.clone())
-                .await
-                .unwrap(),
-            good_proposal.take_proposal()
-        );
+        node.round_manager
+            .process_proposal_msg(good_proposal)
+            .await
+            .unwrap();
     });
 }
 
@@ -447,7 +443,10 @@ fn sync_info_carried_on_timeout_vote() {
             .insert_single_quorum_cert(block_0_quorum_cert.clone())
             .unwrap();
 
-        node.round_manager.process_local_timeout(1).await.unwrap();
+        node.round_manager
+            .process_local_timeout(1)
+            .await
+            .unwrap_err();
         let vote_msg_on_timeout = node.next_vote().await;
         assert!(vote_msg_on_timeout.vote().is_timeout());
         assert_eq!(
@@ -478,7 +477,7 @@ fn no_vote_on_invalid_proposer() {
         );
         assert!(node
             .round_manager
-            .pre_process_proposal(bad_proposal)
+            .process_proposal_msg(bad_proposal)
             .await
             .is_err());
         let good_proposal = ProposalMsg::new(
@@ -486,13 +485,10 @@ fn no_vote_on_invalid_proposer() {
             SyncInfo::new(genesis_qc.clone(), genesis_qc.clone(), None),
         );
 
-        assert_eq!(
-            node.round_manager
-                .pre_process_proposal(good_proposal.clone())
-                .await
-                .unwrap(),
-            good_proposal.take_proposal(),
-        );
+        node.round_manager
+            .process_proposal_msg(good_proposal.clone())
+            .await
+            .unwrap();
     });
 }
 
@@ -520,20 +516,17 @@ fn new_round_on_timeout_certificate() {
             block_skip_round,
             SyncInfo::new(genesis_qc.clone(), genesis_qc.clone(), Some(tc)),
         );
-        assert_eq!(
-            node.round_manager
-                .pre_process_proposal(skip_round_proposal.clone())
-                .await
-                .unwrap(),
-            skip_round_proposal.take_proposal()
-        );
+        node.round_manager
+            .process_proposal_msg(skip_round_proposal)
+            .await
+            .unwrap();
         let old_good_proposal = ProposalMsg::new(
             correct_block.clone(),
             SyncInfo::new(genesis_qc.clone(), genesis_qc.clone(), None),
         );
         assert!(node
             .round_manager
-            .pre_process_proposal(old_good_proposal.clone())
+            .process_proposal_msg(old_good_proposal)
             .await
             .is_err());
     });
@@ -649,10 +642,7 @@ fn recover_on_restart() {
         let proposal = inserter.create_block_with_qc(genesis_qc.clone(), i, i, vec![]);
         let timeout = Timeout::new(1, i - 1);
         let mut tc = TimeoutCertificate::new(timeout.clone());
-        tc.add_signature(
-            inserter.signer().author(),
-            inserter.signer().sign_message(timeout.hash()),
-        );
+        tc.add_signature(inserter.signer().author(), inserter.signer().sign(&timeout));
         data.push((proposal, tc));
     }
 
@@ -676,11 +666,10 @@ fn recover_on_restart() {
     // verify after restart we recover the data
     node = node.restart(&mut playground, runtime.handle().clone());
     let consensus_state = node.round_manager.consensus_state();
-    let waypoint = consensus_state.waypoint();
-    assert_eq!(
-        consensus_state,
-        ConsensusState::new(1, num_proposals, 0, waypoint)
-    );
+    assert_eq!(consensus_state.epoch(), 1);
+    assert_eq!(consensus_state.last_voted_round(), num_proposals);
+    assert_eq!(consensus_state.preferred_round(), 0);
+    assert_eq!(consensus_state.in_validator_set(), true);
     for (block, _) in data {
         assert_eq!(node.block_store.block_exists(block.id()), true);
     }
@@ -698,7 +687,10 @@ fn nil_vote_on_timeout() {
         node.next_proposal().await;
         // Process the outgoing vote message and verify that it contains a round signature
         // and that the vote extends genesis.
-        node.round_manager.process_local_timeout(1).await.unwrap();
+        node.round_manager
+            .process_local_timeout(1)
+            .await
+            .unwrap_err();
         let vote_msg = node.next_vote().await;
 
         let vote = vote_msg.vote();
@@ -734,7 +726,10 @@ fn vote_resent_on_timeout() {
         assert_eq!(vote.vote_data().proposed().id(), id);
         // Process the outgoing vote message and verify that it contains a round signature
         // and that the vote is the same as above.
-        node.round_manager.process_local_timeout(1).await.unwrap();
+        node.round_manager
+            .process_local_timeout(1)
+            .await
+            .unwrap_err();
         let timeout_vote_msg = node.next_vote().await;
         let timeout_vote = timeout_vote_msg.vote();
 
@@ -783,14 +778,14 @@ fn sync_info_sent_on_stale_sync_info() {
             .round_manager
             .process_local_timeout(1)
             .await
-            .unwrap();
+            .unwrap_err();
         let timeout_vote_msg = behind_node.next_vote().await;
         assert!(timeout_vote_msg.vote().is_timeout());
 
         // process the stale sync info carried in the vote
         ahead_node
             .round_manager
-            .process_vote(timeout_vote_msg)
+            .process_vote_msg(timeout_vote_msg)
             .await
             .unwrap();
         let sync_info = behind_node.next_sync_info().await;
@@ -817,7 +812,7 @@ fn sync_on_partial_newer_sync_info() {
                 .unwrap();
             let vote_msg = node.next_vote().await;
             // Adding vote to form a QC
-            node.round_manager.process_vote(vote_msg).await.unwrap();
+            node.round_manager.process_vote_msg(vote_msg).await.unwrap();
         }
         let block_4 = node.next_proposal().await;
         node.round_manager
@@ -839,12 +834,76 @@ fn sync_on_partial_newer_sync_info() {
         // Create a sync info with newer quorum cert but older commit cert
         let sync_info = SyncInfo::new(block_4_qc.clone(), certificate_for_genesis(), None);
         node.round_manager
-            .sync_up(&sync_info, node.signer.author(), true)
+            .ensure_round_and_sync_up(
+                sync_info.highest_round() + 1,
+                &sync_info,
+                node.signer.author(),
+                true,
+            )
             .await
             .unwrap();
         // QuorumCert added
         assert_eq!(*node.block_store.highest_quorum_cert(), block_4_qc);
         // Help remote message sent
-        let _ = node.next_sync_info().await;
+        // Due to the asynchronous channel, the order of the sync info and next proposal is not fixed.
+        // We assert one of them is the sync info we expect.
+        let m1 = node.next_message().await;
+        let m2 = node.next_message().await;
+        assert!(matches!(m1, ConsensusMsg::SyncInfo(_)) || matches!(m2, ConsensusMsg::SyncInfo(_)));
+    });
+}
+
+#[test]
+fn safety_rules_crash() {
+    let mut runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut node = nodes.pop().unwrap();
+    runtime.spawn(playground.start());
+
+    fn reset_safety_rules(node: &mut NodeSetup) {
+        let safety_storage = PersistentSafetyStorage::initialize(
+            Storage::from(libra_secure_storage::InMemoryStorage::new()),
+            node.signer.author(),
+            node.signer.private_key().clone(),
+            Ed25519PrivateKey::generate_for_testing(),
+            node.round_manager.consensus_state().waypoint(),
+        );
+
+        node.safety_rules_manager = SafetyRulesManager::new_local(safety_storage, false);
+        let safety_rules =
+            MetricsSafetyRules::new(node.safety_rules_manager.client(), node.storage.clone());
+        node.round_manager.set_safety_rules(safety_rules);
+    };
+
+    timed_block_on(&mut runtime, async {
+        for _ in 0..2 {
+            let proposal_msg = node.next_proposal().await;
+
+            reset_safety_rules(&mut node);
+            // construct_and_sign_vote
+            node.round_manager
+                .process_proposal_msg(proposal_msg)
+                .await
+                .unwrap();
+
+            let vote_msg = node.next_vote().await;
+
+            // sign_timeout
+            reset_safety_rules(&mut node);
+            let round = vote_msg.vote().vote_data().proposed().round();
+            node.round_manager
+                .process_local_timeout(round)
+                .await
+                .unwrap_err();
+            let vote_msg = node.next_vote().await;
+
+            // sign proposal
+            reset_safety_rules(&mut node);
+            node.round_manager.process_vote_msg(vote_msg).await.unwrap();
+        }
+
+        // verify the last sign proposal happened
+        node.next_proposal().await;
     });
 }

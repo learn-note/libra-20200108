@@ -5,16 +5,17 @@ use crate::{
     block::Block,
     common::{Payload, Round},
     quorum_cert::QuorumCert,
+    vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
 };
 use executor_types::StateComputeResult;
 use libra_crypto::hash::HashValue;
 use libra_types::block_info::BlockInfo;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 /// ExecutedBlocks are managed in a speculative tree, the committed blocks form a chain. Besides
 /// block data, each executed block also has other derived meta data which could be regenerated from
 /// blocks.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ExecutedBlock {
     /// Block data that cannot be regenerated.
     block: Block,
@@ -22,6 +23,12 @@ pub struct ExecutedBlock {
     /// the tree. The execution results are not persisted: they're recalculated again for the
     /// pending blocks upon restart.
     state_compute_result: StateComputeResult,
+}
+
+impl Debug for ExecutedBlock {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
 }
 
 impl Display for ExecutedBlock {
@@ -40,10 +47,6 @@ impl ExecutedBlock {
 
     pub fn block(&self) -> &Block {
         &self.block
-    }
-
-    pub fn epoch(&self) -> u64 {
-        self.block().epoch()
     }
 
     pub fn id(&self) -> HashValue {
@@ -80,5 +83,16 @@ impl ExecutedBlock {
             self.compute_result().version(),
             self.compute_result().epoch_state().clone(),
         )
+    }
+
+    pub fn maybe_signed_vote_proposal(&self) -> MaybeSignedVoteProposal {
+        MaybeSignedVoteProposal {
+            vote_proposal: VoteProposal::new(
+                self.compute_result().extension_proof(),
+                self.block.clone(),
+                self.compute_result().epoch_state().clone(),
+            ),
+            signature: self.compute_result().signature().clone(),
+        }
     }
 }

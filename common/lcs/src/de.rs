@@ -38,7 +38,7 @@ pub fn from_bytes<'a, T>(bytes: &'a [u8]) -> Result<T>
 where
     T: Deserialize<'a>,
 {
-    let mut deserializer = Deserializer::new(bytes);
+    let mut deserializer = Deserializer::new(bytes, crate::MAX_CONTAINER_DEPTH);
     let t = T::deserialize(&mut deserializer)?;
     deserializer.end().map(move |_| t)
 }
@@ -48,7 +48,7 @@ pub fn from_bytes_seed<'a, T>(seed: T, bytes: &'a [u8]) -> Result<T::Value>
 where
     T: DeserializeSeed<'a>,
 {
-    let mut deserializer = Deserializer::new(bytes);
+    let mut deserializer = Deserializer::new(bytes, crate::MAX_CONTAINER_DEPTH);
     let t = seed.deserialize(&mut deserializer)?;
     deserializer.end().map(move |_| t)
 }
@@ -56,13 +56,17 @@ where
 /// Deserialization implementation for LCS
 struct Deserializer<'de> {
     input: &'de [u8],
+    max_remaining_depth: usize,
 }
 
 impl<'de> Deserializer<'de> {
     /// Creates a new `Deserializer` which will be deserializing the provided
     /// input.
-    fn new(input: &'de [u8]) -> Self {
-        Deserializer { input }
+    fn new(input: &'de [u8], max_remaining_depth: usize) -> Self {
+        Deserializer {
+            input,
+            max_remaining_depth,
+        }
     }
 
     /// The `Deserializer::end` method should be called after a type has been
@@ -155,12 +159,16 @@ impl<'de> Deserializer<'de> {
         Err(Error::IntegerOverflowDuringUleb128Decoding)
     }
 
-    fn parse_bytes(&mut self) -> Result<&'de [u8]> {
+    fn parse_length(&mut self) -> Result<usize> {
         let len = self.parse_u32_from_uleb128()? as usize;
         if len > crate::MAX_SEQUENCE_LENGTH {
             return Err(Error::ExceededMaxLen(len));
         }
+        Ok(len)
+    }
 
+    fn parse_bytes(&mut self) -> Result<&'de [u8]> {
+        let len = self.parse_length()?;
         let slice = self.input.get(..len).ok_or(Error::Eof)?;
         self.input = &self.input[len..];
         Ok(slice)
@@ -169,6 +177,18 @@ impl<'de> Deserializer<'de> {
     fn parse_string(&mut self) -> Result<&'de str> {
         let slice = self.parse_bytes()?;
         std::str::from_utf8(slice).map_err(|_| Error::Utf8)
+    }
+
+    fn enter_named_container(&mut self, name: &'static str) -> Result<()> {
+        if self.max_remaining_depth == 0 {
+            return Err(Error::ExceededContainerDepthLimit(name));
+        }
+        self.max_remaining_depth -= 1;
+        Ok(())
+    }
+
+    fn leave_named_container(&mut self) {
+        self.max_remaining_depth += 1;
     }
 }
 
@@ -329,29 +349,31 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         visitor.visit_unit()
     }
 
-    fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
+    fn deserialize_unit_struct<V>(self, name: &'static str, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_unit(visitor)
+        self.enter_named_container(name)?;
+        let r = self.deserialize_unit(visitor);
+        self.leave_named_container();
+        r
     }
 
-    fn deserialize_newtype_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
+    fn deserialize_newtype_struct<V>(self, name: &'static str, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_newtype_struct(self)
+        self.enter_named_container(name)?;
+        let r = visitor.visit_newtype_struct(&mut *self);
+        self.leave_named_container();
+        r
     }
 
     fn deserialize_seq<V>(mut self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        let len = self.parse_u32_from_uleb128()? as usize;
-        if len > crate::MAX_SEQUENCE_LENGTH {
-            return Err(Error::ExceededMaxLen(len));
-        }
-
+        let len = self.parse_length()?;
         visitor.visit_seq(SeqDeserializer::new(&mut self, len))
     }
 
@@ -364,50 +386,55 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 
     fn deserialize_tuple_struct<V>(
         mut self,
-        _name: &'static str,
+        name: &'static str,
         len: usize,
         visitor: V,
     ) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_seq(SeqDeserializer::new(&mut self, len))
+        self.enter_named_container(name)?;
+        let r = visitor.visit_seq(SeqDeserializer::new(&mut self, len));
+        self.leave_named_container();
+        r
     }
 
     fn deserialize_map<V>(mut self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        let len = self.parse_u32_from_uleb128()? as usize;
-        if len > crate::MAX_SEQUENCE_LENGTH {
-            return Err(Error::ExceededMaxLen(len));
-        }
-
+        let len = self.parse_length()?;
         visitor.visit_map(MapDeserializer::new(&mut self, len))
     }
 
     fn deserialize_struct<V>(
         mut self,
-        _name: &'static str,
+        name: &'static str,
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_seq(SeqDeserializer::new(&mut self, fields.len()))
+        self.enter_named_container(name)?;
+        let r = visitor.visit_seq(SeqDeserializer::new(&mut self, fields.len()));
+        self.leave_named_container();
+        r
     }
 
     fn deserialize_enum<V>(
         self,
-        _name: &'static str,
+        name: &'static str,
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_enum(self)
+        self.enter_named_container(name)?;
+        let r = visitor.visit_enum(&mut *self);
+        self.leave_named_container();
+        r
     }
 
     // LCS does not utilize identifiers, so throw them away

@@ -3,8 +3,8 @@
 
 use crate::{
     block_storage::{BlockReader, BlockStore},
-    counters,
     network::NetworkSender,
+    network_interface::ConsensusMsg,
     persistent_liveness_storage::{PersistentLivenessStorage, RecoveryData},
     state_replication::StateComputer,
 };
@@ -20,11 +20,7 @@ use libra_logger::prelude::*;
 use libra_types::{account_address::AccountAddress, epoch_change::EpochChangeProof};
 use mirai_annotations::checked_precondition;
 use rand::{prelude::*, Rng};
-use std::{
-    clone::Clone,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{clone::Clone, sync::Arc, time::Duration};
 use termion::color::*;
 
 #[derive(Debug, PartialEq)]
@@ -109,10 +105,12 @@ impl BlockStore {
             if qc.ends_epoch() {
                 retriever
                     .network
-                    .broadcast_epoch_change(EpochChangeProof::new(
-                        vec![finality_proof.clone()],
-                        /* more = */ false,
-                    ))
+                    .broadcast(ConsensusMsg::EpochChangeProof(Box::new(
+                        EpochChangeProof::new(
+                            vec![finality_proof.clone()],
+                            /* more = */ false,
+                        ),
+                    )))
                     .await;
             }
         }
@@ -223,11 +221,9 @@ impl BlockStore {
         // If a node restarts in the middle of state synchronization, it is going to try to catch up
         // to the stored quorum certs as the new root.
         storage.save_tree(blocks.clone(), quorum_certs.clone())?;
-        let pre_sync_instance = Instant::now();
         state_computer
             .sync_to(highest_commit_cert.ledger_info().clone())
             .await?;
-        counters::STATE_SYNC_DURATION_S.observe_duration(pre_sync_instance.elapsed());
         let recovery_data = storage
             .start()
             .expect_recovery_data("Failed to construct recovery data after fast forward sync");

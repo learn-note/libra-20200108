@@ -1,7 +1,9 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::persistent_safety_storage::PersistentSafetyStorage;
+use crate::{
+    persistent_safety_storage::PersistentSafetyStorage, serializer::SerializerService, SafetyRules,
+};
 use consensus_types::{
     block::Block,
     common::{Payload, Round},
@@ -9,12 +11,20 @@ use consensus_types::{
     timeout::Timeout,
     vote::Vote,
     vote_data::VoteData,
-    vote_proposal::VoteProposal,
+    vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
 };
-use libra_crypto::hash::{CryptoHash, TransactionAccumulatorHasher};
-use libra_secure_storage::InMemoryStorage;
+use libra_crypto::{
+    ed25519::Ed25519PrivateKey,
+    hash::{CryptoHash, TransactionAccumulatorHasher},
+    traits::SigningKey,
+    Uniform,
+};
+use libra_secure_storage::{InMemoryStorage, Storage};
+use libra_time::duration_since_epoch;
 use libra_types::{
     block_info::BlockInfo,
+    epoch_change::EpochChangeProof,
+    epoch_state::EpochState,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     on_chain_config::ValidatorSet,
     proof::AccumulatorExtensionProof,
@@ -22,15 +32,24 @@ use libra_types::{
     validator_signer::ValidatorSigner,
     waypoint::Waypoint,
 };
-use std::{
-    collections::BTreeMap,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::BTreeMap;
 
 pub type Proof = AccumulatorExtensionProof<TransactionAccumulatorHasher>;
 
 pub fn empty_proof() -> Proof {
     Proof::new(vec![], 0, vec![])
+}
+
+pub fn make_genesis(signer: &ValidatorSigner) -> (EpochChangeProof, QuorumCert) {
+    let validator_info =
+        ValidatorInfo::new_with_test_network_keys(signer.author(), signer.public_key(), 1);
+    let validator_set = ValidatorSet::new(vec![validator_info]);
+    let li = LedgerInfo::mock_genesis(Some(validator_set));
+    let block = Block::make_genesis_block_from_ledger_info(&li);
+    let qc = QuorumCert::certificate_for_genesis_from_ledger_info(&li, block.id());
+    let lis = LedgerInfoWithSignatures::new(li, BTreeMap::new());
+    let proof = EpochChangeProof::new(vec![lis], false);
+    (proof, qc)
 }
 
 pub fn make_proposal_with_qc_and_proof(
@@ -39,39 +58,45 @@ pub fn make_proposal_with_qc_and_proof(
     proof: Proof,
     qc: QuorumCert,
     validator_signer: &ValidatorSigner,
-) -> VoteProposal {
-    VoteProposal::new(
+    exec_key: Option<&Ed25519PrivateKey>,
+) -> MaybeSignedVoteProposal {
+    let vote_proposal = VoteProposal::new(
         proof,
         Block::new_proposal(
             payload,
             round,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            duration_since_epoch().as_secs(),
             qc,
             validator_signer,
         ),
         None,
-    )
+    );
+    let signature = exec_key.map(|key| key.sign(&vote_proposal));
+    MaybeSignedVoteProposal {
+        vote_proposal,
+        signature,
+    }
 }
 
 pub fn make_proposal_with_qc(
     round: Round,
     qc: QuorumCert,
     validator_signer: &ValidatorSigner,
-) -> VoteProposal {
-    make_proposal_with_qc_and_proof(vec![], round, empty_proof(), qc, validator_signer)
+    exec_key: Option<&Ed25519PrivateKey>,
+) -> MaybeSignedVoteProposal {
+    make_proposal_with_qc_and_proof(vec![], round, empty_proof(), qc, validator_signer, exec_key)
 }
 
 pub fn make_proposal_with_parent_and_overrides(
     payload: Payload,
     round: Round,
-    parent: &VoteProposal,
-    committed: Option<&VoteProposal>,
+    parent: &MaybeSignedVoteProposal,
+    committed: Option<&MaybeSignedVoteProposal>,
     validator_signer: &ValidatorSigner,
     epoch: Option<u64>,
-) -> VoteProposal {
+    next_epoch_state: Option<EpochState>,
+    exec_key: Option<&Ed25519PrivateKey>,
+) -> MaybeSignedVoteProposal {
     let block_epoch = match epoch {
         Some(e) => e,
         _ => parent.block().epoch(),
@@ -128,7 +153,7 @@ pub fn make_proposal_with_parent_and_overrides(
                 tree.root_hash(),
                 tree.version(),
                 committed.block().timestamp_usecs(),
-                None,
+                next_epoch_state,
             );
             LedgerInfo::new(commit_block_info, vote_data.hash())
         }
@@ -149,16 +174,17 @@ pub fn make_proposal_with_parent_and_overrides(
 
     let qc = QuorumCert::new(vote_data, ledger_info_with_signatures);
 
-    make_proposal_with_qc_and_proof(payload, round, proof, qc, validator_signer)
+    make_proposal_with_qc_and_proof(payload, round, proof, qc, validator_signer, exec_key)
 }
 
 pub fn make_proposal_with_parent(
     payload: Payload,
     round: Round,
-    parent: &VoteProposal,
-    committed: Option<&VoteProposal>,
+    parent: &MaybeSignedVoteProposal,
+    committed: Option<&MaybeSignedVoteProposal>,
     validator_signer: &ValidatorSigner,
-) -> VoteProposal {
+    exec_key: Option<&Ed25519PrivateKey>,
+) -> MaybeSignedVoteProposal {
     make_proposal_with_parent_and_overrides(
         payload,
         round,
@@ -166,6 +192,8 @@ pub fn make_proposal_with_parent(
         committed,
         validator_signer,
         None,
+        None,
+        exec_key,
     )
 }
 
@@ -177,13 +205,32 @@ pub fn validator_signers_to_ledger_info(signers: &[&ValidatorSigner]) -> LedgerI
     LedgerInfo::mock_genesis(Some(validator_set))
 }
 
-pub fn validator_signers_to_waypoints(signers: &[&ValidatorSigner]) -> Waypoint {
+pub fn validator_signers_to_waypoint(signers: &[&ValidatorSigner]) -> Waypoint {
     let li = validator_signers_to_ledger_info(signers);
     Waypoint::new_epoch_boundary(&li).unwrap()
 }
 
 pub fn test_storage(signer: &ValidatorSigner) -> PersistentSafetyStorage {
-    let waypoint = validator_signers_to_waypoints(&[signer]);
-    let storage = Box::new(InMemoryStorage::new());
-    PersistentSafetyStorage::initialize(storage, signer.private_key().clone(), waypoint)
+    let waypoint = validator_signers_to_waypoint(&[signer]);
+    let storage = Storage::from(InMemoryStorage::new());
+    PersistentSafetyStorage::initialize(
+        storage,
+        signer.author(),
+        signer.private_key().clone(),
+        Ed25519PrivateKey::generate_for_testing(),
+        waypoint,
+    )
+}
+
+/// Returns a simple serializer for testing purposes.
+pub fn test_safety_rules() -> SafetyRules {
+    let signer = ValidatorSigner::from_int(0);
+    let storage = test_storage(&signer);
+    SafetyRules::new(storage, true)
+}
+
+/// Returns a simple serializer for testing purposes.
+pub fn test_serializer() -> SerializerService {
+    let safety_rules = test_safety_rules();
+    SerializerService::new(safety_rules)
 }

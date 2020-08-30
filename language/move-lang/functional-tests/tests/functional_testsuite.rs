@@ -46,7 +46,7 @@ impl std::error::Error for MoveSourceCompilerError {}
 
 impl Compiler for MoveSourceCompiler {
     /// Compile a transaction script or module.
-    fn compile<Logger: FnMut(String) -> ()>(
+    fn compile<Logger: FnMut(String)>(
         &mut self,
         _log: Logger,
         address: LibraAddress,
@@ -83,7 +83,11 @@ impl Compiler for MoveSourceCompiler {
         Ok(match unit {
             CompiledUnit::Script { script, .. } => ScriptOrModule::Script(script),
             CompiledUnit::Module { module, .. } => {
-                let input = format!("address {} {{\n{}\n}}", sender_addr, input);
+                let input = if input.starts_with("address") {
+                    input.to_string()
+                } else {
+                    format!("address {} {{\n{}\n}}", sender_addr, input)
+                };
                 cur_file.reopen()?.write_all(input.as_bytes())?;
                 self.temp_files.push(cur_file);
                 self.deps.push(cur_path);
@@ -92,7 +96,7 @@ impl Compiler for MoveSourceCompiler {
         })
     }
 
-    fn use_staged_genesis(&self) -> bool {
+    fn use_compiled_genesis(&self) -> bool {
         false
     }
 }
@@ -101,4 +105,4 @@ fn functional_testsuite(path: &Path) -> datatest_stable::Result<()> {
     testsuite::functional_tests(MoveSourceCompiler::new(stdlib_files(STD_LIB_DIR)), path)
 }
 
-datatest_stable::harness!(functional_testsuite, FUNCTIONAL_TEST_DIR, r".*\.move");
+datatest_stable::harness!(functional_testsuite, FUNCTIONAL_TEST_DIR, r".*\.move$");

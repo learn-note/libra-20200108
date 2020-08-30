@@ -5,9 +5,10 @@ use anyhow::{format_err, Error, Result};
 use libra_crypto::HashValue;
 use libra_types::{
     account_config::{
-        AccountResource, AccountRole, BalanceResource, BurnEvent, CancelBurnEvent,
-        CurrencyInfoResource, MintEvent, NewBlockEvent, NewEpochEvent, PreburnEvent,
-        ReceivedPaymentEvent, SentPaymentEvent, UpgradeEvent, LBR_NAME,
+        AccountResource, AccountRole, BalanceResource, BaseUrlRotationEvent, BurnEvent,
+        CancelBurnEvent, ComplianceKeyRotationEvent, CurrencyInfoResource, FreezingBit, MintEvent,
+        NewBlockEvent, NewEpochEvent, PreburnEvent, ReceivedMintEvent, ReceivedPaymentEvent,
+        SentPaymentEvent, ToLBRExchangeRateUpdateEvent, UpgradeEvent,
     },
     account_state_blob::AccountStateWithProof,
     contract_event::ContractEvent,
@@ -15,7 +16,7 @@ use libra_types::{
     ledger_info::LedgerInfoWithSignatures,
     proof::{AccountStateProof, AccumulatorConsistencyProof},
     transaction::{Transaction, TransactionArgument, TransactionPayload},
-    vm_error::StatusCode,
+    vm_status::KeptVMStatus,
 };
 use move_core_types::{
     identifier::Identifier,
@@ -25,6 +26,10 @@ use move_core_types::{
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, convert::TryFrom};
 use transaction_builder::get_transaction_name;
+
+pub const JSONRPC_LIBRA_CHAIN_ID: &str = "libra_chain_id";
+pub const JSONRPC_LIBRA_LEDGER_VERSION: &str = "libra_ledger_version";
+pub const JSONRPC_LIBRA_LEDGER_TIMESTAMPUSECS: &str = "libra_ledger_timestampusec";
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct AmountView {
@@ -42,13 +47,10 @@ impl AmountView {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(tag = "type")]
 pub enum AccountRoleView {
     #[serde(rename = "unknown")]
     Unknown,
-    #[serde(rename = "unhosted")]
-    Unhosted,
-    #[serde(rename = "empty")]
-    Empty,
     #[serde(rename = "child_vasp")]
     ChildVASP { parent_vasp_address: BytesView },
     #[serde(rename = "parent_vasp")]
@@ -57,6 +59,20 @@ pub enum AccountRoleView {
         base_url: String,
         expiration_time: u64,
         compliance_key: BytesView,
+        num_children: u64,
+        compliance_key_rotation_events_key: BytesView,
+        base_url_rotation_events_key: BytesView,
+    },
+    #[serde(rename = "designated_dealer")]
+    DesignatedDealer {
+        human_name: String,
+        base_url: String,
+        expiration_time: u64,
+        compliance_key: BytesView,
+        preburn_balances: Vec<AmountView>,
+        received_mint_events_key: BytesView,
+        compliance_key_rotation_events_key: BytesView,
+        base_url_rotation_events_key: BytesView,
     },
 }
 
@@ -69,6 +85,7 @@ pub struct AccountView {
     pub received_events_key: BytesView,
     pub delegated_key_rotation_capability: bool,
     pub delegated_withdrawal_capability: bool,
+    pub is_frozen: bool,
     pub role: AccountRoleView,
 }
 
@@ -77,10 +94,11 @@ impl AccountView {
         account: &AccountResource,
         balances: BTreeMap<Identifier, BalanceResource>,
         account_role: AccountRole,
+        freezing_bit: FreezingBit,
     ) -> Self {
         Self {
             balances: balances
-                .into_iter()
+                .iter()
                 .map(|(currency_code, balance)| {
                     AmountView::new(balance.coin(), &currency_code.as_str())
                 })
@@ -89,8 +107,9 @@ impl AccountView {
             authentication_key: BytesView::from(account.authentication_key()),
             sent_events_key: BytesView::from(account.sent_events().key().as_bytes()),
             received_events_key: BytesView::from(account.received_events().key().as_bytes()),
-            delegated_key_rotation_capability: account.delegated_key_rotation_capability(),
-            delegated_withdrawal_capability: account.delegated_withdrawal_capability(),
+            delegated_key_rotation_capability: account.has_delegated_key_rotation_capability(),
+            delegated_withdrawal_capability: account.has_delegated_withdrawal_capability(),
+            is_frozen: freezing_bit.is_frozen(),
             role: AccountRoleView::from(account_role),
         }
     }
@@ -119,6 +138,11 @@ pub enum EventDataView {
     },
     #[serde(rename = "mint")]
     Mint { amount: AmountView },
+    #[serde(rename = "to_lbr_exchange_rate_update")]
+    ToLBRExchangeRateUpdate {
+        currency_code: String,
+        new_to_lbr_exchange_rate: f32,
+    },
     #[serde(rename = "preburn")]
     Preburn {
         amount: AmountView,
@@ -128,12 +152,14 @@ pub enum EventDataView {
     ReceivedPayment {
         amount: AmountView,
         sender: BytesView,
+        receiver: BytesView,
         metadata: BytesView,
     },
     #[serde(rename = "sentpayment")]
     SentPayment {
         amount: AmountView,
         receiver: BytesView,
+        sender: BytesView,
         metadata: BytesView,
     },
     #[serde(rename = "upgrade")]
@@ -145,6 +171,21 @@ pub enum EventDataView {
         round: u64,
         proposer: BytesView,
         proposed_time: u64,
+    },
+    #[serde(rename = "receivedmint")]
+    ReceivedMint {
+        amount: AmountView,
+        destination_address: BytesView,
+    },
+    #[serde(rename = "compliancekeyrotation")]
+    ComplianceKeyRotation {
+        new_compliance_public_key: String,
+        time_rotated_seconds: u64,
+    },
+    #[serde(rename = "baseurlrotation")]
+    BaseUrlRotation {
+        new_base_url: String,
+        time_rotated_seconds: u64,
     },
     #[serde(rename = "unknown")]
     Unknown {},
@@ -163,6 +204,7 @@ impl From<(u64, ContractEvent)> for EventView {
                 Ok(EventDataView::ReceivedPayment {
                     amount: amount_view,
                     sender: BytesView::from(received_event.sender().as_ref()),
+                    receiver: BytesView::from(&event.key().get_creator_address().to_vec()),
                     metadata: BytesView::from(received_event.metadata()),
                 })
             } else {
@@ -175,6 +217,7 @@ impl From<(u64, ContractEvent)> for EventView {
                 Ok(EventDataView::SentPayment {
                     amount: amount_view,
                     receiver: BytesView::from(sent_event.receiver().as_ref()),
+                    sender: BytesView::from(&event.key().get_creator_address().to_vec()),
                     metadata: BytesView::from(sent_event.metadata()),
                 })
             } else {
@@ -206,6 +249,15 @@ impl From<(u64, ContractEvent)> for EventView {
             } else {
                 Err(format_err!("Unable to parse CancelBurnEvent"))
             }
+        } else if event.type_tag() == &TypeTag::Struct(ToLBRExchangeRateUpdateEvent::struct_tag()) {
+            if let Ok(update_event) = ToLBRExchangeRateUpdateEvent::try_from(&event) {
+                Ok(EventDataView::ToLBRExchangeRateUpdate {
+                    currency_code: update_event.currency_code().to_string(),
+                    new_to_lbr_exchange_rate: update_event.new_to_lbr_exchange_rate(),
+                })
+            } else {
+                Err(format_err!("Unable to parse ToLBRExchangeRateUpdate"))
+            }
         } else if event.type_tag() == &TypeTag::Struct(MintEvent::struct_tag()) {
             if let Ok(mint_event) = MintEvent::try_from(&event) {
                 let amount_view =
@@ -215,6 +267,21 @@ impl From<(u64, ContractEvent)> for EventView {
                 })
             } else {
                 Err(format_err!("Unable to parse MintEvent"))
+            }
+        } else if event.type_tag() == &TypeTag::Struct(ReceivedMintEvent::struct_tag()) {
+            if let Ok(received_mint_event) = ReceivedMintEvent::try_from(&event) {
+                let amount_view = AmountView::new(
+                    received_mint_event.amount(),
+                    received_mint_event.currency_code().as_str(),
+                );
+                let destination_address =
+                    BytesView::from(received_mint_event.destination_address().as_ref());
+                Ok(EventDataView::ReceivedMint {
+                    amount: amount_view,
+                    destination_address,
+                })
+            } else {
+                Err(format_err!("Unable to parse ReceivedMintEvent"))
             }
         } else if event.type_tag() == &TypeTag::Struct(PreburnEvent::struct_tag()) {
             if let Ok(preburn_event) = PreburnEvent::try_from(&event) {
@@ -256,6 +323,28 @@ impl From<(u64, ContractEvent)> for EventView {
             } else {
                 Err(format_err!("Unable to parse UpgradeEvent"))
             }
+        } else if event.type_tag() == &TypeTag::Struct(ComplianceKeyRotationEvent::struct_tag()) {
+            if let Ok(rotation_event) = ComplianceKeyRotationEvent::try_from(&event) {
+                Ok(EventDataView::ComplianceKeyRotation {
+                    new_compliance_public_key: hex::encode(
+                        rotation_event.new_compliance_public_key(),
+                    ),
+                    time_rotated_seconds: rotation_event.time_rotated_seconds(),
+                })
+            } else {
+                Err(format_err!("Unable to parse ComplianceKeyRotationEvent"))
+            }
+        } else if event.type_tag() == &TypeTag::Struct(BaseUrlRotationEvent::struct_tag()) {
+            if let Ok(rotation_event) = BaseUrlRotationEvent::try_from(&event) {
+                String::from_utf8(rotation_event.new_base_url().to_vec())
+                    .map(|new_base_url| EventDataView::BaseUrlRotation {
+                        new_base_url,
+                        time_rotated_seconds: rotation_event.time_rotated_seconds(),
+                    })
+                    .map_err(|_| format_err!("Unable to parse BaseUrlRotationEvent"))
+            } else {
+                Err(format_err!("Unable to parse BaseUrlRotationEvent"))
+            }
         } else {
             Err(format_err!("Unknown events"))
         };
@@ -273,6 +362,7 @@ impl From<(u64, ContractEvent)> for EventView {
 pub struct BlockMetadata {
     pub version: u64,
     pub timestamp: u64,
+    pub chain_id: u8,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -296,13 +386,67 @@ impl From<&Vec<u8>> for BytesView {
     }
 }
 
+impl From<Vec<u8>> for BytesView {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(hex::encode(bytes))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum VMStatusView {
+    #[serde(rename = "executed")]
+    Executed,
+    #[serde(rename = "out_of_gas")]
+    OutOfGas,
+    #[serde(rename = "move_abort")]
+    MoveAbort { location: String, abort_code: u64 },
+    #[serde(rename = "execution_failure")]
+    ExecutionFailure {
+        location: String,
+        function_index: u16,
+        code_offset: u16,
+    },
+    #[serde(rename = "verification_error")]
+    VerificationError,
+    #[serde(rename = "deserialization_error")]
+    DeserializationError,
+    #[serde(rename = "publishing_failure")]
+    PublishingFailure,
+}
+
+impl From<&KeptVMStatus> for VMStatusView {
+    fn from(status: &KeptVMStatus) -> Self {
+        match status {
+            KeptVMStatus::Executed => VMStatusView::Executed,
+            KeptVMStatus::OutOfGas => VMStatusView::OutOfGas,
+            KeptVMStatus::MoveAbort(loc, abort_code) => VMStatusView::MoveAbort {
+                location: loc.to_string(),
+                abort_code: *abort_code,
+            },
+            KeptVMStatus::ExecutionFailure {
+                location,
+                function,
+                code_offset,
+            } => VMStatusView::ExecutionFailure {
+                location: location.to_string(),
+                function_index: *function,
+                code_offset: *code_offset,
+            },
+            KeptVMStatus::VerificationError => VMStatusView::VerificationError,
+            KeptVMStatus::DeserializationError => VMStatusView::DeserializationError,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TransactionView {
     pub version: u64,
     pub transaction: TransactionDataView,
     pub hash: String,
+    pub bytes: BytesView,
     pub events: Vec<EventView>,
-    pub vm_status: StatusCode,
+    pub vm_status: VMStatusView,
     pub gas_used: u64,
 }
 
@@ -321,11 +465,13 @@ pub enum TransactionDataView {
         signature: String,
         public_key: String,
         sequence_number: u64,
+        chain_id: u8,
         max_gas_amount: u64,
         gas_unit_price: u64,
         gas_currency: String,
-        expiration_time: u64,
+        expiration_timestamp_secs: u64,
         script_hash: String,
+        script_bytes: BytesView,
         script: ScriptView,
     },
     #[serde(rename = "unknown")]
@@ -357,13 +503,6 @@ pub enum ScriptView {
 
 impl ScriptView {
     // TODO cover all script types
-    pub fn get_name(&self) -> String {
-        match self {
-            ScriptView::PeerToPeer { .. } => "peer to peer transaction".to_string(),
-            ScriptView::Mint { .. } => "mint transaction".to_string(),
-            ScriptView::Unknown { .. } => "unknown transaction".to_string(),
-        }
-    }
 }
 
 impl From<Transaction> for TransactionDataView {
@@ -374,7 +513,7 @@ impl From<Transaction> for TransactionDataView {
                     timestamp_usecs: x.1,
                 })
             }
-            Transaction::WaypointWriteSet(_) => Ok(TransactionDataView::WriteSet {}),
+            Transaction::GenesisTransaction(_) => Ok(TransactionDataView::WriteSet {}),
             Transaction::UserTransaction(t) => {
                 let script_hash = match t.payload() {
                     TransactionPayload::Script(s) => HashValue::sha3_256_of(s.code()),
@@ -382,17 +521,25 @@ impl From<Transaction> for TransactionDataView {
                 }
                 .to_hex();
 
+                let script_bytes: BytesView = match t.payload() {
+                    TransactionPayload::Script(s) => lcs::to_bytes(s).unwrap_or_default(),
+                    _ => vec![],
+                }
+                .into();
+
                 Ok(TransactionDataView::UserTransaction {
                     sender: t.sender().to_string(),
                     signature_scheme: t.authenticator().scheme().to_string(),
                     signature: hex::encode(t.authenticator().signature_bytes()),
                     public_key: hex::encode(t.authenticator().public_key_bytes()),
                     sequence_number: t.sequence_number(),
+                    chain_id: t.chain_id().id(),
                     max_gas_amount: t.max_gas_amount(),
                     gas_unit_price: t.gas_unit_price(),
                     gas_currency: t.gas_currency_code().to_string(),
-                    expiration_time: t.expiration_time().as_secs(),
+                    expiration_timestamp_secs: t.expiration_timestamp_secs(),
                     script_hash,
+                    script_bytes,
                     script: t.into_raw_transaction().into_payload().into(),
                 })
             }
@@ -405,17 +552,50 @@ impl From<Transaction> for TransactionDataView {
 impl From<AccountRole> for AccountRoleView {
     fn from(role: AccountRole) -> Self {
         match role {
-            AccountRole::Empty => AccountRoleView::Empty,
-            AccountRole::Unhosted => AccountRoleView::Unhosted,
             AccountRole::Unknown => AccountRoleView::Unknown,
             AccountRole::ChildVASP(child_vasp) => AccountRoleView::ChildVASP {
                 parent_vasp_address: BytesView::from(&child_vasp.parent_vasp_addr().to_vec()),
             },
-            AccountRole::ParentVASP(parent_vasp) => AccountRoleView::ParentVASP {
-                human_name: parent_vasp.human_name().to_string(),
-                base_url: parent_vasp.base_url().to_string(),
-                expiration_time: parent_vasp.expiration_date(),
-                compliance_key: BytesView::from(parent_vasp.compliance_public_key()),
+            AccountRole::ParentVASP { vasp, credential } => AccountRoleView::ParentVASP {
+                human_name: credential.human_name().to_string(),
+                base_url: credential.base_url().to_string(),
+                expiration_time: credential.expiration_date(),
+                compliance_key: BytesView::from(credential.compliance_public_key()),
+                num_children: vasp.num_children(),
+                compliance_key_rotation_events_key: BytesView::from(
+                    credential.compliance_key_rotation_events().key().as_bytes(),
+                ),
+                base_url_rotation_events_key: BytesView::from(
+                    credential.base_url_rotation_events().key().as_bytes(),
+                ),
+            },
+            AccountRole::DesignatedDealer {
+                dd_credential,
+                preburn_balances,
+                designated_dealer,
+            } => AccountRoleView::DesignatedDealer {
+                human_name: dd_credential.human_name().to_string(),
+                base_url: dd_credential.base_url().to_string(),
+                expiration_time: dd_credential.expiration_date(),
+                compliance_key: BytesView::from(dd_credential.compliance_public_key()),
+                preburn_balances: preburn_balances
+                    .iter()
+                    .map(|(currency_code, balance)| {
+                        AmountView::new(balance.coin(), &currency_code.as_str())
+                    })
+                    .collect(),
+                received_mint_events_key: BytesView::from(
+                    designated_dealer.received_mint_events().key().as_bytes(),
+                ),
+                compliance_key_rotation_events_key: BytesView::from(
+                    dd_credential
+                        .compliance_key_rotation_events()
+                        .key()
+                        .as_bytes(),
+                ),
+                base_url_rotation_events_key: BytesView::from(
+                    dd_credential.base_url_rotation_events().key().as_bytes(),
+                ),
             },
         }
     }
@@ -428,7 +608,6 @@ impl From<TransactionPayload> for ScriptView {
         let unknown_currency = "unknown_currency".to_string();
 
         let (code, args, ty_args) = match value {
-            TransactionPayload::Program => ("deprecated".to_string(), empty_vec, empty_ty_vec),
             TransactionPayload::WriteSet(_) => ("genesis".to_string(), empty_vec, empty_ty_vec),
             TransactionPayload::Script(script) => (
                 get_transaction_name(script.code()),
@@ -463,15 +642,11 @@ impl From<TransactionPayload> for ScriptView {
                     Err(format_err!("Unable to parse PeerToPeer arguments"))
                 }
             }
-            name @ "mint" | name @ "mint_lbr_to_address" => {
+            "mint" => {
                 if let [TransactionArgument::Address(receiver), TransactionArgument::U8Vector(auth_key_prefix), TransactionArgument::U64(amount)] =
                     &args[..]
                 {
-                    let currency = if name == "mint_lbr_to_address" {
-                        LBR_NAME.to_string()
-                    } else {
-                        ty_args.get(0).unwrap_or(&unknown_currency).to_string()
-                    };
+                    let currency = ty_args.get(0).unwrap_or(&unknown_currency).to_string();
                     Ok(ScriptView::Mint {
                         receiver: receiver.to_string(),
                         auth_key_prefix: BytesView::from(auth_key_prefix),
@@ -493,14 +668,28 @@ pub struct CurrencyInfoView {
     pub code: String,
     pub scaling_factor: u64,
     pub fractional_part: u64,
+    pub to_lbr_exchange_rate: f32,
+    pub mint_events_key: BytesView,
+    pub burn_events_key: BytesView,
+    pub preburn_events_key: BytesView,
+    pub cancel_burn_events_key: BytesView,
+    pub exchange_rate_update_events_key: BytesView,
 }
 
-impl From<CurrencyInfoResource> for CurrencyInfoView {
-    fn from(info: CurrencyInfoResource) -> CurrencyInfoView {
+impl From<&CurrencyInfoResource> for CurrencyInfoView {
+    fn from(info: &CurrencyInfoResource) -> CurrencyInfoView {
         CurrencyInfoView {
             code: info.currency_code().to_string(),
             scaling_factor: info.scaling_factor(),
             fractional_part: info.fractional_part(),
+            to_lbr_exchange_rate: info.exchange_rate(),
+            mint_events_key: BytesView::from(info.mint_events().key().as_bytes()),
+            burn_events_key: BytesView::from(info.burn_events().key().as_bytes()),
+            preburn_events_key: BytesView::from(info.preburn_events().key().as_bytes()),
+            cancel_burn_events_key: BytesView::from(info.cancel_burn_events().key().as_bytes()),
+            exchange_rate_update_events_key: BytesView::from(
+                info.exchange_rate_update_events().key().as_bytes(),
+            ),
         }
     }
 }

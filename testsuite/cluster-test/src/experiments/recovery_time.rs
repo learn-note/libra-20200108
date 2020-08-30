@@ -10,12 +10,10 @@ use tokio::time;
 
 use crate::{
     cluster::Cluster,
-    cluster_swarm::ClusterSwarm,
     experiments::{Context, Experiment, ExperimentParam},
     instance::Instance,
     tx_emitter::EmitJobRequest,
 };
-use anyhow::format_err;
 use async_trait::async_trait;
 use libra_logger::info;
 use std::time::Instant;
@@ -66,30 +64,14 @@ impl Experiment for RecoveryTime {
             )
             .await?;
         info!("Stopping {}", self.instance);
-        context
-            .cluster_swarm
-            .delete_node(
-                self.instance
-                    .instance_config()
-                    .ok_or_else(|| format_err!("Failed to find instance_config"))?
-                    .clone(),
-            )
-            .await?;
+        self.instance.stop().await?;
         info!("Deleting db and restarting node for {}", self.instance);
-        context
-            .cluster_swarm
-            .upsert_node(
-                self.instance
-                    .instance_config()
-                    .ok_or_else(|| format_err!("Failed to find instance_config"))?
-                    .clone(),
-                true,
-            )
-            .await?;
+        self.instance.clean_data().await?;
+        self.instance.start().await?;
         info!("Waiting for instance to be up: {}", self.instance);
-        while self.instance.try_json_rpc().await.is_err() {
-            time::delay_for(Duration::from_secs(1)).await;
-        }
+        self.instance
+            .wait_json_rpc(Instant::now() + Duration::from_secs(120))
+            .await?;
         let start_instant = Instant::now();
         info!(
             "Instance {} is up. Waiting for it to start committing.",

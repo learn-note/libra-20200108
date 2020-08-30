@@ -28,7 +28,7 @@
 //! using a relay protocol.
 
 use crate::{
-    common::NetworkPublicKeys,
+    logging::{network_events::DISCOVERY_SOURCE, *},
     peer_manager::{self, conn_notifs_channel, ConnectionRequestSender, PeerManagerError},
 };
 use futures::{
@@ -36,32 +36,42 @@ use futures::{
     future::{BoxFuture, FutureExt},
     stream::{FusedStream, FuturesUnordered, Stream, StreamExt},
 };
+use libra_config::network_id::NetworkContext;
+use libra_crypto::x25519;
 use libra_logger::prelude::*;
 use libra_network_address::NetworkAddress;
 use libra_types::PeerId;
 use num_variants::NumVariants;
+use rand::{
+    prelude::{SeedableRng, SmallRng},
+    seq::SliceRandom,
+};
+use serde::{export::Formatter, Serialize};
 use std::{
     cmp::min,
-    collections::HashMap,
-    fmt::Debug,
+    collections::{HashMap, HashSet},
+    fmt, mem,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::time;
+use tokio_retry::strategy::jitter;
 
+pub mod builder;
 #[cfg(test)]
 mod test;
 
 /// The ConnectivityManager actor.
 pub struct ConnectivityManager<TTicker, TBackoff> {
-    /// PeerId of this node.
-    self_peer_id: PeerId,
+    network_context: Arc<NetworkContext>,
     /// Nodes which are eligible to join the network.
-    eligible: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
+    eligible: Arc<RwLock<HashMap<PeerId, HashSet<x25519::PublicKey>>>>,
     /// PeerId and address of remote peers to which this peer is connected.
     connected: HashMap<PeerId, NetworkAddress>,
     /// Addresses of peers received from discovery sources.
-    peer_addresses: HashMap<PeerId, Addresses>,
+    peer_addrs: PeerAddresses,
+    /// Public key sets of peers received from discovery sources.
+    peer_pubkeys: PeerPublicKeys,
     /// Ticker to trigger connectivity checks to provide the guarantees stated above.
     ticker: TTicker,
     /// Channel to send connection requests to PeerManager.
@@ -83,32 +93,74 @@ pub struct ConnectivityManager<TTicker, TBackoff> {
     /// A local counter incremented on receiving an incoming message. Printing this in debugging
     /// allows for easy debugging.
     event_id: u32,
+    /// A way to limit the number of connected peers by outgoing dials.
+    connection_limit: Option<usize>,
+    /// Random for shuffling which peers will be dialed
+    rng: SmallRng,
 }
 
 /// Different sources for peer addresses, ordered by priority (Onchain=highest,
 /// Config=lowest).
 #[repr(u8)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, NumVariants)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, NumVariants, Serialize)]
 pub enum DiscoverySource {
     OnChain,
     Gossip,
     Config,
 }
 
+impl fmt::Debug for DiscoverySource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl fmt::Display for DiscoverySource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                DiscoverySource::OnChain => "OnChain",
+                DiscoverySource::Gossip => "Gossip",
+                DiscoverySource::Config => "Config",
+            }
+        )
+    }
+}
+
 /// Requests received by the [`ConnectivityManager`] manager actor from upstream modules.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub enum ConnectivityRequest {
+    // TODO(philiphayes): can we consolidate these UpdateX messages into one message?
     /// Request to update known addresses of peer with id `PeerId` to given list.
     UpdateAddresses(DiscoverySource, HashMap<PeerId, Vec<NetworkAddress>>),
     /// Update set of nodes eligible to join the network.
-    UpdateEligibleNodes(HashMap<PeerId, NetworkPublicKeys>),
+    UpdateEligibleNodes(DiscoverySource, HashMap<PeerId, HashSet<x25519::PublicKey>>),
+    /// Gets current size of connected peers. This is useful in tests.
+    #[serde(skip)]
+    GetConnectedSize(oneshot::Sender<usize>),
     /// Gets current size of dial queue. This is useful in tests.
+    #[serde(skip)]
     GetDialQueueSize(oneshot::Sender<usize>),
 }
 
-/// A set of NetworkAddress's for a peer, bucketed by DiscoverySource in priority order.
-#[derive(Clone, Debug, Default)]
+/// The set of `NetworkAddress`'s for all peers.
+#[derive(Serialize)]
+struct PeerAddresses(HashMap<PeerId, Addresses>);
+
+/// A set of `NetworkAddress`'s for a single peer, bucketed by DiscoverySource in
+/// priority order.
+#[derive(Clone, Default, Serialize)]
 struct Addresses([Vec<NetworkAddress>; DiscoverySource::NUM_VARIANTS]);
+
+/// The sets of `x25519::PublicKey`s for all peers.
+struct PeerPublicKeys(HashMap<PeerId, PublicKeys>);
+
+/// Sets of `x25519::PublicKey`s for a single peer, bucketed by DiscoverySource
+/// in priority order.
+#[derive(Default)]
+struct PublicKeys([HashSet<x25519::PublicKey>; DiscoverySource::NUM_VARIANTS]);
 
 #[derive(Debug)]
 enum DialResult {
@@ -124,9 +176,13 @@ struct DialState<TBackoff> {
     /// The current state of this peer's backoff delay.
     backoff: TBackoff,
     /// The index of the next address to dial. Index of an address in the peer's
-    /// `peer_addresses` entry.
+    /// `peer_addrs` entry.
     addr_idx: usize,
 }
+
+/////////////////////////
+// ConnectivityManager //
+/////////////////////////
 
 impl<TTicker, TBackoff> ConnectivityManager<TTicker, TBackoff>
 where
@@ -135,36 +191,32 @@ where
 {
     /// Creates a new instance of the [`ConnectivityManager`] actor.
     pub fn new(
-        self_peer_id: PeerId,
-        eligible: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
-        seed_peers: HashMap<PeerId, Vec<NetworkAddress>>,
+        network_context: Arc<NetworkContext>,
+        eligible: Arc<RwLock<HashMap<PeerId, HashSet<x25519::PublicKey>>>>,
+        seed_addrs: HashMap<PeerId, Vec<NetworkAddress>>,
+        seed_pubkeys: HashMap<PeerId, HashSet<x25519::PublicKey>>,
         ticker: TTicker,
         connection_reqs_tx: ConnectionRequestSender,
         connection_notifs_rx: conn_notifs_channel::Receiver,
         requests_rx: channel::Receiver<ConnectivityRequest>,
         backoff_strategy: TBackoff,
         max_delay_ms: u64,
+        connection_limit: Option<usize>,
     ) -> Self {
-        // Ensure seed peers doesn't contain our own address (we want to avoid
-        // pointless self-dials).
-        let peer_addresses = seed_peers
-            .into_iter()
-            .filter(|(peer_id, _)| *peer_id != self_peer_id)
-            .map(|(peer_id, seed_addrs)| {
-                (
-                    peer_id,
-                    Addresses::from_addrs(DiscoverySource::Config, seed_addrs),
-                )
-            })
-            .collect::<HashMap<PeerId, Addresses>>();
+        assert!(
+            eligible.read().unwrap().is_empty(),
+            "Eligible peers must be initially empty. eligible: {:?}",
+            eligible
+        );
 
-        info!("ConnectivityManager: {} seed peers", peer_addresses.len());
+        info!("{} connectivity manager init", network_context);
 
-        Self {
-            self_peer_id,
+        let mut connmgr = Self {
+            network_context,
             eligible,
             connected: HashMap::new(),
-            peer_addresses,
+            peer_addrs: PeerAddresses::new(),
+            peer_pubkeys: PeerPublicKeys::new(),
             ticker,
             connection_reqs_tx,
             connection_notifs_rx,
@@ -174,7 +226,15 @@ where
             backoff_strategy,
             max_delay_ms,
             event_id: 0,
-        }
+            connection_limit,
+            rng: SmallRng::from_entropy(),
+        };
+
+        // set the initial config addresses and pubkeys
+        connmgr.handle_update_addresses(DiscoverySource::Config, seed_addrs);
+        connmgr.handle_update_eligible_peers(DiscoverySource::Config, seed_pubkeys);
+
+        connmgr
     }
 
     /// Starts the [`ConnectivityManager`] actor.
@@ -190,28 +250,49 @@ where
         // When we first startup, let's attempt to connect with our seed peers.
         self.check_connectivity(&mut pending_dials).await;
 
-        trace!("Starting connection manager");
+        sl_info!(network_log(
+            network_events::CONNECTIVITY_MANAGER_LOOP,
+            &self.network_context
+        )
+        .data(network_events::TYPE, network_events::START));
         loop {
             self.event_id = self.event_id.wrapping_add(1);
             ::futures::select! {
                 _ = self.ticker.select_next_some() => {
-                    trace!("Event Id: {}, type: Tick", self.event_id);
+                    sl_trace!(network_log(network_events::CONNECTIVITY_MANAGER_LOOP, &self.network_context)
+                        .data(network_events::TYPE, "tick")
+                        .field(network_events::EVENT_ID, &self.event_id)
+                    );
                     self.check_connectivity(&mut pending_dials).await;
                 },
                 req = self.requests_rx.select_next_some() => {
-                    trace!("Event Id: {}, type: ConnectivityRequest, req: {:?}", self.event_id, req);
+                    sl_trace!(network_log(network_events::CONNECTIVITY_MANAGER_LOOP, &self.network_context)
+                        .data(network_events::TYPE, "connectivity_request")
+                        .field(network_events::CONNECTIVITY_REQUEST, &req)
+                        .field(network_events::EVENT_ID, &self.event_id)
+                    );
                     self.handle_request(req);
                 },
                 notif = self.connection_notifs_rx.select_next_some() => {
-                    trace!("Event Id: {}, type: peer_manager::ConnectionNotification, notif: {:?}", self.event_id, notif);
+                    sl_trace!(network_log(network_events::CONNECTIVITY_MANAGER_LOOP, &self.network_context)
+                        .data(network_events::TYPE, "connection_notification")
+                        .field(network_events::EVENT_ID, &self.event_id)
+                        .field(network_events::CONNECTION_NOTIFICATION, &notif)
+                    );
                     self.handle_control_notification(notif);
                 },
                 peer_id = pending_dials.select_next_some() => {
-                    trace!("Event Id: {}, type: Dial complete, peer: {}", self.event_id, peer_id.short_str());
+                    sl_trace!(network_log(network_events::CONNECTIVITY_MANAGER_LOOP, &self.network_context)
+                        .data(network_events::TYPE, "dial_complete")
+                        .field(network_events::EVENT_ID, &self.event_id)
+                        .field(network_events::REMOTE_PEER, &peer_id)
+                    );
                     self.dial_queue.remove(&peer_id);
                 },
                 complete => {
-                    crit!("Connectivity manager actor terminated");
+                    sl_error!(network_log(network_events::CONNECTIVITY_MANAGER_LOOP, &self.network_context)
+                        .data(network_events::TYPE, network_events::TERMINATION)
+                    );
                     break;
                 }
             }
@@ -232,11 +313,16 @@ where
             .cloned()
             .collect();
         for p in stale_connections.into_iter() {
-            info!("Should no longer be connected to peer: {}", p.short_str());
+            info!(
+                "{} Should no longer be connected to peer: {}",
+                self.network_context,
+                p.short_str()
+            );
             // Close existing connection.
             if let Err(e) = self.connection_reqs_tx.disconnect_peer(p).await {
                 info!(
-                    "Failed to disconnect from peer: {}. Error: {:?}",
+                    "{} Failed to disconnect from peer: {}. Error: {:?}",
+                    self.network_context,
                     p.short_str(),
                     e
                 );
@@ -268,7 +354,8 @@ where
     ) {
         let eligible = self.eligible.read().unwrap().clone();
         let to_connect: Vec<_> = self
-            .peer_addresses
+            .peer_addrs
+            .0
             .iter()
             .filter(|(peer_id, addrs)| {
                 eligible.contains_key(peer_id)  // The node is eligible to be dialed.
@@ -278,26 +365,26 @@ where
             })
             .collect();
 
-        // We tune max delay depending on the number of peers to which we're not connected. This
-        // ensures that if we're disconnected from a large fraction of peers, we keep the retry
-        // window smaller.
-        let max_delay = Duration::from_millis(
-            (self.max_delay_ms as f64
-                * (1.0
-                    - ((self.dial_queue.len() + to_connect.len()) as f64
-                        / eligible
-                            .iter()
-                            .filter(|(peer_id, _)| self.peer_addresses.contains_key(peer_id))
-                            .count() as f64))) as u64,
-        );
+        // Limit the number of dialed connections from a Full Node
+        // This does not limit the number of incoming connections
+        // It enforces that a full node cannot have more outgoing connections than `connection_limit`
+        // including in flight dials.
+        let to_connect_size = if let Some(conn_limit) = self.connection_limit {
+            min(
+                conn_limit.saturating_sub(self.connected.len() + self.dial_queue.len()),
+                to_connect.len(),
+            )
+        } else {
+            to_connect.len()
+        };
 
         // The initial dial state; it has zero dial delay and uses the first
         // address.
         let init_dial_state = DialState::new(self.backoff_strategy.clone());
 
-        for (p, addrs) in to_connect.into_iter() {
+        for (p, addrs) in to_connect.choose_multiple(&mut self.rng, to_connect_size) {
             let mut connction_reqs_tx = self.connection_reqs_tx.clone();
-            let peer_id = *p;
+            let peer_id = **p;
             let dial_state = self
                 .dial_states
                 .entry(peer_id)
@@ -311,23 +398,27 @@ where
             // Using the DialState's backoff strategy, compute the delay until
             // the next dial attempt for this peer.
             let now = Instant::now();
-            let dial_delay = dial_state.next_backoff_delay(max_delay);
+            let dial_delay =
+                dial_state.next_backoff_delay(Duration::from_millis(self.max_delay_ms));
             let f_delay = time::delay_for(dial_delay);
 
             let (cancel_tx, cancel_rx) = oneshot::channel();
 
             info!(
-                "Create dial future: peer: {}, at address: {}, after delay: {:?}",
+                "{} Create dial future: peer: {}, at address: {}, after delay: {:?}",
+                self.network_context,
                 peer_id.short_str(),
                 addr,
                 dial_delay,
             );
 
+            let network_context = self.network_context.clone();
             // Create future which completes by either dialing after calculated
             // delay or on cancellation.
             let f = async move {
                 info!(
-                    "Dial future: dialing peer: {}, at address: {}, after delay: {:?}",
+                    "{} Dial future: dialing peer: {}, at address: {}, after delay: {:?}",
+                    network_context,
                     peer_id.short_str(),
                     addr,
                     f_delay
@@ -338,7 +429,7 @@ where
                 // `cancel_rx`.
                 let dial_result = ::futures::select! {
                     _ = f_delay.fuse() => {
-                        info!("Dialing peer: {}, at addr: {}", peer_id.short_str(), addr);
+                        info!("{} Dialing peer: {}, at addr: {}", network_context, peer_id.short_str(), addr);
                         match connction_reqs_tx.dial_peer(peer_id, addr.clone()).await {
                             Ok(_) => DialResult::Success,
                             Err(e) => DialResult::Failed(e),
@@ -348,7 +439,7 @@ where
                         DialResult::Cancelled
                     },
                 };
-                log_dial_result(peer_id, addr, dial_result);
+                log_dial_result(network_context, peer_id, addr, dial_result);
                 // Send peer_id as future result so it can be removed from dial queue.
                 peer_id
             };
@@ -373,97 +464,220 @@ where
         self.dial_eligible_peers(pending_dials).await;
     }
 
+    fn reset_dial_state(&mut self, peer_id: &PeerId) {
+        if let Some(dial_state) = self.dial_states.get_mut(peer_id) {
+            *dial_state = DialState::new(self.backoff_strategy.clone());
+        }
+    }
+
     fn handle_request(&mut self, req: ConnectivityRequest) {
         match req {
-            ConnectivityRequest::UpdateAddresses(src, address_map) => {
-                for (peer_id, addrs) in address_map {
-                    trace!(
-                        "Received updated addresses for peer: {} from {:?} discovery source",
-                        peer_id.short_str(),
-                        src,
-                    );
-                    // Do not include self_peer_id in the address list for dialing.
-                    if peer_id != self.self_peer_id {
-                        self.update_peer_addrs(src, peer_id, addrs);
-                        // Ensure that the next dial attempt starts from the first addr.
-                        if let Some(dial_state) = self.dial_states.get_mut(&peer_id) {
-                            dial_state.reset_addr();
-                        }
-                    }
-                }
+            ConnectivityRequest::UpdateAddresses(src, new_peer_addrs) => {
+                trace!(
+                    "{} Received updated list of peer addresses: src: {:?}",
+                    self.network_context,
+                    src,
+                );
+                self.handle_update_addresses(src, new_peer_addrs);
             }
-            ConnectivityRequest::UpdateEligibleNodes(nodes) => {
-                trace!("Received updated list of eligible nodes",);
-                *self.eligible.write().unwrap() = nodes;
+            ConnectivityRequest::UpdateEligibleNodes(src, new_peer_pubkeys) => {
+                trace!(
+                    "{} Received updated list of eligible nodes: src: {:?}",
+                    self.network_context,
+                    src,
+                );
+                self.handle_update_eligible_peers(src, new_peer_pubkeys);
             }
             ConnectivityRequest::GetDialQueueSize(sender) => {
                 sender.send(self.dial_queue.len()).unwrap();
             }
+            ConnectivityRequest::GetConnectedSize(sender) => {
+                sender.send(self.connected.len()).unwrap();
+            }
         }
     }
 
-    fn update_peer_addrs(
+    fn handle_update_addresses(
         &mut self,
         src: DiscoverySource,
-        peer_id: PeerId,
-        addrs: Vec<NetworkAddress>,
+        new_peer_addrs: HashMap<PeerId, Vec<NetworkAddress>>,
     ) {
-        self.peer_addresses
-            .entry(peer_id)
-            .or_default()
-            .update(src, addrs);
+        // TODO(philiphayes): do these two in next commit
+        // 1. set peers not in update to empty
+        // 2. remove all empty
+
+        // Keep track of if any peer's addresses have actually changed, so we can
+        // log without too much spam.
+        let mut have_any_changed = false;
+        let self_peer_id = self.network_context.peer_id();
+
+        // 3. add or update intersection
+        for (peer_id, new_addrs) in new_peer_addrs {
+            // Do not include self_peer_id in the address list for dialing to
+            // avoid pointless self-dials.
+            if peer_id == self_peer_id {
+                continue;
+            }
+
+            // Update peer's addresses
+            let addrs = self.peer_addrs.0.entry(peer_id).or_default();
+            if addrs.update(src, new_addrs) {
+                have_any_changed = true;
+                info!(
+                    "{} addresses updated for peer: {}, update src: {:?}, addrs: {}",
+                    self.network_context,
+                    peer_id.short_str(),
+                    src,
+                    addrs,
+                );
+
+                // If we're currently trying to dial this peer, we reset their
+                // dial state. As a result, we will begin our next dial attempt
+                // from the first address (which might have changed) and from a
+                // fresh backoff (since the current backoff delay might be maxed
+                // out if we can't reach any of their previous addresses).
+                self.reset_dial_state(&peer_id);
+            }
+        }
+
+        // Only log the total state if anything has actually changed.
+        if have_any_changed {
+            let peer_addrs = &self.peer_addrs;
+            sl_info!(network_log("peer_addresses_update", &self.network_context)
+                .field(DISCOVERY_SOURCE, &src)
+                .data("peer_addresses", &peer_addrs));
+        }
+    }
+
+    fn handle_update_eligible_peers(
+        &mut self,
+        src: DiscoverySource,
+        new_peer_pubkeys: HashMap<PeerId, HashSet<x25519::PublicKey>>,
+    ) {
+        let mut have_any_changed = false;
+        let self_peer_id = self.network_context.peer_id();
+
+        // 1. set peer entries not in update to empty for this source
+        for (peer_id, pubkeys) in self.peer_pubkeys.0.iter_mut() {
+            if !new_peer_pubkeys.contains_key(peer_id) {
+                have_any_changed |= pubkeys.update(src, HashSet::new());
+            }
+        }
+
+        // 2. add or update pubkeys in intersection
+        for (peer_id, new_pubkeys) in new_peer_pubkeys {
+            if peer_id == self_peer_id {
+                continue;
+            }
+
+            let pubkeys = self.peer_pubkeys.0.entry(peer_id).or_default();
+            if pubkeys.update(src, new_pubkeys) {
+                have_any_changed = true;
+                info!(
+                    "{} pubkey sets updated for peer: {}, update src: {}, pubkeys: {}",
+                    self.network_context,
+                    peer_id.short_str(),
+                    src,
+                    pubkeys
+                );
+                self.reset_dial_state(&peer_id);
+            }
+        }
+
+        // 3. remove all peer entries where all sources are empty
+        have_any_changed |= self.peer_pubkeys.remove_empty();
+
+        // 4. set shared eligible peers to union
+        if have_any_changed {
+            // For each peer, union all of the pubkeys from each discovery source
+            // to generate the new eligible peers set.
+            let new_eligible = self.peer_pubkeys.union_all();
+
+            sl_info!(network_log("eligible_peers_update", &self.network_context)
+                .field(DISCOVERY_SOURCE, &src)
+                .data("eligible_peers", &new_eligible));
+
+            // Swap in the new eligible peers set. Drop the old set after releasing
+            // the write lock.
+            let _old_eligible = {
+                let mut eligible = self.eligible.write().unwrap();
+                mem::replace(&mut *eligible, new_eligible)
+            };
+        }
+
+        // TODO(philiphayes): we can probably do `cancel_stale_dials` and
+        // possibly `cancel_stale_connections` in here?
     }
 
     fn handle_control_notification(&mut self, notif: peer_manager::ConnectionNotification) {
         match notif {
-            peer_manager::ConnectionNotification::NewPeer(peer_id, addr) => {
+            peer_manager::ConnectionNotification::NewPeer(peer_id, addr, _origin, _context) => {
+                // TODO(gnazario): Keep track of inbound and outbound separately?  Somehow handle limits between both
                 self.connected.insert(peer_id, addr);
+
                 // Cancel possible queued dial to this peer.
                 self.dial_states.remove(&peer_id);
                 self.dial_queue.remove(&peer_id);
             }
-            peer_manager::ConnectionNotification::LostPeer(peer_id, addr, _reason) => {
-                match self.connected.get(&peer_id) {
-                    Some(curr_addr) if *curr_addr == addr => {
-                        // Remove node from connected peers list.
-                        self.connected.remove(&peer_id);
-                    }
-                    _ => {
-                        debug!(
-                            "Ignoring stale lost peer event for peer: {}, addr: {}",
-                            peer_id.short_str(),
-                            addr
-                        );
-                    }
+            peer_manager::ConnectionNotification::LostPeer(peer_id, addr, _origin, _reason) => {
+                if let Some(stored_addr) = self.connected.get(&peer_id) {
+                    // Remove node from connected peers list.
+                    info!(
+                        "{} Removing peer '{}' addr: {}, vs event addr: {}",
+                        self.network_context,
+                        peer_id.short_str(),
+                        stored_addr,
+                        addr
+                    );
+                    self.connected.remove(&peer_id);
+                } else {
+                    debug!(
+                        "{} Ignoring stale lost peer event for peer: {}, addr: {}",
+                        self.network_context,
+                        peer_id.short_str(),
+                        addr
+                    );
                 }
             }
         }
     }
 }
 
-fn log_dial_result(peer_id: PeerId, addr: NetworkAddress, dial_result: DialResult) {
+fn log_dial_result(
+    network_context: Arc<NetworkContext>,
+    peer_id: PeerId,
+    addr: NetworkAddress,
+    dial_result: DialResult,
+) {
     match dial_result {
         DialResult::Success => {
             info!(
-                "Successfully connected to peer: {} at address: {}",
+                "{} Successfully connected to peer: {} at address: {}",
+                network_context,
                 peer_id.short_str(),
                 addr
             );
         }
         DialResult::Cancelled => {
-            info!("Cancelled pending dial to peer: {}", peer_id.short_str());
+            info!(
+                "{} Cancelled pending dial to peer: {}",
+                network_context,
+                peer_id.short_str()
+            );
         }
         DialResult::Failed(err) => match err {
             PeerManagerError::AlreadyConnected(a) => {
                 info!(
-                    "Already connected to peer: {} at address: {}",
+                    "{} Already connected to peer: {} at address: {}",
+                    network_context,
                     peer_id.short_str(),
                     a
                 );
             }
             e => {
                 info!(
-                    "Failed to connect to peer: {} at address: {}; error: {}",
+                    "{} Failed to connect to peer: {} at address: {}; error: {}",
+                    network_context,
                     peer_id.short_str(),
                     addr,
                     e
@@ -473,17 +687,51 @@ fn log_dial_result(peer_id: PeerId, addr: NetworkAddress, dial_result: DialResul
     }
 }
 
-impl Addresses {
+/////////////////////
+// DiscoverySource //
+/////////////////////
+
+impl DiscoverySource {
+    fn as_usize(self) -> usize {
+        self as u8 as usize
+    }
+}
+
+///////////////////
+// PeerAddresses //
+///////////////////
+
+impl PeerAddresses {
     fn new() -> Self {
-        Default::default()
+        Self(HashMap::new())
     }
+}
 
-    fn from_addrs(src: DiscoverySource, src_addrs: Vec<NetworkAddress>) -> Self {
-        let mut addrs = Self::new();
-        addrs.update(src, src_addrs);
-        addrs
+impl fmt::Display for PeerAddresses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Write the normal HashMap-style debug format, but shorten the peer_id's
+        // so the output isn't as noisy.
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(peer_id, addrs)| (peer_id.short_str(), addrs)),
+            )
+            .finish()
     }
+}
 
+impl fmt::Debug for PeerAddresses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+///////////////
+// Addresses //
+///////////////
+
+impl Addresses {
     fn len(&self) -> usize {
         self.0.iter().map(Vec::len).sum()
     }
@@ -492,15 +740,134 @@ impl Addresses {
         self.len() == 0
     }
 
-    fn update(&mut self, src: DiscoverySource, addrs: Vec<NetworkAddress>) {
-        let idx = src as u8 as usize;
-        self.0[idx] = addrs;
+    /// Update the addresses for the `DiscoverySource` bucket. Return `true` if
+    /// the addresses have actually changed.
+    fn update(&mut self, src: DiscoverySource, addrs: Vec<NetworkAddress>) -> bool {
+        let src_idx = src.as_usize();
+        if self.0[src_idx] != addrs {
+            self.0[src_idx] = addrs;
+            true
+        } else {
+            false
+        }
     }
 
     fn get(&self, idx: usize) -> Option<&NetworkAddress> {
         self.0.iter().flatten().nth(idx)
     }
 }
+
+impl fmt::Display for Addresses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Write without the typical "Addresses(..)" around the output to reduce
+        // debug noise.
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl fmt::Debug for Addresses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+////////////////////
+// PeerPublicKeys //
+////////////////////
+
+impl PeerPublicKeys {
+    fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    /// Remove all empty `PublicKeys`. Returns `true` if any `PublicKeys`
+    /// were actually removed.
+    fn remove_empty(&mut self) -> bool {
+        let pre_retain_len = self.0.len();
+        self.0.retain(|_, pubkeys| !pubkeys.is_empty());
+        assert!(
+            pre_retain_len >= self.0.len(),
+            "retain should only remove items, never add: pre len: {}, post len: {}",
+            pre_retain_len,
+            self.0.len()
+        );
+        let num_removed = pre_retain_len - self.0.len();
+        num_removed > 0
+    }
+
+    fn union_all(&self) -> HashMap<PeerId, HashSet<x25519::PublicKey>> {
+        self.0
+            .iter()
+            .map(|(peer_id, pubkeys)| (*peer_id, pubkeys.union()))
+            .collect()
+    }
+}
+
+impl fmt::Display for PeerPublicKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Write the normal HashMap-style debug format, but shorten the peer_id's
+        // so the output isn't as noisy.
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(peer_id, pubkeys)| (peer_id.short_str(), pubkeys)),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for PeerPublicKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+////////////////
+// PublicKeys //
+////////////////
+
+impl PublicKeys {
+    fn len(&self) -> usize {
+        self.0.iter().map(HashSet::len).sum()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn update(&mut self, src: DiscoverySource, pubkeys: HashSet<x25519::PublicKey>) -> bool {
+        let src_idx = src.as_usize();
+        if self.0[src_idx] != pubkeys {
+            self.0[src_idx] = pubkeys;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn union(&self) -> HashSet<x25519::PublicKey> {
+        self.0.iter().flatten().copied().collect()
+    }
+}
+
+impl fmt::Display for PublicKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Write without the typical "PublicKeys(..)" around the output to reduce
+        // debug noise.
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl fmt::Debug for PublicKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+///////////////
+// DialState //
+///////////////
 
 impl<TBackoff> DialState<TBackoff>
 where
@@ -513,10 +880,6 @@ where
         }
     }
 
-    fn reset_addr(&mut self) {
-        self.addr_idx = 0;
-    }
-
     fn next_addr<'a>(&mut self, addrs: &'a Addresses) -> &'a NetworkAddress {
         assert!(!addrs.is_empty());
 
@@ -527,6 +890,8 @@ where
     }
 
     fn next_backoff_delay(&mut self, max_delay: Duration) -> Duration {
-        min(max_delay, self.backoff.next().unwrap_or(max_delay))
+        let jitter = jitter(Duration::from_millis(100));
+
+        min(max_delay, self.backoff.next().unwrap_or(max_delay)) + jitter
     }
 }

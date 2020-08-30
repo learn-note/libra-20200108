@@ -11,7 +11,6 @@ use crate::{
     persistent_safety_storage::PersistentSafetyStorage,
     remote_service::{self, RemoteService},
 };
-use consensus_types::common::Author;
 use libra_config::utils;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -23,19 +22,32 @@ use std::{
 pub struct ThreadService {
     _child: JoinHandle<()>,
     server_addr: SocketAddr,
+    network_timeout: u64,
 }
 
 impl ThreadService {
-    pub fn new(author: Author, storage: PersistentSafetyStorage) -> Self {
+    pub fn new(
+        storage: PersistentSafetyStorage,
+        verify_vote_proposal_signature: bool,
+        timeout: u64,
+    ) -> Self {
         let listen_port = utils::get_available_port();
         let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
         let server_addr = listen_addr;
 
-        let child = thread::spawn(move || remote_service::execute(author, storage, listen_addr));
+        let child = thread::spawn(move || {
+            remote_service::execute(
+                storage,
+                listen_addr,
+                verify_vote_proposal_signature,
+                timeout,
+            )
+        });
 
         Self {
             _child: child,
             server_addr,
+            network_timeout: timeout,
         }
     }
 }
@@ -43,5 +55,8 @@ impl ThreadService {
 impl RemoteService for ThreadService {
     fn server_address(&self) -> SocketAddr {
         self.server_addr
+    }
+    fn network_timeout_ms(&self) -> u64 {
+        self.network_timeout
     }
 }

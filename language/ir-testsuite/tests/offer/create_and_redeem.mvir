@@ -10,8 +10,8 @@ module M {
         return T { b: true };
     }
 
-    public publish(t: Self.T) {
-        move_to_sender<T>(move(t));
+    public publish(account: &signer, t: Self.T) {
+        move_to<T>(move(account),  move(t));
         return;
     }
 }
@@ -19,29 +19,32 @@ module M {
 //! new-transaction
 //! sender: alice
 import {{default}}.M;
-import 0x0.Offer;
+import 0x1.Offer;
+import 0x1.Signer;
 
 // Alice creates an offer for Bob that contains an M.T resource
 main(account: &signer) {
+    let sender: address;
+    sender = Signer.address_of(copy(account));
     Offer.create<M.T>(
         move(account),
         M.create(),
         {{bob}}
     );
 
-    assert(Offer.exists_at<M.T>(get_txn_sender()), 77);
-    assert(Offer.address_of<M.T>(get_txn_sender()) == {{bob}} , 78);
+    assert(Offer.exists_at<M.T>(copy(sender)), 77);
+    assert(Offer.address_of<M.T>(copy(sender)) == {{bob}} , 78);
     return;
 }
 
 //! new-transaction
 //! sender: carl
 import {{default}}.M;
-import 0x0.Offer;
+import 0x1.Offer;
 
 // Carl should *not* be able to claim Alice's offer for Bob
 main(account: &signer) {
-    M.publish(Offer.redeem<M.T>(move(account), {{alice}}));
+    M.publish(copy(account), Offer.redeem<M.T>(copy(account), {{alice}}));
 
     return;
 }
@@ -52,7 +55,7 @@ main(account: &signer) {
 //! new-transaction
 //! sender: bob
 import {{default}}.M;
-import 0x0.Offer;
+import 0x1.Offer;
 
 // Bob should be able to claim Alice's offer for him
 main(account: &signer) {
@@ -71,10 +74,10 @@ main(account: &signer) {
 //! new-transaction
 //! sender: bob
 import {{default}}.M;
-import 0x0.Offer;
+import 0x1.Offer;
 
 // Bob should be able to reclaim his own offer for Carl
 main(account: &signer) {
-    M.publish(Offer.redeem<M.T>(move(account), {{bob}}));
+    M.publish(copy(account), Offer.redeem<M.T>(copy(account), {{bob}}));
     return;
 }

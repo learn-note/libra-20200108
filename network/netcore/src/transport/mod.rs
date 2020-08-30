@@ -13,21 +13,42 @@
 
 use futures::{future::Future, stream::Stream};
 use libra_network_address::NetworkAddress;
-use std::time::Duration;
+use libra_types::PeerId;
+use serde::{export::Formatter, Serialize};
+use std::fmt;
 
 pub mod and_then;
 pub mod boxed;
+#[cfg(any(test, feature = "testing", feature = "fuzzing"))]
 pub mod memory;
 pub mod tcp;
-pub mod timeout;
 
 /// Origin of how a Connection was established.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Serialize)]
 pub enum ConnectionOrigin {
     /// `Inbound` indicates that we are the listener for this connection.
     Inbound,
     /// `Outbound` indicates that we are the dialer for this connection.
     Outbound,
+}
+
+impl fmt::Debug for ConnectionOrigin {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl fmt::Display for ConnectionOrigin {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                ConnectionOrigin::Inbound => "Inbound",
+                ConnectionOrigin::Outbound => "Outbound",
+            }
+        )
+    }
 }
 
 /// A Transport is responsible for establishing connections with remote Peers.
@@ -86,7 +107,7 @@ pub trait Transport {
         Self: Sized;
 
     /// Dials the given [`NetworkAddress`], returning a future for a pending outbound connection.
-    fn dial(&self, addr: NetworkAddress) -> Result<Self::Outbound, Self::Error>
+    fn dial(&self, peer_id: PeerId, addr: NetworkAddress) -> Result<Self::Outbound, Self::Error>
     where
         Self: Sized;
 }
@@ -132,17 +153,5 @@ pub trait TransportExt: Transport {
         Fut: Future<Output = Result<O, Self::Error>>,
     {
         and_then::AndThen::new(self, f)
-    }
-
-    /// Wraps a [`Transport`] with a timeout to the
-    /// [Inbound](Transport::Inbound) and [Outbound](Transport::Outbound)
-    /// connection futures.
-    ///
-    /// Note: The timeout does not apply to the [Listener](Transport::Listener) stream.
-    fn with_timeout(self, timeout: Duration) -> timeout::TimeoutTransport<Self>
-    where
-        Self: Sized,
-    {
-        timeout::TimeoutTransport::new(self, timeout)
     }
 }

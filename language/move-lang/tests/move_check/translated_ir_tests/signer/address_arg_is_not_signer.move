@@ -1,22 +1,22 @@
-address 0x1 {
+address 0x2 {
 module M {
     resource struct R { s: signer }
-    public fun store_signer(s: signer) {
-        move_to_sender(R { s })
+    public fun store_signer(s1: &signer, s: signer) {
+        move_to(s1, R { s })
     }
 }
 }
 
 script {
     fun t1(s: signer) {
-        0x1::M::store_signer(s)
+        0x2::M::store_signer(s)
     }
 }
 // check: INVALID_MAIN_FUNCTION_SIGNATURE
 
 script {
     fun t2(s: &signer, s2: signer) {
-        0x1::M::store_signer(s2)
+        0x2::M::store_signer(s2)
     }
 }
 // check: INVALID_MAIN_FUNCTION_SIGNATURE

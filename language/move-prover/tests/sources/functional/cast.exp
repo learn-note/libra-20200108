@@ -9,11 +9,11 @@ error: abort not covered by any of the `aborts_if` clauses
     │ ╰─────^
     ·
  45 │         (x as u64)
-    │         ---------- abort happened here
+    │         ---------- abort happened here with execution failure
     │
-    =     at tests/sources/functional/cast.move:44:5: aborting_u64_cast_incorrect (entry)
-    =     at tests/sources/functional/cast.move:45:9: aborting_u64_cast_incorrect (ABORTED)
+    =     at tests/sources/functional/cast.move:44:5: aborting_u64_cast_incorrect
     =         x = <redacted>
+    =     at tests/sources/functional/cast.move:45:9: aborting_u64_cast_incorrect (ABORTED)
 
 error: abort not covered by any of the `aborts_if` clauses
 
@@ -25,8 +25,8 @@ error: abort not covered by any of the `aborts_if` clauses
     │ ╰─────^
     ·
  31 │         (x as u8)
-    │         --------- abort happened here
+    │         --------- abort happened here with execution failure
     │
-    =     at tests/sources/functional/cast.move:30:5: aborting_u8_cast_incorrect (entry)
-    =     at tests/sources/functional/cast.move:31:9: aborting_u8_cast_incorrect (ABORTED)
+    =     at tests/sources/functional/cast.move:30:5: aborting_u8_cast_incorrect
     =         x = <redacted>
+    =     at tests/sources/functional/cast.move:31:9: aborting_u8_cast_incorrect (ABORTED)

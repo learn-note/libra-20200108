@@ -57,7 +57,7 @@ impl SpecBlockId {
 }
 
 /// The kind of an assignment in the bytecode.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AssignKind {
     /// The assign copies the lhs value.
     Copy,
@@ -79,7 +79,6 @@ pub enum Constant {
     U128(u128),
     Address(BigUint),
     ByteArray(Vec<u8>),
-    TxnSenderAddress,
 }
 
 /// An operation -- target of a call. This contains user functions, builtin functions, and
@@ -94,7 +93,6 @@ pub enum Operation {
     Unpack(ModuleId, StructId, Vec<Type>),
 
     // Resources
-    MoveToSender(ModuleId, StructId, Vec<Type>),
     MoveTo(ModuleId, StructId, Vec<Type>),
     MoveFrom(ModuleId, StructId, Vec<Type>),
     Exists(ModuleId, StructId, Vec<Type>),
@@ -313,6 +311,15 @@ impl Bytecode {
             v.swap(0, 1);
         }
         v
+    }
+
+    /// Returns the code offsets at which the code exits(aborts or returns).
+    pub fn get_exits(code: &[Bytecode]) -> Vec<CodeOffset> {
+        code.iter()
+            .enumerate()
+            .filter(|(_, bytecode)| bytecode.is_exit())
+            .map(|(idx, _)| idx as CodeOffset)
+            .collect()
     }
 }
 
@@ -537,9 +544,6 @@ impl<'env> fmt::Display for OperationDisplay<'env> {
             MoveTo(mid, sid, targs) => {
                 write!(f, "move_to<{}>", self.struct_str(*mid, *sid, targs))?;
             }
-            MoveToSender(mid, sid, targs) => {
-                write!(f, "move_to_sender<{}>", self.struct_str(*mid, *sid, targs))?;
-            }
             MoveFrom(mid, sid, targs) => {
                 write!(f, "move_from<{}>", self.struct_str(*mid, *sid, targs))?;
             }
@@ -630,7 +634,6 @@ impl fmt::Display for Constant {
             U128(x) => write!(f, "{}", x)?,
             Address(x) => write!(f, "0x{}", x.to_str_radix(16))?,
             ByteArray(x) => write!(f, "{:?}", x)?,
-            TxnSenderAddress => write!(f, "txn_sender")?,
         }
         Ok(())
     }

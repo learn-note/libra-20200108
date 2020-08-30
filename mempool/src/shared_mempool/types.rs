@@ -14,14 +14,16 @@ use futures::{
     future::Future,
     task::{Context, Poll},
 };
-use libra_config::config::{MempoolConfig, PeerNetworkId};
+use libra_config::{
+    config::{MempoolConfig, PeerNetworkId},
+    network_id::NodeNetworkId,
+};
 use libra_types::{
     account_address::AccountAddress,
     mempool_status::MempoolStatus,
     on_chain_config::{ConfigID, LibraVersion, OnChainConfig, OnChainConfigPayload, VMConfig},
     transaction::SignedTransaction,
-    vm_error::VMStatus,
-    PeerId,
+    vm_status::DiscardedVMStatus,
 };
 use std::{
     collections::HashMap,
@@ -35,8 +37,6 @@ use subscription_service::ReconfigSubscription;
 use tokio::runtime::Handle;
 use vm_validator::vm_validator::TransactionValidation;
 
-pub(crate) const DEFAULT_MIN_BROADCAST_RECIPIENT_COUNT: usize = 0;
-
 /// Struct that owns all dependencies required by shared mempool routines
 #[derive(Clone)]
 pub(crate) struct SharedMempool<V>
@@ -45,7 +45,7 @@ where
 {
     pub mempool: Arc<Mutex<CoreMempool>>,
     pub config: MempoolConfig,
-    pub network_senders: HashMap<PeerId, MempoolNetworkSender>,
+    pub network_senders: HashMap<NodeNetworkId, MempoolNetworkSender>,
     pub db: Arc<dyn DbReader>,
     pub validator: Arc<RwLock<V>>,
     pub peer_manager: Arc<PeerManager>,
@@ -75,12 +75,14 @@ pub(crate) struct ScheduledBroadcast {
     deadline: Instant,
     /// broadcast recipient
     peer: PeerNetworkId,
+    /// whether this broadcast was scheduled in backoff mode
+    backoff: bool,
     /// the waker that will be used to notify the executor when the broadcast is ready
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl ScheduledBroadcast {
-    pub fn new(deadline: Instant, peer: PeerNetworkId, executor: Handle) -> Self {
+    pub fn new(deadline: Instant, peer: PeerNetworkId, backoff: bool, executor: Handle) -> Self {
         let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
         let waker_clone = waker.clone();
 
@@ -98,13 +100,14 @@ impl ScheduledBroadcast {
         Self {
             deadline,
             peer,
+            backoff,
             waker,
         }
     }
 }
 
 impl Future for ScheduledBroadcast {
-    type Output = PeerNetworkId;
+    type Output = (PeerNetworkId, bool); // (peer, whether this broadcast was scheduled as a backoff broadcast)
 
     fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<Self::Output> {
         if Instant::now() < self.deadline {
@@ -114,7 +117,7 @@ impl Future for ScheduledBroadcast {
 
             Poll::Pending
         } else {
-            Poll::Ready(self.peer)
+            Poll::Ready((self.peer.clone(), self.backoff))
         }
     }
 }
@@ -185,7 +188,7 @@ pub struct TransactionExclusion {
 }
 
 /// Submission Status is represented as combination of vm_validator internal status and core mempool insertion status
-pub type SubmissionStatus = (MempoolStatus, Option<VMStatus>);
+pub type SubmissionStatus = (MempoolStatus, Option<DiscardedVMStatus>);
 
 /// sender type: used to enqueue new transactions to shared mempool by client endpoints
 pub type MempoolClientSender =
